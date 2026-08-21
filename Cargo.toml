@@ -14,7 +14,7 @@ postcard = { version = "1.1", features = ["alloc"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 io-uring = "0.7"
-rustix = { version = "1", features = ["fs", "net", "process"] }
+rustix = { version = "1", features = ["event", "fs", "net", "process"] }
 libc = "0.2"
 globset = "0.4"
 toml = "0.8"
@@ -25,10 +25,12 @@ thiserror = "2"
 fuser = "0.15"
 proptest = "1"
 tempfile = "3"
+futures = "0.3"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 dbg_macro = "deny"
 
-[workspace.lints.rust]
-unsafe_code = "deny"
+# `unsafe_code` is denied per-crate rather than workspace-wide: every crate root
+# carries `#![deny(unsafe_code)]`, and lbfs-server re-allows it for exactly one
+# module (`fs::local::uring`), which is the only place `unsafe` may appear.

@@ -59,6 +59,15 @@ impl PooledBuf {
     pub fn capacity(&self) -> usize {
         self.buf.as_ref().unwrap().len()
     }
+
+    /// Full backing storage, ignoring the logical length.
+    ///
+    /// Only for tests that need to inspect bytes the kernel wrote past
+    /// `set_len`, or before a `set_len` has happened at all.
+    #[cfg(test)]
+    pub fn as_mut_ref_for_test(&self) -> &[u8] {
+        self.buf.as_ref().unwrap()
+    }
 }
 
 impl Drop for PooledBuf {
