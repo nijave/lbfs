@@ -57,15 +57,20 @@ impl Config {
     }
 }
 
+/// Widen to `u64` before scaling: a `u32` shift discards the high bits it
+/// pushes off the top instead of trapping, so `"4096MiB"` would otherwise
+/// parse as a silent `0`.
 pub fn parse_size(s: &str) -> Result<u32, ConfigError> {
     let bad = || ConfigError::BadSize(s.to_string());
-    if let Some(n) = s.strip_suffix("MiB") {
-        return n.trim().parse::<u32>().map(|v| v << 20).map_err(|_| bad());
-    }
-    if let Some(n) = s.strip_suffix("KiB") {
-        return n.trim().parse::<u32>().map(|v| v << 10).map_err(|_| bad());
-    }
-    s.trim().parse::<u32>().map_err(|_| bad())
+    let (digits, mult) = if let Some(n) = s.strip_suffix("MiB") {
+        (n, 1u64 << 20)
+    } else if let Some(n) = s.strip_suffix("KiB") {
+        (n, 1u64 << 10)
+    } else {
+        (s, 1u64)
+    };
+    let v: u64 = digits.trim().parse().map_err(|_| bad())?;
+    u32::try_from(v.checked_mul(mult).ok_or_else(bad)?).map_err(|_| bad())
 }
 
 #[derive(Debug)]
@@ -127,6 +132,14 @@ mod tests {
         assert_eq!(parse_size("64KiB").unwrap(), 64 << 10);
         assert_eq!(parse_size("4096").unwrap(), 4096);
         assert!(parse_size("1GiBoop").is_err());
+        // Overflowing u32 must error, never wrap to a plausible-looking size.
+        assert!(parse_size("4096MiB").is_err());
+        assert!(parse_size("4097MiB").is_err());
+        assert!(parse_size("5120MiB").is_err());
+        assert!(parse_size("4194304KiB").is_err());
+        assert!(parse_size("4294967296").is_err());
+        // The largest in-range literal still parses.
+        assert_eq!(parse_size("4095MiB").unwrap(), 4095 << 20);
         let cfg = Config::from_toml(
             r#"
             listen = "0.0.0.0:9423"
