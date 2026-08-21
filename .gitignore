@@ -1,0 +1,4 @@
+/target
+/vm/images/
+/vm/kernels/
+*.qcow2
