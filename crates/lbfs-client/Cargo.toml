@@ -1,0 +1,23 @@
+[package]
+name = "lbfs-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lbfs-proto = { workspace = true, features = ["io"] }
+serde = { workspace = true }
+postcard = { workspace = true }
+tokio = { workspace = true }
+fuser = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
