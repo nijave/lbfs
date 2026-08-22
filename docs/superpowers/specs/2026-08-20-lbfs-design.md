@@ -430,10 +430,13 @@ Future work:
   to the highest layer that holds the file — no copy-up — and when no
   layer holds it, the write creates the file in the top layer.
 - Read-only layers on top of the layered backend: servers can share a
-  layer marked read-only. When any server holds a layer read-only and
-  another server tries to mount that layer writable, the writable attach
-  fails with a conflict error. Needs a coordination design for how
-  servers detect the conflict across machines.
+  layer marked read-only. Read-only means immutable — while any attach
+  holds a layer read-only, nothing changes it, so clients may cache its
+  content and metadata with no coherence protocol. When any server holds
+  a layer read-only and another server tries to mount that layer
+  writable, the writable attach fails with a conflict error. Needs a
+  coordination design for how servers detect the conflict across
+  machines.
 - OCI layer sourcing on top of the layered backend: the server pulls
   Docker/OCI images and unpacks each image layer into a directory that
   the layered backend then stacks — CI hosts mount an image's filesystem
@@ -447,6 +450,36 @@ Future work:
   start), measuring time-to-first-file and time-to-ready for typical
   images. This prices the real-time-attach thesis against the status
   quo.
+- Consistency model for shared layers, the layered backend's first
+  principle: one writer per writable layer, any number of readers on
+  immutable layers. Readers cache immutable layers as long as they
+  like; the writer's private top layer never needs cross-client
+  invalidation.
+- Two writable-layer kinds for the layered backend: a scratch layer the
+  server throws away on detach (the CI job workspace), and a
+  to-be-persisted layer that a job fills and then seals into a durable,
+  shareable layer (the product of a build). Sealing turns the layer
+  immutable and eligible for the read-only sharing above.
+- Research how overlayfs answers the layered-semantics questions before
+  designing the backend: deletions over lower layers (whiteouts),
+  readdir merge, rename and hardlink across layers, opaque directories,
+  and its xattr conventions — then decide which answers carry over.
+  Server-side layer lifecycle (refcounts, eviction, pinning, disk
+  quotas) and content-addressed dedup by OCI digest have no overlayfs
+  precedent and need their own design.
+- containerd snapshotter plugin: expose lbfs mounts through the
+  snapshotter interface the way stargz and SOCI do, so container
+  runtimes consume lbfs without changes. Doubles as the harness for the
+  container-workload benchmark above.
+- Multi-client scale benchmark and server fairness: N readers over
+  shared layers is the load shape the direction note targets. Measure
+  it, and give the server per-client limits so one job cannot starve
+  the rest — per-connection windows exist, server-wide policy does not.
+- Production observability: a metrics endpoint (Prometheus shape) with
+  per-op latencies, per-layer hit rates, and per-client counters —
+  distinct from the eBPF development rig below.
+- Read-only attach for clients: a mount mode the kernel enforces on the
+  client, pairing with shared immutable layers.
 - Feasibility analysis — kernel-module client: a native lbfs kernel
   driver speaking the wire protocol (the shape of the in-kernel NFS
   client) instead of FUSE. The NFS comparison prices the userspace
@@ -476,3 +509,16 @@ Future work:
   scaling, NVMe-oF-style.
 - `mount.lbfs` helper for fstab integration.
 - CI wiring for test layers 1–2.
+
+Noted and deferred:
+
+- Client-side persistent layer cache and prefetch: deferred — clients
+  run one job and vanish, with low launch cost, so a per-host cache has
+  little to feed.
+- uid/gid mapping for heterogeneous hosts on shared layers: undecided;
+  revisit with the authorization decorator.
+- Wire compression (zstd per data segment): deferred — the target
+  network is fast; revisit if deployment ever leaves the LAN/VPC class.
+- Protocol upgrade/compat policy: deferred — client and server ship and
+  upgrade together, and a server upgrades by starting fresh and seeding
+  again from OCI data, so cross-version pairs never occur.
