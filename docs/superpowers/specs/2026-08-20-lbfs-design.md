@@ -402,13 +402,30 @@ Fast-follows (priority order):
 1. **Reconnection / session resumption:** re-`ATTACH` on connection loss
    with re-establishment of node and handle state; requires a session-resume
    protocol extension (the `HELLO` version field is the vehicle).
-2. **Forced-sync control:** a management/protocol mechanism (reserved frame
-   flag bit 1 on `FSYNC`/`FSYNCDIR`, or a dedicated opcode) that forces a
-   real sync regardless of the server's `fsync = "ignore"` setting — e.g.,
-   before snapshots.
+2. **Forced-sync control:** force a real sync even while the server runs
+   `fsync = "ignore"`. Two entry points: one reachable from user space on a
+   live mount (an ioctl or a control xattr on the mount root), and one the
+   client driver calls on its own at moments such as unmount. On the wire,
+   both ride the reserved frame flag bit 1 on `FSYNC`/`FSYNCDIR` (or a
+   dedicated opcode) so the server honors the sync no matter its policy —
+   e.g., before snapshots.
 
 Future work:
 
+- Repeatable performance suite under `vm/`: one command that captures the
+  network baseline (iperf3, single-stream and windowed), the server's disk
+  baseline (fio on the export), and the same fio shapes through the mount,
+  then reports the three-way comparison — automating the manual method
+  behind `docs/benchmarks/`.
+- Layered backend, a second `FileSystem` in the spirit of overlayfs: the
+  server stacks an ordered list of directories; reads and writes both go
+  to the highest layer that holds the file — no copy-up — and when no
+  layer holds it, the write creates the file in the top layer.
+- Read-only layers on top of the layered backend: servers can share a
+  layer marked read-only. When any server holds a layer read-only and
+  another server tries to mount that layer writable, the writable attach
+  fails with a conflict error. Needs a coordination design for how
+  servers detect the conflict across machines.
 - mTLS (rustls stream wrap) and an authorization `FileSystem` decorator.
 - Performance test rig capturing detailed kernel-level metrics — eBPF
   (bpftrace/BCC) or similar: per-opcode latency histograms, io_uring
