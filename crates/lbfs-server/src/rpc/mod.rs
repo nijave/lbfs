@@ -94,6 +94,16 @@ const KEEPALIVE_COUNT: u32 = 3;
 /// Pause before retrying an accept that failed for a reason time can fix.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
+/// How long a closing session waits for the replies it already produced.
+///
+/// The drain exists so an `Entry` a backend handed out reaches the client that
+/// owes it a `FORGET`; the bound exists because one handler that never returns
+/// — `OPEN` on a peerless FIFO, parked on a blocking thread — would otherwise
+/// hold the session task, the socket, and the whole export's node table for as
+/// long as the process lives. Thirty seconds is far longer than any operation
+/// this server issues and far shorter than "forever".
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Server-wide state
 // ---------------------------------------------------------------------------
@@ -459,6 +469,10 @@ struct Session {
     /// Sender for the session itself; handler tasks get clones.
     tx: mpsc::Sender<OutFrame>,
     window: Arc<Semaphore>,
+    /// Raised when the socket can no longer carry replies, by whoever finds
+    /// out first: the writer on a failed write, or a handler whose reply has
+    /// no writer left to take it.
+    socket_dead: Arc<Notify>,
 }
 
 async fn serve_requests(
@@ -472,23 +486,39 @@ async fn serve_requests(
     // never admitted, so this can never be the thing that grows without limit.
     let (tx, rx) = mpsc::channel::<OutFrame>(limits.max_inflight as usize);
     let socket_dead = Arc::new(Notify::new());
-    let writer = tokio::spawn(writer_task(writer_half, rx, Arc::clone(&socket_dead)));
+    let mut writer = tokio::spawn(writer_task(writer_half, rx, Arc::clone(&socket_dead)));
     let session = Session {
         server,
         limits,
         fs,
         tx,
         window: Arc::new(Semaphore::new(limits.max_inflight as usize)),
+        socket_dead: Arc::clone(&socket_dead),
     };
 
     let result = read_loop(&session, &mut reader, &socket_dead).await;
 
     // Drop the session's own sender, then wait for the writer. Handler tasks
     // still hold clones, so this drains every reply that was produced before
-    // the socket closes - see the module's third invariant.
+    // the socket closes - see the module's third invariant. Bounded, because
+    // a handler that never returns must not turn a closing session into a
+    // permanent one.
     drop(session);
-    if let Err(e) = writer.await {
-        tracing::error!(error = %e, "writer task failed");
+    match tokio::time::timeout(DRAIN_TIMEOUT, &mut writer).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = %e, "writer task failed"),
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?DRAIN_TIMEOUT,
+                "a request never completed; closing the session with replies undelivered"
+            );
+            // Abort rather than detach: after this long the writer is either
+            // idle behind a stuck handler, with everything it had already
+            // written, or blocked on a socket the client stopped reading.
+            // Neither is worth holding the connection open for, and dropping
+            // the write half is what finally tells the client it is over.
+            writer.abort();
+        }
     }
     result
 }
@@ -587,35 +617,79 @@ async fn read_loop(
 
         let request_id = hdr.request_id;
         let fs = Arc::clone(fs);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let (status, body, data) = dispatch(op, &body, data, &fs).await;
-            // A send failure means the writer is gone, which means the
-            // connection is gone: the reply has nowhere to go and the session
-            // is already unwinding.
-            let _ = tx
-                .send(OutFrame {
-                    request_id,
-                    status,
-                    body,
-                    data,
-                    permit,
-                })
-                .await;
-        });
+        tokio::spawn(run_request(
+            request_id,
+            async move { dispatch(op, &body, data, &fs).await },
+            tx.clone(),
+            permit,
+            Arc::clone(&session.socket_dead),
+        ));
+    }
+}
+
+/// Run one request's work, and answer for it even if that work panics.
+///
+/// The work goes in its own task purely so a panic becomes a `JoinError` here
+/// instead of vanishing. A detached handler that panics is the worst
+/// failure this layer can have: the client waits forever for a `request_id`
+/// that will never be answered, on a socket that is still open and still
+/// serving everybody else. And it compounds — the buffer pool and the node
+/// table are behind `Mutex`es taken with `.lock().unwrap()`, so a panic while
+/// one is held poisons it and every later request panics in the same place.
+/// `EIO` per request turns a permanently wedged mount into an error the client
+/// can report, which is the same trade `LocalFs`'s `join_errno` already makes
+/// for a panicking blocking task.
+async fn run_request<F>(
+    request_id: u64,
+    work: F,
+    tx: mpsc::Sender<OutFrame>,
+    permit: Option<OwnedSemaphorePermit>,
+    socket_dead: Arc<Notify>,
+) where
+    F: std::future::Future<Output = dispatch::Reply> + Send + 'static,
+{
+    let (status, body, data) = match tokio::spawn(work).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            tracing::error!(request_id, error = %e, "request handler panicked; answering EIO");
+            (Errno::EIO.0, Vec::new(), None)
+        }
+    };
+    let queued = tx
+        .send(OutFrame {
+            request_id,
+            status,
+            body,
+            data,
+            permit,
+        })
+        .await;
+    if queued.is_err() {
+        // No writer left to take it, so there is no connection left either.
+        // Tell the reader rather than letting it block on a header that can
+        // no longer be answered.
+        socket_dead.notify_one();
     }
 }
 
 /// The largest data segment this opcode may carry.
 ///
 /// Zero for everything but the two ops that carry bulk bytes inbound (spec
-/// §3.1). `SETXATTR` is bounded by the body maximum, which is the kernel's own
-/// `XATTR_SIZE_MAX`, and by the negotiated I/O size as well — no frame gets to
-/// exceed what the two sides settled on, whatever else the op allows.
+/// §3.1). The two are bounded by different numbers on purpose:
+///
+/// * `WRITE` by the negotiated I/O size, which is what that number *means* —
+///   the client asked for `max_write` and this is it.
+/// * `SETXATTR` by the max body size, which spec §3.2 names as the bound on
+///   xattr values, and *not* also by the negotiated I/O size. Clamping it to
+///   both would be asymmetric with the reply side: `GETXATTR` hands back up to
+///   `XATTR_SIZE_MAX` in a data segment whatever the session negotiated, so a
+///   client that agreed on a 4 KiB I/O size would receive a 16 KiB attribute
+///   it could never send back. An xattr is not I/O and does not travel on the
+///   I/O budget.
 fn data_limit(op: Opcode, limits: &Limits) -> u32 {
     match op {
         Opcode::Write => limits.max_io_size,
-        Opcode::Setxattr => MAX_BODY_SIZE.min(limits.max_io_size),
+        Opcode::Setxattr => MAX_BODY_SIZE,
         _ => 0,
     }
 }
@@ -731,12 +805,47 @@ mod tests {
         assert_eq!(data_limit(Opcode::Setxattr, &limits), MAX_BODY_SIZE);
         assert_eq!(data_limit(Opcode::Lookup, &limits), 0);
         assert_eq!(data_limit(Opcode::Read, &limits), 0);
-        // A small negotiated I/O size bounds the xattr value too: no frame
-        // exceeds what the handshake settled.
+        // A small negotiated I/O size bounds WRITE and nothing else: an xattr
+        // value is bounded by the body maximum, symmetrically with the
+        // GETXATTR reply the same session can already receive.
         let tight = Limits {
             max_io_size: 4096,
             ..limits
         };
-        assert_eq!(data_limit(Opcode::Setxattr, &tight), 4096);
+        assert_eq!(data_limit(Opcode::Write, &tight), 4096);
+        assert_eq!(data_limit(Opcode::Setxattr, &tight), MAX_BODY_SIZE);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_eio_for_its_own_request() {
+        let (tx, mut rx) = mpsc::channel::<OutFrame>(1);
+        let dead = Arc::new(Notify::new());
+        run_request(
+            77,
+            async { panic!("a backend that should not have panicked") },
+            tx,
+            None,
+            Arc::clone(&dead),
+        )
+        .await;
+        let frame = rx.recv().await.expect("the request must be answered");
+        assert_eq!((frame.request_id, frame.status), (77, Errno::EIO.0));
+        assert!(frame.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_no_writer_left_ends_the_session() {
+        let (tx, rx) = mpsc::channel::<OutFrame>(1);
+        drop(rx); // the writer is gone
+        let dead = Arc::new(Notify::new());
+        run_request(1, async { (STATUS_OK, Vec::new(), None) }, tx, None, {
+            Arc::clone(&dead)
+        })
+        .await;
+        // `notify_one` leaves a permit behind, so the reader's next
+        // `notified()` completes even though it was not waiting yet.
+        tokio::time::timeout(Duration::from_secs(5), dead.notified())
+            .await
+            .expect("the reader must be woken");
     }
 }

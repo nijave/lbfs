@@ -18,11 +18,11 @@ use lbfs_proto::frame::{
 };
 use lbfs_proto::io::{read_body, read_header, write_frame};
 use lbfs_proto::ops::{
-    AttachReply, AttachRequest, ForgetRequest, GetattrRequest, HelloReply, HelloRequest,
-    LookupRequest, Opcode, OpenReply, OpenRequest, ReadRequest, ReleaseRequest, WriteReply,
-    WriteRequest,
+    AttachReply, AttachRequest, ForgetRequest, GetattrRequest, GetxattrRequest, HelloReply,
+    HelloRequest, LookupRequest, Opcode, OpenReply, OpenRequest, ReadRequest, ReleaseRequest,
+    SetxattrRequest, WriteReply, WriteRequest,
 };
-use lbfs_proto::types::{Entry, FileAttr, ROOT_NODE};
+use lbfs_proto::types::{Entry, FileAttr, XattrReply, ROOT_NODE};
 use lbfs_server::config::{Allowlist, Config, FsyncPolicy};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -419,9 +419,13 @@ async fn window_overrun_closes_connection() {
     )
     .await
     .expect("server must close the connection on a window overrun");
+    // Half the burst is a deliberately generous bound. The reader admits its
+    // eight and hits the overrun before a single reply can be written, so the
+    // true figure is nearer one read's worth; anything up to half still
+    // falsifies a window that was not enforced at all.
     assert!(
-        got < BURST as usize * READ_SIZE,
-        "connection closed before every read in the burst was answered"
+        got <= (BURST / 2) as usize * READ_SIZE,
+        "the window let too much of the burst through: {got} bytes"
     );
 }
 
@@ -492,6 +496,93 @@ async fn oversize_write_data_closes_connection() {
     assert!(at_eof(&mut s).await, "oversize data is connection-fatal");
 }
 
+/// An xattr value is bounded by the max body size, not by the negotiated I/O
+/// size — symmetrically with the GETXATTR reply the same session can receive.
+#[tokio::test]
+async fn a_large_xattr_survives_a_small_negotiated_io_size() {
+    const VALUE: usize = 16 << 10;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("x"), b"body").unwrap();
+    let addr = start_server_for(dir.path()).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let (hdr, body) = call(
+        &mut s,
+        1,
+        Opcode::Hello,
+        &hello_body(PROTOCOL_VERSION, 4096),
+    )
+    .await;
+    assert_eq!(hdr.op_or_status, STATUS_OK);
+    let hello: HelloReply = dec(&body);
+    assert_eq!(hello.max_io_size, 4096);
+    let attach = enc(&AttachRequest {
+        path: path_bytes(dir.path()),
+    });
+    call(&mut s, 2, Opcode::Attach, &attach).await;
+    let body = enc(&LookupRequest {
+        parent: ROOT_NODE,
+        name: b"x".to_vec(),
+    });
+    let (_, body) = call(&mut s, 3, Opcode::Lookup, &body).await;
+    let entry: Entry = dec(&body);
+
+    let value = vec![b'v'; VALUE];
+    let body = enc(&SetxattrRequest {
+        node: entry.node,
+        name: b"user.big".to_vec(),
+        flags: 0,
+    });
+    send(&mut s, 4, Opcode::Setxattr as u16, 0, &body, &value).await;
+    let (hdr, _, _) = recv(&mut s).await;
+    assert_eq!(hdr.request_id, 4, "the connection must survive the value");
+    assert!(
+        hdr.op_or_status < 0xFF00,
+        "a legal xattr value is not a protocol violation"
+    );
+    // Some backing filesystems cap an xattr value well below 64 KiB (ext4 at
+    // one block). Their errno is a legitimate answer; what this test is about
+    // is that the frame reached the backend at all.
+    if hdr.op_or_status == STATUS_OK {
+        let body = enc(&GetxattrRequest {
+            node: entry.node,
+            name: b"user.big".to_vec(),
+            size: MAX_BODY_SIZE,
+        });
+        send(&mut s, 5, Opcode::Getxattr as u16, 0, &body, &[]).await;
+        let (hdr, body, data) = recv(&mut s).await;
+        assert_eq!((hdr.request_id, hdr.op_or_status), (5, STATUS_OK));
+        let reply: XattrReply = dec(&body);
+        assert_eq!(reply.size as usize, VALUE);
+        assert_eq!(data, value);
+    }
+}
+
+/// A body the server cannot decode is that request's problem, not the
+/// connection's: the frame lengths were honored, so the stream is still in
+/// sync and the next request is still answerable.
+#[tokio::test]
+async fn a_malformed_body_answers_einval_and_keeps_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start_server_for(dir.path()).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    hello_attach(&mut s, dir.path()).await;
+
+    // A LOOKUP body that stops after the parent varint: postcard runs out of
+    // input reading the name's length prefix.
+    let (hdr, body) = call(&mut s, 3, Opcode::Lookup, &[1u8]).await;
+    assert_eq!(hdr.op_or_status, libc::EINVAL as u16);
+    assert!(body.is_empty());
+
+    // Still serving.
+    let body = enc(&GetattrRequest {
+        node: ROOT_NODE,
+        fh: None,
+    });
+    let (hdr, _) = call(&mut s, 4, Opcode::Getattr, &body).await;
+    assert_eq!(hdr.op_or_status, STATUS_OK);
+}
+
 /// A zero or sub-page `max_io_size` clamps up rather than propagating: the
 /// config parser accepts `"0"`, and a zero-length I/O ceiling would make every
 /// read and write a violation.
@@ -523,5 +614,15 @@ async fn handshake_opcodes_after_attach_close_connection() {
         &[],
     )
     .await;
-    assert!(at_eof(&mut s).await);
+    assert!(at_eof(&mut s).await, "a second HELLO is fatal");
+
+    // The other half, on its own connection: re-attaching would mean a second
+    // export root under a node table already handed out against the first.
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    hello_attach(&mut s, dir.path()).await;
+    let attach = enc(&AttachRequest {
+        path: path_bytes(dir.path()),
+    });
+    send(&mut s, 3, Opcode::Attach as u16, 0, &attach, &[]).await;
+    assert!(at_eof(&mut s).await, "a mid-session ATTACH is fatal");
 }
