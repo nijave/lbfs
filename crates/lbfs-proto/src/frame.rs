@@ -13,7 +13,7 @@ pub const DEFAULT_MAX_IO_SIZE: u32 = 1 << 20;
 pub const MAX_BODY_SIZE: u32 = 64 << 10;
 
 pub const FLAG_NO_REPLY: u16 = 1 << 0;
-/// Reserved for the forced-sync fast-follow (spec §11). Never set in v1.
+/// Reserved for the forced-sync fast-follow (spec §11). Never set in product v1.
 pub const FLAG_FORCE_SYNC_RESERVED: u16 = 1 << 1;
 
 pub const STATUS_OK: u16 = 0;

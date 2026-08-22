@@ -340,20 +340,6 @@ struct Capability {
     required: bool,
 }
 
-/// The capabilities this client asks the kernel for.
-///
-/// Deliberately short, and `FUSE_ATOMIC_O_TRUNC` is deliberately absent: the
-/// server drops `O_TRUNC` from an `OPEN`'s flags because honoring it there
-/// would let a plain open destroy data, and truncation rides `SETATTR` instead.
-/// Asking for atomic `O_TRUNC` would tell the kernel to stop sending that
-/// `SETATTR`, and `open(O_TRUNC)` would silently keep the old contents.
-/// `fuser`'s own default set is `FUSE_ASYNC_READ | FUSE_BIG_WRITES` plus
-/// `FUSE_MAX_PAGES`, and none of those is it either.
-///
-/// A list rather than one bitmask because [`KernelConfig::add_capabilities`] is
-/// all or nothing: one unsupported bit in a combined ask makes it add none of
-/// them, so a kernel too old for the writeback cache would quietly cost this
-/// mount `READDIRPLUS` as well.
 /// `FUSE_HANDLE_KILLPRIV_V2`, which fuser 0.15.1 does not name.
 ///
 /// fuser's `consts` stops at `FUSE_HANDLE_KILLPRIV` (bit 19). Bit 28 arrived
@@ -368,6 +354,20 @@ struct Capability {
 /// knows. A locally declared constant is therefore the whole mechanism.
 const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
 
+/// The capabilities this client asks the kernel for.
+///
+/// Deliberately short, and `FUSE_ATOMIC_O_TRUNC` is deliberately absent: the
+/// server drops `O_TRUNC` from an `OPEN`'s flags because honoring it there
+/// would let a plain open destroy data, and truncation rides `SETATTR` instead.
+/// Asking for atomic `O_TRUNC` would tell the kernel to stop sending that
+/// `SETATTR`, and `open(O_TRUNC)` would silently keep the old contents.
+/// `fuser`'s own default set is `FUSE_ASYNC_READ | FUSE_BIG_WRITES` plus
+/// `FUSE_MAX_PAGES`, and none of those is it either.
+///
+/// A list rather than one bitmask because [`KernelConfig::add_capabilities`] is
+/// all or nothing: one unsupported bit in a combined ask makes it add none of
+/// them, so a kernel too old for the writeback cache would quietly cost this
+/// mount `READDIRPLUS` as well.
 fn capabilities(writeback: bool) -> Vec<Capability> {
     let mut caps = vec![
         // What makes READDIRPLUS available at all. Without it a listing costs
@@ -403,7 +403,7 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
         // (`fs/fuse/inode.c:1411-1414`), the inode latches `S_NOSEC` after the
         // first write, and every write after that short-circuits with no
         // request at all. The price is a promise: the server clears the bits
-        // instead. See spec §5.3 and `fs::local::killpriv`.
+        // instead. See spec §5.3 and `lbfs_server::fs::local::killpriv`.
         Capability {
             bit: FUSE_HANDLE_KILLPRIV_V2,
             name: "FUSE_HANDLE_KILLPRIV_V2",
