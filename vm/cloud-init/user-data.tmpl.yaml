@@ -1,0 +1,21 @@
+#cloud-config
+# __SSH_KEY__ and __HOSTNAME__ are substituted by vm/up.sh, once per guest.
+hostname: __HOSTNAME__
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - __SSH_KEY__
+package_update: true
+packages: [fuse3, attr, fio, gcc, curl, make]
+write_files:
+  - path: /etc/fuse.conf
+    content: "user_allow_other\n"
+runcmd:
+  - mkdir -p /srv/exports/data /mnt/lbfs
+  - chown ubuntu:ubuntu /srv/exports/data /mnt/lbfs
+  # write_files runs before the package stage, and installing fuse3 ships its
+  # own /etc/fuse.conf over the top. Re-assert the setting afterwards; the grep
+  # keeps it idempotent if dpkg happened to keep our copy instead.
+  - sh -c 'grep -qx user_allow_other /etc/fuse.conf || echo user_allow_other >> /etc/fuse.conf'
