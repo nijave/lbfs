@@ -110,8 +110,13 @@ survives. The protocol has no in-band error recovery.
 
 ### 3.2 Handshake and attach
 
-1. `HELLO` (client → server): magic `LBFS`, protocol version (exact match
-   required in v1; the field is the evolution mechanism), proposed limits.
+1. `HELLO` (client → server): magic `LBFS`, protocol version — now `2`, and
+   still an exact match, which is the whole point. Version `2` adds
+   `kill_suidgid` to the `WRITE` body. postcard ignores trailing bytes, so a
+   version-`1` server decoding a version-`2` `WRITE` would drop the flag and
+   silently keep a set-user-ID bit the mount promised to clear. Refusing the
+   handshake turns that into a startup failure an operator can see. Both ends
+   deploy together, so the refusal costs nothing.
 2. `HELLO` reply: settled protocol version, **max in-flight window**
    (default 128, clamped to [8, 1024]), **max I/O size** (default 1 MiB,
    matches FUSE `max_write`), max body size (64 KiB — bounds xattr values
@@ -159,6 +164,12 @@ sustain 1 GiB/s; 128 leaves ample depth for metadata bursts.
 `SETATTR` is a single op with an optional-field struct (mode, uid, gid,
 size, atime, mtime, fh), covering chmod/chown/truncate/utimens exactly as
 FUSE does.
+
+`WRITE` carries one flag beside its `(node, fh, offset)` triple:
+`kill_suidgid`, copied from the kernel's `FUSE_WRITE_KILL_SUIDGID`. The client
+sets it whenever its kernel sets it; the server treats it as an instruction to
+clear set-user-ID and set-group-ID before the bytes land. §5.3 says which side
+performs the clearing.
 
 Filenames, symlink targets, and xattr names travel as raw byte strings
 (`OsStr` semantics) — never UTF-8-validated. A filesystem proxy must
@@ -258,6 +269,39 @@ trait FileSystem: Send + Sync {
   vectored socket write → pool. No allocation on the data path (groundwork
   for registered buffers later).
 
+**Killing privileged mode bits.** The client asks its kernel for
+`FUSE_HANDLE_KILLPRIV_V2`, which stops the kernel probing
+`security.capability` before every write and so removes one round trip per
+write. In exchange the server owes the promise that flag encodes: clear
+set-user-ID and set-group-ID on write, truncate and chown, clearing
+set-group-ID only when the file also carries group-execute permission.
+
+Who performs the clearing depends on one fact the server reads once at
+startup — whether it holds `CAP_FSETID`.
+
+- **`Kernel`** — no `CAP_FSETID`, which is how `vm/lbfs-server.service` runs
+  it. The backing kernel clears the bits inside the server's own `write(2)`,
+  `ftruncate(2)` and `fchown(2)`, so the server does nothing per operation and
+  the write path stays at one syscall.
+- **`Explicit`** — the server holds `CAP_FSETID`, so the backing kernel skips
+  the strip and the server does it: one `statx`, then an `fchmod` only when a
+  privileged bit is present. Truncate takes the same treatment. Chown needs no
+  code either way, because `chown_common` clears the bits for every
+  non-directory regardless of capability.
+
+Two narrowings, both deliberate. The server leaves `security.capability`
+alone: discovering whether it exists costs exactly the round trip this design
+removes, and the client mounts `nosuid,nodev`, which disables file
+capabilities on that mount. And the set-group-ID rule follows group-execute
+alone rather than the caller's group membership, because v1 carries no caller
+credentials on the wire.
+
+Under `Explicit` the `statx`, `fchmod` and write are three steps rather than
+one atomic action. A `SETATTR` racing between the second and the third leaves
+new bytes under a set-user-ID bit for one round trip. v1 exports to a single
+client whose kernel serializes those two operations per inode, and the result
+is narrower than v1 shipped with, so the design accepts the window.
+
 ## 6. Durability Policy
 
 `LocalFs` option `fsync = "honor" | "ignore"` (default `honor`):
@@ -289,7 +333,18 @@ A future control message will force a real sync regardless of this setting;
   `entry_timeout`/`attr_timeout` default 1 s, CLI-tunable (0 disables);
   **writeback cache** on (kernel aggregates small writes — the biggest win
   for build workloads); `keep_cache` so re-reads stay local; `readdirplus`
-  on; `max_write`/`max_readahead` = negotiated max I/O size.
+  on; `max_write`/`max_readahead` = negotiated max I/O size. Beside those
+  cache flags the client requests one more capability at `INIT`:
+  `FUSE_HANDLE_KILLPRIV_V2` (§5.3).
+
+  `FUSE_HANDLE_KILLPRIV_V2` is optional, not required. A kernel that refuses
+  it keeps today's behaviour: the kernel probes `security.capability` before
+  each write and performs its own strip through `SETATTR`
+  (`fs/fuse/dir.c:2335`). The mount stays correct and stays slow. Note that
+  the kernel sets `FUSE_WRITE_KILL_SUIDGID` on direct-I/O writes regardless
+  of whether it granted the capability, so a server honouring the flag on a
+  mount that lost it strips more often than the contract demands — never
+  less.
 - **Identity:** ownership, mode, and times pass through exactly as the
   server sees them (NFS-without-idmapping). `st_ino` inside the mount is
   the server's `NodeId`, not the backing inode — fuser derives the FUSE
@@ -511,6 +566,11 @@ Future work:
   scaling, NVMe-oF-style.
 - `mount.lbfs` helper for fstab integration.
 - CI wiring for test layers 1–2.
+- **Server-side `security.capability` clearing under a privileged server.**
+  `FUSE_HANDLE_KILLPRIV_V2` shipped without it (§5.3). A server holding
+  `CAP_FSETID` clears set-user-ID and set-group-ID but leaves the capability
+  attribute; picking it up means either a per-write probe or a per-node cache
+  invalidated by `SETXATTR`.
 
 Noted and deferred:
 
