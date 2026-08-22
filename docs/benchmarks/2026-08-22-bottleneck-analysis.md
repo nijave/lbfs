@@ -347,6 +347,97 @@ plus the bench file exceed the ~1.5 GB of page cache a 1962 MB guest offers,
 so part of every read comes off the virtual disk. Server iowait during the
 streaming read run confirms it at 30.7%.
 
+## Phase 8: the per-write probe, removed
+
+Measured after the change landed on branch `perf/kill-priv` (`587bc00`): same
+pair, same drained single-job driver, same two 512 MiB files, fio 3.41.
+
+The extra round trip per write was a `GETXATTR` of `security.capability`, not
+a `GETATTR`. The kernel issues it from `file_remove_privs`
+(`fs/inode.c:2317-2341`) before every write on an inode that lacks `S_NOSEC`,
+and a FUSE superblock only gains `SB_NOSEC` when the server negotiates
+`FUSE_HANDLE_KILLPRIV_V2` (`fs/fuse/inode.c:1411-1414`). lbfs answers the probe
+with ENODATA, which the kernel never latches, so it repeated forever. The
+server's `xattr_fd` reopens the node through `/proc` to run `fgetxattr`, and
+that reopen is the open/fstat/close triple the earlier window counted.
+
+Asking for the flag removes the probe; honouring the promise it encodes moves
+the set-user-ID strip onto the server. Three runs per shape, median first and
+the range across the three beside it:
+
+| job (direct=1, 512M, 15 s) | before | after | range across three runs |
+|---|---|---|---|
+| randwrite 4k psync QD1 | 3365 IOPS, 296 µs | 6576 IOPS, 151.0 µs | 6467-6769 IOPS, 147.0-153.7 µs |
+| randread 4k psync QD1 | 8322 IOPS, 119.3 µs | 8327 IOPS, 119.1 µs | 8239-8448 IOPS, 117.6-120.6 µs |
+| randread 4k libaio QD16 | 40290 IOPS, 393 µs | 43507 IOPS, 367.1 µs | 43472-44199 IOPS, 361.3-367.5 µs |
+| seq read 1M psync | 1580 MB/s, 632 µs | 1814 MB/s, 550.2 µs | 1724-1843 MB/s, 541.8-579.1 µs |
+
+The write shape halves: 296 µs becomes 151 µs and 3365 IOPS becomes 6576. Its
+p99 clat follows, 216-239 µs across the three runs against the 391 µs Phase 7
+recorded for the same shape. The plan behind the change predicted ~4800 IOPS at
+~205 µs for this row, and priced the removed round trip at 90 µs; the run came
+in at 151 µs, a 145 µs saving.
+
+Two readings fit that overshoot, and this campaign cannot separate them. Either
+the reopen and the `spawn_blocking` hop cost more than the 92 µs a bare
+metadata round trip prices — the probe path does strictly more work than a
+`GETATTR` — or the 146.4 µs the raw RPC layer charged for a 4 KiB write that
+day ran pessimistic. The nearness of the new 151 µs to that 146.4 µs reads as a
+warning rather than as confirmation: at face value it leaves the kernel's FUSE
+layer costing a write about 5 µs where it costs a read 27 µs, and it collapses
+both the +150 µs row in the FUSE-cost table above and the ~58 µs of kernel
+write-path work that table's arithmetic assumed. A fresh `lbfs-bench` write
+pass beside a fresh mount pass would tell the two readings apart. Until then
+the 145 µs saving stands as a measurement and its decomposition stays open.
+
+The three read shapes hold. Random 4 KiB reads at QD1 land within 0.2% of the
+earlier figure, and that is the control which makes the write result a change
+in the write path rather than a faster pair today. The queued read and the
+streaming read come in 8% and 15% ahead, both inside the run-to-run spread this
+pair carries: the 1 MiB sequential read alone has landed anywhere from
+1519.7 MB/s in the 4 MiB request campaign (`2026-08-22-big-requests.md`, job 2)
+to 1843 MB/s today, a band of about 20%.
+
+Syscall counts from `strace -c -f` on `lbfs-server`, one 12 s randwrite window
+per row:
+
+| window | reply frames (`writev`) | `open` | `fstat` | `close` |
+|---|---|---|---|---|
+| before | 12872 | 6430 | 6430 | 6430 |
+| after, 1 s attribute timeout | 31589 | 12 | 0 | 12 |
+| after, 30 s attribute timeout | 31634 | 0 | 0 | 0 |
+
+Read the rows as ratios, never as throughput. Each row pays its own tracer tax,
+and that tax scales with the traced syscalls per write: five before, roughly
+one now. The before row works out to 536 writes/s — 6430 reopens over 12 s,
+12872 frames, two frames per write — against the 3365 IOPS that shape reaches
+clean. The middle row's job averaged 5097 IOPS over 30 s with the tracer
+attached for 12 of them, which puts the traced stretch near 2900 writes/s
+against 6576 clean, the halving the anomalies section describes, and close to
+the 2632 frames/s that 31589 over 12 s works out to. One frame per write, then,
+where the before row shows two; the 2.45 × frame count in the after row
+measures a lighter tracer on a shorter path, not a throughput jump of that size.
+
+The triple became a pair as well: the node table now carries the file type, so
+`xattr_fd` skips the `fstat` it used to run. Twelve reopens across twelve
+seconds is one per second, and that rate is the attribute timeout —
+`fuse_change_attributes_common` clears `S_NOSEC` on every attribute reply, so
+each expiry buys the kernel one more probe. A mount with `--attr-timeout 30`
+shows none at all over the same window, which places the residue on that path
+and nowhere else. A workload that interleaves `stat` with writes pays more of
+these probes than fio's pure write loop does.
+
+The vanished probe is what shows the kernel granted the capability. A grant
+leaves no line in the client log — only a refusal logs — so the absent
+"unsupported by this kernel" line rules a refusal out rather than showing a
+grant, and a kernel that withheld the flag would go on asking once per write.
+The server's `policy=Kernel` line at attach names the strip branch the server
+chose, right for a unit running as `ubuntu` without `CAP_FSETID`, and says
+nothing about the kernel's answer to the client. Through the mount, a file with
+mode `4755` drops to `755` on a 4 KiB write and again on a truncate, while a
+file with mode `2664` keeps its set-group-ID bit across the same two
+operations — the VFS rule, now on the server's side of the wire.
+
 ## Environment notes and follow-ups
 
 * Kernel 7.0.0-28-generic on both guests. `fs.fuse.max_pages_limit = 256`,
@@ -383,76 +474,12 @@ streaming read run confirms it at 30.7%.
 * `sysstat` remains on both guests and `bindfs` plus `strace` remain on the
   server guest.
 
-## Phase 8: the per-write probe, removed
+The Phase 8 run left the pair the same way:
 
-Measured after the change landed on branch `perf/kill-priv` (`587bc00`): same
-pair, same drained single-job driver, same two 512 MiB files.
-
-The extra round trip per write was a `GETXATTR` of `security.capability`, not
-a `GETATTR`. The kernel issues it from `file_remove_privs`
-(`fs/inode.c:2317-2341`) before every write on an inode that lacks `S_NOSEC`,
-and a FUSE superblock only gains `SB_NOSEC` when the server negotiates
-`FUSE_HANDLE_KILLPRIV_V2` (`fs/fuse/inode.c:1411-1414`). lbfs answers the probe
-with ENODATA, which the kernel never latches, so it repeated forever. The
-server's `xattr_fd` reopens the node through `/proc` to run `fgetxattr`, and
-that reopen is the open/fstat/close triple the earlier window counted.
-
-Asking for the flag removes the probe; honouring the promise it encodes moves
-the set-user-ID strip onto the server. Three runs per shape, median first and
-the range across the three beside it:
-
-| job (direct=1, 512M, 15 s) | before | after | range across three runs |
-|---|---|---|---|
-| randwrite 4k psync QD1 | 3365 IOPS, 296 µs | 6576 IOPS, 151.0 µs | 6467-6769 IOPS, 147.0-153.7 µs |
-| randread 4k psync QD1 | 8322 IOPS, 119.3 µs | 8327 IOPS, 119.1 µs | 8239-8448 IOPS, 117.6-120.6 µs |
-| randread 4k libaio QD16 | 40290 IOPS, 393 µs | 43507 IOPS, 367.1 µs | 43472-44199 IOPS, 361.3-367.5 µs |
-| seq read 1M psync | 1580 MB/s, 632 µs | 1814 MB/s, 550.2 µs | 1724-1843 MB/s, 541.8-579.1 µs |
-
-The write shape halves: 296 µs becomes 151 µs and 3365 IOPS becomes 6576, a
-145 µs saving where the earlier arithmetic priced the round trip at 90 µs. The
-gap between the estimate and the result belongs to the reopen and the
-`spawn_blocking` hop, which cost more than the bare metadata round trip that
-estimate used. What remains, 151 µs through the mount, sits within a few
-microseconds of the 146.4 µs the raw RPC layer charged for the same 4 KiB write
-on this pair.
-
-The three read shapes hold. Random 4 KiB reads at QD1 land within 0.2% of the
-earlier figure, and that is the control which makes the write result a change
-in the write path rather than a faster pair today. The queued read and the
-streaming read come in 8% and 15% ahead, both inside the 20% spread this pair
-carries between runs.
-
-Syscall counts from `strace -c -f` on `lbfs-server`, one 12 s randwrite window
-per row:
-
-| window | reply frames (`writev`) | `open` | `fstat` | `close` |
-|---|---|---|---|---|
-| before | 12872 | 6430 | 6430 | 6430 |
-| after, 1 s attribute timeout | 31589 | 12 | 0 | 12 |
-| after, 30 s attribute timeout | 31634 | 0 | 0 | 0 |
-
-One reply frame per write rather than two. The triple became a pair as well:
-the node table now carries the file type, so `xattr_fd` skips the `fstat` it
-used to run. Twelve reopens across twelve seconds is one per second, and that
-rate is the attribute timeout — `fuse_change_attributes_common` clears
-`S_NOSEC` on every attribute reply, so each expiry buys the kernel one more
-probe. A mount with `--attr-timeout 30` shows none at all over the same window,
-which places the residue on that path and nowhere else. A workload that
-interleaves `stat` with writes pays more of these probes than fio's pure write
-loop does.
-
-The kernel granted the capability. The client log carries no "unsupported by
-this kernel" line, and the server logs `policy=Kernel` at attach, the right
-choice for a unit running as `ubuntu` without `CAP_FSETID`. Through the mount,
-a file with mode `4755` drops to `755` on a 4 KiB write and again on a
-truncate, while a file with mode `2664` keeps its set-group-ID bit across the
-same two operations — the VFS rule, now on the server's side of the wire.
-
-### Cleanup after this run
-
-* Client guest: `/mnt/lbfs` unmounted, no `lbfs-client` process, fio job files
-  and logs removed.
-* Server guest: `bench/` gone from the export, which is empty again, and the
-  drain script removed.
-* `lbfs-server` stays active on the server guest, running this branch's binary.
+* Client guest: `/mnt/lbfs` unmounted, no `lbfs-client` process, the bench tree
+  and the run's temporary files removed.
+* Server guest: the export empty again, `lbfs-server` active with no restarts,
+  no tracer attached, the drain script removed.
+* `lbfs-server` now runs the `perf/kill-priv` build,
+  `fb5066ce618ac0855c1d0fd3eca04a5d`, which supersedes the md5 above.
 * Both domains still running.
