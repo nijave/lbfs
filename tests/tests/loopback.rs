@@ -696,6 +696,11 @@ fn privileged_bits_die_on_write(writeback: bool) {
     let exec_real = lb.export().join("sgid-exec");
     std::fs::write(&exec, b"old").unwrap();
     std::fs::set_permissions(&exec, std::os::unix::fs::PermissionsExt::from_mode(0o2775)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&exec_real).unwrap().mode() & 0o7777,
+        0o2775,
+        "the chmod did not reach the export"
+    );
     std::fs::write(&exec, b"new").unwrap();
     assert_eq!(
         std::fs::metadata(&exec_real).unwrap().mode() & 0o7777,
@@ -706,6 +711,11 @@ fn privileged_bits_die_on_write(writeback: bool) {
     let mark_real = lb.export().join("sgid-mand");
     std::fs::write(&mark, b"old").unwrap();
     std::fs::set_permissions(&mark, std::os::unix::fs::PermissionsExt::from_mode(0o2664)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&mark_real).unwrap().mode() & 0o7777,
+        0o2664,
+        "the chmod did not reach the export"
+    );
     std::fs::write(&mark, b"new").unwrap();
     assert_eq!(
         std::fs::metadata(&mark_real).unwrap().mode() & 0o7777,
