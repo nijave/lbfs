@@ -58,22 +58,34 @@ use fuser::{
     ReplyXattr, Request, TimeOrNow,
 };
 use lbfs_proto::ops::CopyFileRangeRequest;
-use lbfs_proto::types::{Entry, FileAttr, FileKind, NodeId, SetattrArgs, StatfsReply, TimeSet};
+use lbfs_proto::types::{
+    DirEntryPlus, Entry, FileAttr, FileKind, NodeId, SetattrArgs, StatfsReply, TimeSet,
+};
 use lbfs_proto::Errno;
 
 use crate::conn::Connection;
 
 /// How many bytes of directory page to ask the server for per round trip.
 ///
-/// The kernel hands `READDIR` and `READDIRPLUS` a buffer of one page, so a
-/// smaller ask would cost a round trip per 4 KiB of listing. Asking for a
-/// little more fills that buffer in one call and leaves a tail the client
-/// discards — cheap, because the server answers every page of a directory out
-/// of the snapshot it took at `OPENDIR`, so re-requesting the tail on the next
-/// call costs it no syscalls. The server clamps the ask to what a reply frame
-/// can legally carry, so this number needs no relationship to the negotiated
-/// limits.
-const READDIR_PAGE_BYTES: u32 = 8 << 10;
+/// One page, to match the buffer the kernel hands `READDIR` and `READDIRPLUS`.
+/// Over-fetching is *not* free on the `READDIRPLUS` side, whatever the shape of
+/// the snapshot the server pages out of: every entry in a `READDIRPLUS` reply
+/// has already cost the server an `openat`, a `statx` and a lookup count, and a
+/// lookup count the kernel never sees is one the bridge has to hand back itself
+/// (see [`consume_readdirplus_page`]). At 8 KiB against a 4 KiB kernel buffer
+/// roughly half of every page was over-fetched; the two cost models are close
+/// enough — the server charges `namelen + 160` per entry, the kernel
+/// `align8(152 + namelen)` — that a matched ask leaves a residue of about one
+/// entry.
+///
+/// Plain `READDIR` packs looser on the server than in the kernel (`namelen +
+/// 32` against `align8(24 + namelen)`), so a page occasionally under-fills the
+/// kernel's buffer and the loop asks again. One extra round trip per hundred
+/// names is the cheaper mistake.
+///
+/// The server clamps the ask to what a reply frame can legally carry, so this
+/// number needs no relationship to the negotiated limits.
+const READDIR_PAGE_BYTES: u32 = 4 << 10;
 
 // ---------------------------------------------------------------------------
 // Attribute conversion
@@ -224,6 +236,79 @@ fn direntplus_ino(name: &[u8], entry: &Entry) -> u64 {
     }
 }
 
+/// What became of one directory page.
+#[derive(Debug, PartialEq, Eq)]
+enum PageOutcome {
+    /// Every entry reached the kernel's buffer; ask for the next page.
+    Consumed,
+    /// The buffer filled. The reply is finished, whatever the listing has left.
+    Full,
+}
+
+/// Feed one `READDIRPLUS` page into the kernel's reply buffer, paying back the
+/// lookup counts for whatever does not fit.
+///
+/// The paying back is the whole point. A `READDIRPLUS` entry is not free data:
+/// the server resolved it through `lookup_impl`, which registers the node and
+/// bumps its lookup count, and the only thing that ever brings that count down
+/// is a `FORGET`. The kernel sends one per entry it *received* — so an entry
+/// this bridge fetched and then discarded, because the buffer filled before it,
+/// is a count nothing will ever retire. The node and its `O_PATH` descriptor
+/// stay pinned for the life of the connection, and a recursive listing of a
+/// large tree walks the server into `EMFILE`. Discarding the tail silently is
+/// therefore a leak, not an optimization; `forget` here is the bridge settling
+/// its own debt rather than the kernel's.
+///
+/// Entries with node 0 — `.`, `..`, and names the server could not resolve —
+/// owe nothing, because the server registered nothing for them.
+///
+/// `emit` returns `true` when the entry did not fit, matching
+/// [`fuser::ReplyDirectoryPlus::add`].
+fn consume_readdirplus_page(
+    entries: &[DirEntryPlus],
+    mut emit: impl FnMut(&DirEntryPlus, u64) -> bool,
+    mut forget: impl FnMut(NodeId),
+) -> PageOutcome {
+    for (i, e) in entries.iter().enumerate() {
+        if !emit(e, direntplus_ino(&e.name, &e.entry)) {
+            continue;
+        }
+        // The rejected entry and everything behind it never reached the
+        // kernel, so this bridge owes their lookup counts back.
+        for unseen in &entries[i..] {
+            if unseen.entry.node != 0 {
+                forget(unseen.entry.node);
+            }
+        }
+        first_entry_overflow(i, &e.name);
+        return PageOutcome::Full;
+    }
+    PageOutcome::Consumed
+}
+
+/// A page whose *first* entry does not fit leaves the reply empty, and an empty
+/// reply is how a filesystem says "end of directory" — so the listing would
+/// look complete when it is not, and the cursor could never advance.
+///
+/// Unreachable at any size the kernel and this protocol use together: a
+/// `fuse_direntplus` costs 152 bytes plus a name of at most `FUSE_NAME_MAX`
+/// against a buffer of one page. Said out loud anyway, because the failure is
+/// silent data loss rather than an error, and because "unreachable" is a claim
+/// about two numbers neither side of this code owns.
+fn first_entry_overflow(index: usize, name: &[u8]) {
+    debug_assert!(
+        index > 0,
+        "the kernel's directory buffer could not hold a single entry"
+    );
+    if index == 0 {
+        tracing::error!(
+            name = %String::from_utf8_lossy(name),
+            "the kernel's directory buffer could not hold one entry; \
+             this listing will look complete when it is not"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mount and init configuration
 // ---------------------------------------------------------------------------
@@ -315,6 +400,15 @@ pub fn mount_options(max_io_size: u32, allow_other: bool, auto_unmount: bool) ->
         MountOption::FSName("lbfs".to_string()),
         MountOption::DefaultPermissions,
         MountOption::CUSTOM(format!("max_read={max_io_size}")),
+        // Said out loud rather than inherited. `fusermount3` forces both on an
+        // unprivileged mount, so for the ordinary case these change nothing —
+        // but a client run as root gets neither, and the attributes this bridge
+        // reports are the server's verbatim, setuid bits and `rdev` included.
+        // A compromised server could otherwise plant a setuid-root binary or a
+        // device node in the export and have the client's kernel honor it. v1
+        // trusts the server, and this is the cheapest way not to have to.
+        MountOption::NoSuid,
+        MountOption::NoDev,
     ];
     if allow_other {
         opts.push(MountOption::AllowOther);
@@ -448,6 +542,27 @@ impl fuser::Filesystem for LbfsFuse {
         // throughput, never correctness.
         if let Err(nearest) = config.set_max_readahead(max_io) {
             tracing::debug!(max_io, nearest, "max_readahead clamped by the kernel");
+        }
+
+        // The kernel meters *background* requests — readahead and writeback
+        // flushes, which is nearly all of the bulk I/O — against a limit of its
+        // own, separate from the negotiated window. fuser's default is 16, so a
+        // session that settled on 128 in flight would spend seven eighths of it
+        // on nothing and the design's "FUSE concurrency maps onto protocol
+        // pipelining" would stop being true exactly where throughput is decided.
+        // The congestion threshold is where the kernel starts treating the
+        // filesystem as backed up; three quarters is fuser's own ratio, named
+        // here so the number does not rest on somebody else's default.
+        let window = u16::try_from(self.conn.limits.max_inflight).unwrap_or(u16::MAX);
+        if let Err(nearest) = config.set_max_background(window) {
+            tracing::warn!(window, nearest, "the kernel would not take max_background");
+        }
+        if let Err(nearest) = config.set_congestion_threshold((window / 4 * 3).max(1)) {
+            tracing::warn!(
+                window,
+                nearest,
+                "the kernel would not take the congestion threshold"
+            );
         }
         for cap in capabilities(self.writeback) {
             if config.add_capabilities(cap.bit).is_ok() {
@@ -811,17 +926,20 @@ impl fuser::Filesystem for LbfsFuse {
                 // check is what keeps a server that did from hanging the mount
                 // rather than merely truncating a listing.
                 let done = page.end || page.entries.is_empty();
-                for e in &page.entries {
+                for (i, e) in page.entries.iter().enumerate() {
                     cursor = e.offset;
                     // The real inode from the server's `getdents64`. Plain
                     // `READDIR` instantiates nothing, so this number is only
-                    // ever `d_ino`, and a zero would have glibc drop the name.
+                    // ever `d_ino`, a zero would have glibc drop the name, and
+                    // a discarded entry owes no `FORGET` — the difference from
+                    // `readdirplus`, where every entry carries a lookup count.
                     if reply.add(
                         e.ino,
                         e.offset as i64,
                         kind_of_wire(e.kind),
                         OsStr::from_bytes(&e.name),
                     ) {
+                        first_entry_overflow(i, &e.name);
                         return reply.ok();
                     }
                 }
@@ -849,25 +967,32 @@ impl fuser::Filesystem for LbfsFuse {
                     Err(e) => return reply.error(errno(e)),
                 };
                 let done = page.end || page.entries.is_empty();
-                for e in &page.entries {
-                    cursor = e.offset;
-                    // Every name the server sent is emitted, including the ones
-                    // it could not resolve: dropping one would make the listing
-                    // disagree with `READDIR`, and the kernel takes no lookup
-                    // count for an entry whose nodeid is zero, so nothing is
-                    // owed for it either.
-                    let node = direntplus_ino(&e.name, &e.entry);
-                    let attr = to_fuse_attr(node, &e.entry.attr);
-                    if reply.add(
-                        node,
-                        e.offset as i64,
-                        OsStr::from_bytes(&e.name),
-                        &ttl,
-                        &attr,
-                        e.entry.generation,
-                    ) {
-                        return reply.ok();
-                    }
+                // Every name the server sent is emitted, including the ones it
+                // could not resolve: dropping one would make the listing
+                // disagree with `READDIR`, and the kernel takes no lookup count
+                // for an entry whose nodeid is zero, so nothing is owed for it
+                // either. Anything the buffer will not take is forgotten in
+                // there — see `consume_readdirplus_page`.
+                let outcome = consume_readdirplus_page(
+                    &page.entries,
+                    |e, node| {
+                        let attr = to_fuse_attr(node, &e.entry.attr);
+                        reply.add(
+                            node,
+                            e.offset as i64,
+                            OsStr::from_bytes(&e.name),
+                            &ttl,
+                            &attr,
+                            e.entry.generation,
+                        )
+                    },
+                    |node| conn.send_forget(node, 1),
+                );
+                if outcome == PageOutcome::Full {
+                    return reply.ok();
+                }
+                if let Some(last) = page.entries.last() {
+                    cursor = last.offset;
                 }
                 if done {
                     return reply.ok();
@@ -1217,6 +1342,101 @@ mod tests {
         assert_eq!(direntplus_ino(b"...", &entry(0, 4242)), 0);
     }
 
+    fn plus(name: &[u8], node: NodeId) -> DirEntryPlus {
+        DirEntryPlus {
+            name: name.to_vec(),
+            entry: entry(node, 900 + node),
+            offset: 100 + node,
+        }
+    }
+
+    /// One page, a buffer with room for `room` of it, and what came back.
+    fn consume(page: &[DirEntryPlus], room: usize) -> (PageOutcome, Vec<Vec<u8>>, Vec<NodeId>) {
+        let mut emitted: Vec<Vec<u8>> = Vec::new();
+        let mut forgotten = Vec::new();
+        let outcome = consume_readdirplus_page(
+            page,
+            |e, _| {
+                if emitted.len() == room {
+                    return true; // full: this entry did not go in
+                }
+                emitted.push(e.name.clone());
+                false
+            },
+            |node| forgotten.push(node),
+        );
+        (outcome, emitted, forgotten)
+    }
+
+    /// The leak this function exists to prevent. Every `READDIRPLUS` entry the
+    /// server sent has already cost it a registration and a lookup count, and
+    /// the kernel only ever retires the counts for entries it received. An
+    /// over-fetched tail dropped in silence pins a node and its `O_PATH`
+    /// descriptor on the server until the connection closes — `EMFILE` after
+    /// enough directories.
+    #[test]
+    fn an_overfull_page_forgets_every_entry_the_kernel_never_saw() {
+        let page = [
+            plus(b"a", 5),
+            plus(b"b", 6),
+            plus(b"c", 7),
+            plus(b"d", 8),
+            plus(b"e", 9),
+        ];
+        let (outcome, emitted, forgotten) = consume(&page, 2);
+        assert_eq!(outcome, PageOutcome::Full);
+        assert_eq!(emitted, vec![b"a".to_vec(), b"b".to_vec()]);
+        // The rejected entry `c` counts too: it never reached the kernel
+        // either.
+        assert_eq!(forgotten, vec![7, 8, 9]);
+    }
+
+    /// Node 0 is the server saying it registered nothing — the dots, and names
+    /// it could not resolve. Forgetting one would decrement a count that was
+    /// never taken.
+    #[test]
+    fn an_overfull_page_owes_nothing_for_node_zero_entries() {
+        let page = [
+            plus(b"a", 5),
+            plus(b".", 0),
+            plus(b"..", 0),
+            plus(b"vanished", 0),
+            plus(b"z", 9),
+        ];
+        let (outcome, emitted, forgotten) = consume(&page, 1);
+        assert_eq!(outcome, PageOutcome::Full);
+        assert_eq!(emitted, vec![b"a".to_vec()]);
+        assert_eq!(forgotten, vec![9]);
+    }
+
+    /// The ordinary case owes nothing: every entry reached the kernel, so every
+    /// lookup count is the kernel's to retire.
+    #[test]
+    fn a_page_that_fits_forgets_nothing() {
+        let page = [plus(b"a", 5), plus(b".", 0), plus(b"b", 6)];
+        let (outcome, emitted, forgotten) = consume(&page, page.len());
+        assert_eq!(outcome, PageOutcome::Consumed);
+        assert_eq!(emitted.len(), 3);
+        assert!(forgotten.is_empty());
+    }
+
+    #[test]
+    fn an_empty_page_is_consumed_and_owes_nothing() {
+        let (outcome, emitted, forgotten) = consume(&[], 0);
+        assert_eq!(outcome, PageOutcome::Consumed);
+        assert!(emitted.is_empty());
+        assert!(forgotten.is_empty());
+    }
+
+    /// The residue this leaves behind is the reason the page ask matches the
+    /// kernel's buffer instead of doubling it: every over-fetched entry is a
+    /// round trip's worth of server work thrown away, plus a `FORGET` to undo
+    /// it.
+    #[test]
+    fn the_page_ask_matches_the_kernels_buffer() {
+        assert_eq!(READDIR_PAGE_BYTES, 4096);
+    }
+
     fn requested(writeback: bool) -> u32 {
         capabilities(writeback).iter().fold(0, |all, c| all | c.bit)
     }
@@ -1275,6 +1495,21 @@ mod tests {
         assert!(opts.contains(&MountOption::CUSTOM("max_read=4096".to_string())));
         assert!(opts.contains(&MountOption::FSName("lbfs".to_string())));
         assert!(opts.contains(&MountOption::DefaultPermissions));
+    }
+
+    /// The server's attributes travel verbatim, setuid bits and `rdev`
+    /// included. `fusermount3` refuses both to an unprivileged mount anyway;
+    /// this is what covers a client run as root against a server it should not
+    /// have trusted that far.
+    #[test]
+    fn the_mount_never_honours_setuid_bits_or_device_nodes() {
+        for (allow_other, auto_unmount) in [(false, false), (true, true)] {
+            let opts = mount_options(1 << 20, allow_other, auto_unmount);
+            assert!(opts.contains(&MountOption::NoSuid));
+            assert!(opts.contains(&MountOption::NoDev));
+            assert!(!opts.contains(&MountOption::Suid));
+            assert!(!opts.contains(&MountOption::Dev));
+        }
     }
 
     /// Neither widens access by default: `allow_other` exposes the mount to

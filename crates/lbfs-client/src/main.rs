@@ -96,6 +96,8 @@ enum StartupError {
     },
     #[error("installing a signal handler: {0}")]
     Signals(std::io::Error),
+    #[error("the FUSE session ended before a shutdown signal arrived")]
+    SessionEnded,
 }
 
 fn main() -> ExitCode {
@@ -134,6 +136,15 @@ fn run() -> Result<(), StartupError> {
         .block_on(Connection::connect(addr, export, writeback))
         .map_err(|source| StartupError::Connect { addr, source })?;
 
+    // Before the mount, not after. A signal arriving in the window between
+    // `spawn_mount2` returning and the handlers being installed would take its
+    // default action and kill this process with a mount already on the
+    // directory and nothing left to unmount it. Not before `connect`, though:
+    // registering a handler suppresses the default action whether or not
+    // anything is awaiting it, so an earlier registration would make Ctrl-C do
+    // nothing for as long as a silent server can hold the handshake open.
+    let mut signals = rt.block_on(async { Signals::install() })?;
+
     let opts = mount_options(limits.max_io_size, cli.allow_other, cli.auto_unmount);
     let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, writeback);
     let session =
@@ -148,8 +159,7 @@ fn run() -> Result<(), StartupError> {
         "mounted"
     );
 
-    rt.block_on(wait_for_signal())
-        .map_err(StartupError::Signals)?;
+    let ending = rt.block_on(wait_for_shutdown(&mut signals, &session));
 
     // This is the drain, not just the unmount. `umount(2)` syncs the
     // superblock before it detaches, so the kernel writes back every dirty
@@ -160,23 +170,76 @@ fn run() -> Result<(), StartupError> {
     // two would fail those last writes with `EIO` and lose the data.
     tracing::info!("unmounting");
     drop(session);
-    Ok(())
+    match ending {
+        Ending::Signalled => Ok(()),
+        Ending::SessionEnded => Err(StartupError::SessionEnded),
+    }
 }
 
-/// A dead connection is not a reason to exit: the mount stays present and
-/// answers `EIO` until somebody unmounts it (spec §7). Only a signal ends the
-/// process.
-async fn wait_for_signal() -> std::io::Result<()> {
-    use tokio::signal::unix::{signal, SignalKind};
+/// The two signals that end this process, held from before the mount exists.
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
 
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let received = tokio::select! {
-        _ = interrupt.recv() => "SIGINT",
-        _ = terminate.recv() => "SIGTERM",
-    };
-    tracing::info!(signal = received, "shutting down");
-    Ok(())
+impl Signals {
+    /// Must be called inside the runtime: the streams register with tokio's
+    /// signal driver.
+    fn install() -> Result<Signals, StartupError> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Signals {
+            interrupt: signal(SignalKind::interrupt()).map_err(StartupError::Signals)?,
+            terminate: signal(SignalKind::terminate()).map_err(StartupError::Signals)?,
+        })
+    }
+}
+
+/// Why the process is stopping.
+enum Ending {
+    Signalled,
+    /// The FUSE session loop stopped on its own — somebody ran
+    /// `fusermount3 -u`, or `init` refused the mount.
+    SessionEnded,
+}
+
+/// How long to leave a dead session unnoticed.
+///
+/// Nobody is waiting on the answer, so this trades promptness for not holding a
+/// thread parked on a `join` that usually never returns.
+const SESSION_POLL: Duration = Duration::from_millis(200);
+
+/// Wait for a signal, or for the mount to end underneath this process.
+///
+/// A dead *connection* is not a reason to exit: the mount stays present and
+/// answers `EIO` until somebody unmounts it (spec §7). A dead *session* is,
+/// because there is no mount left to serve — and the `init` path that refuses a
+/// kernel without the writeback cache reaches exactly this state, having
+/// already returned `Ok` from `spawn_mount2`. Without this the process would
+/// wait for a signal that is not coming, holding the runtime, the socket and an
+/// `ENOTCONN` mountpoint.
+///
+/// Polled rather than awaited because `BackgroundSession` hands out its
+/// `JoinHandle` but no way to await it, and `join` would need a thread of its
+/// own for as long as the mount lives.
+async fn wait_for_shutdown(signals: &mut Signals, session: &fuser::BackgroundSession) -> Ending {
+    loop {
+        tokio::select! {
+            _ = signals.interrupt.recv() => {
+                tracing::info!(signal = "SIGINT", "shutting down");
+                return Ending::Signalled;
+            }
+            _ = signals.terminate.recv() => {
+                tracing::info!(signal = "SIGTERM", "shutting down");
+                return Ending::Signalled;
+            }
+            () = tokio::time::sleep(SESSION_POLL) => {
+                if session.guard.is_finished() {
+                    tracing::warn!("the FUSE session ended without a shutdown signal");
+                    return Ending::SessionEnded;
+                }
+            }
+        }
+    }
 }
 
 fn attr_timeout(secs: f64) -> Result<Duration, StartupError> {
