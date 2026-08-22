@@ -352,9 +352,9 @@ impl TestClient {
 
     /// Write a header with nothing behind it, whatever its lengths claim.
     ///
-    /// Separate from [`TestClient::frame`] because `write_frame` asserts that
-    /// the header agrees with the buffers, which is exactly what a test of an
-    /// oversize `body_len` must be able to violate.
+    /// Separate from [`TestClient::frame`] because `write_frame` refuses a
+    /// header that disagrees with the buffers, which is exactly what a test of
+    /// an oversize `body_len` must be able to violate.
     pub async fn header_only(&mut self, hdr: FrameHeader) {
         self.sock.write_all(&hdr.encode()).await.unwrap();
         self.sock.flush().await.unwrap();

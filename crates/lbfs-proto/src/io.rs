@@ -35,8 +35,29 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     body: &[u8],
     data: &[u8],
 ) -> std::io::Result<()> {
-    debug_assert_eq!(hdr.body_len as usize, body.len());
-    debug_assert_eq!(hdr.data_len as usize, data.len());
+    // The header is what the peer frames by, so a header that disagrees with
+    // the bytes we are about to send desynchronises the stream. Refuse in
+    // release builds too, not just under `debug_assert`.
+    if hdr.body_len as usize != body.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "frame header body_len {} disagrees with the {}-byte body slice",
+                hdr.body_len,
+                body.len()
+            ),
+        ));
+    }
+    if hdr.data_len as usize != data.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "frame header data_len {} disagrees with the {}-byte data slice",
+                hdr.data_len,
+                data.len()
+            ),
+        ));
+    }
     let head = hdr.encode();
     let mut slices = [IoSlice::new(&head), IoSlice::new(body), IoSlice::new(data)];
     let mut total = HEADER_LEN + body.len() + data.len();
@@ -127,6 +148,48 @@ mod tests {
             .unwrap();
         assert_eq!(got_data, data);
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn header_lying_about_body_len_is_rejected() {
+        let mut sink: Vec<u8> = Vec::new();
+        let hdr = FrameHeader {
+            request_id: 5,
+            op_or_status: 16,
+            flags: 0,
+            body_len: 9,
+            data_len: 4,
+        };
+        let err = write_frame(&mut sink, hdr, b"abc", b"wxyz")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("body_len"),
+            "message should name the disagreeing length: {err}"
+        );
+        assert!(sink.is_empty(), "nothing may reach the stream");
+    }
+
+    #[tokio::test]
+    async fn header_lying_about_data_len_is_rejected() {
+        let mut sink: Vec<u8> = Vec::new();
+        let hdr = FrameHeader {
+            request_id: 6,
+            op_or_status: 16,
+            flags: 0,
+            body_len: 3,
+            data_len: 99,
+        };
+        let err = write_frame(&mut sink, hdr, b"abc", b"wxyz")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("data_len"),
+            "message should name the disagreeing length: {err}"
+        );
+        assert!(sink.is_empty(), "nothing may reach the stream");
     }
 
     #[tokio::test]
