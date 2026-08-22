@@ -30,6 +30,13 @@ struct Node {
     fd: Arc<OwnedFd>,
     key: FileKey,
     generation: u64,
+    /// `st_mode & S_IFMT`, captured when the node was first registered.
+    ///
+    /// A live inode never changes type — no syscall exists that would do it —
+    /// and the `O_PATH` descriptor above pins that inode for as long as the
+    /// node lives, so this value cannot go stale. Permission bits are *not*
+    /// stored, because `SETATTR` changes those and nothing here would notice.
+    file_type: u32,
     /// The kernel's lookup count for this id, decremented by `FUSE_FORGET`.
     nlookup: u64,
 }
@@ -45,7 +52,7 @@ pub struct NodeTable(Mutex<Inner>);
 
 impl NodeTable {
     /// Installs `root_fd` as `ROOT_NODE` with an immortal lookup count.
-    pub fn new(root_fd: OwnedFd, root_key: FileKey) -> NodeTable {
+    pub fn new(root_fd: OwnedFd, root_key: FileKey, file_type: u32) -> NodeTable {
         let mut nodes = HashMap::new();
         let mut by_key = HashMap::new();
         nodes.insert(
@@ -54,6 +61,7 @@ impl NodeTable {
                 fd: Arc::new(root_fd),
                 key: root_key,
                 generation: 0,
+                file_type,
                 nlookup: u64::MAX,
             },
         );
@@ -71,7 +79,12 @@ impl NodeTable {
     /// When `key` is already present the existing node is returned with its
     /// lookup count bumped and `fd` closed — the table already owns a
     /// descriptor for that inode.
-    pub fn register(&self, fd: OwnedFd, key: FileKey) -> (NodeId, u64, Arc<OwnedFd>) {
+    pub fn register(
+        &self,
+        fd: OwnedFd,
+        key: FileKey,
+        file_type: u32,
+    ) -> (NodeId, u64, Arc<OwnedFd>) {
         let mut g = self.0.lock().unwrap();
         if let Some(&id) = g.by_key.get(&key) {
             let node = g.nodes.get_mut(&id).expect("by_key points at a live node");
@@ -90,6 +103,7 @@ impl NodeTable {
                 fd: Arc::clone(&fd),
                 key,
                 generation,
+                file_type,
                 nlookup: 1,
             },
         );
@@ -104,6 +118,13 @@ impl NodeTable {
         g.nodes
             .get(&node)
             .map(|n| (Arc::clone(&n.fd), n.generation))
+    }
+
+    /// The stored `S_IFMT` bits, or `None` for an id this table never issued
+    /// or has already forgotten.
+    pub fn file_type(&self, node: NodeId) -> Option<u32> {
+        let g = self.0.lock().unwrap();
+        g.nodes.get(&node).map(|n| n.file_type)
     }
 
     /// Drops `nlookup` references, releasing the node (and its descriptor) at
@@ -157,7 +178,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = open_path(dir.path());
         let key = key_of(&root);
-        (dir, NodeTable::new(root, key))
+        (dir, NodeTable::new(root, key, libc::S_IFDIR))
+    }
+
+    /// `xattr_fd` needs the file type and nothing else about the mode, and a
+    /// live inode never changes type. Storing it at registration means the
+    /// xattr path stops paying for an `fstat` it can answer from memory.
+    #[test]
+    fn a_node_remembers_its_file_type() {
+        let (dir, table) = table_over_tempdir();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+
+        let ffd = open_path(&dir.path().join("f"));
+        let (fid, _, _) = table.register(
+            ffd,
+            key_of(&open_path(&dir.path().join("f"))),
+            libc::S_IFREG,
+        );
+        let dfd = open_path(&dir.path().join("d"));
+        let (did, _, _) = table.register(
+            dfd,
+            key_of(&open_path(&dir.path().join("d"))),
+            libc::S_IFDIR,
+        );
+
+        assert_eq!(table.file_type(fid), Some(libc::S_IFREG));
+        assert_eq!(table.file_type(did), Some(libc::S_IFDIR));
+        assert_eq!(table.file_type(ROOT_NODE), Some(libc::S_IFDIR));
+        assert_eq!(table.file_type(9999), None);
     }
 
     #[test]
@@ -167,7 +216,7 @@ mod tests {
         let fd = open_path(&dir.path().join("f"));
         let key = key_of(&fd);
 
-        let (id, generation, _) = table.register(fd, key);
+        let (id, generation, _) = table.register(fd, key, libc::S_IFREG);
         assert!(id > 1);
         assert!(table.get(id).is_some());
 
@@ -188,8 +237,8 @@ mod tests {
         let key_b = key_of(&fd_b);
         assert_eq!(key_a, key_b);
 
-        let (id_a, _, _) = table.register(fd_a, key_a);
-        let (id_b, _, _) = table.register(fd_b, key_b);
+        let (id_a, _, _) = table.register(fd_a, key_a, libc::S_IFREG);
+        let (id_b, _, _) = table.register(fd_b, key_b, libc::S_IFREG);
         assert_eq!(id_a, id_b);
 
         table.forget(id_a, 1);
@@ -204,14 +253,14 @@ mod tests {
         std::fs::write(dir.path().join("f"), b"x").unwrap();
         let fd1 = open_path(&dir.path().join("f"));
         let key1 = key_of(&fd1);
-        let (_, gen1, _) = table.register(fd1, key1);
+        let (_, gen1, _) = table.register(fd1, key1, libc::S_IFREG);
         table.forget(ROOT_NODE + 1, 1);
 
         std::fs::remove_file(dir.path().join("f")).unwrap();
         std::fs::write(dir.path().join("f"), b"y").unwrap();
         let fd2 = open_path(&dir.path().join("f"));
         let key2 = key_of(&fd2);
-        let (_, gen2, _) = table.register(fd2, key2);
+        let (_, gen2, _) = table.register(fd2, key2, libc::S_IFREG);
         assert_ne!(gen1, gen2);
     }
 
@@ -227,13 +276,13 @@ mod tests {
 
         std::fs::write(dir.path().join("first"), b"x").unwrap();
         let fd1 = open_path(&dir.path().join("first"));
-        let (id1, gen1, _) = table.register(fd1, recycled);
+        let (id1, gen1, _) = table.register(fd1, recycled, libc::S_IFREG);
         table.forget(id1, 1);
         assert!(table.get(id1).is_none());
 
         std::fs::write(dir.path().join("second"), b"y").unwrap();
         let fd2 = open_path(&dir.path().join("second"));
-        let (id2, gen2, _) = table.register(fd2, recycled);
+        let (id2, gen2, _) = table.register(fd2, recycled, libc::S_IFREG);
 
         assert_ne!(id1, id2, "a forgotten id must never be re-issued");
         assert_ne!(gen1, gen2, "a recycled key must get a fresh generation");

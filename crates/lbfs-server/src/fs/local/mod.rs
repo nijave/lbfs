@@ -301,7 +301,7 @@ impl LocalFs {
         );
         Ok(LocalFs {
             uring,
-            nodes: NodeTable::new(root, root_key),
+            nodes: NodeTable::new(root, root_key, u32::from(st.stx_mode) & libc::S_IFMT),
             pool,
             files: HandleTable::new(),
             dirs: HandleTable::new(),
@@ -402,7 +402,9 @@ impl LocalFs {
             return Err(ELOOP);
         }
         let owned = into_owned(child).map_err(errno)?;
-        let (node, generation, _fd) = self.nodes.register(owned, key);
+        let (node, generation, _fd) =
+            self.nodes
+                .register(owned, key, u32::from(st.stx_mode) & libc::S_IFMT);
         Ok(Entry {
             node,
             generation,
@@ -465,18 +467,25 @@ impl LocalFs {
     /// Known limitation, inherent to the reopen: it needs *read* permission,
     /// so an unprivileged server exporting a mode-0222 file answers `EACCES`
     /// to an xattr op the backing filesystem would have allowed.
+    ///
+    /// The type check reads the node table rather than the filesystem. A live
+    /// inode never changes type, so the value `lookup_impl` already captured
+    /// answers this question exactly, and the xattr path drops one syscall per
+    /// operation. That matters more than it looks: on a mount without
+    /// `FUSE_HANDLE_KILLPRIV_V2`, the kernel probes `security.capability`
+    /// before every single write.
     async fn xattr_fd(&self, node: NodeId) -> FsResult<Arc<OwnedFd>> {
         let fd = self.node_fd(node)?;
-        // Blocking: `reopen` is an `open(2)`, and the `fstat` that guards it
-        // belongs on the same thread rather than costing a second round trip
-        // through the ring.
+        match self.nodes.file_type(node) {
+            Some(t) if t == libc::S_IFREG || t == libc::S_IFDIR => {}
+            Some(_) => return Err(EOPNOTSUPP),
+            // The descriptor above came out of the same table, so a miss here
+            // means a FORGET landed between the two reads.
+            None => return Err(Errno::ESTALE),
+        }
+        // Blocking: `reopen` is an `open(2)`, which has no io_uring opcode that
+        // takes a `/proc` path.
         let opened = tokio::task::spawn_blocking(move || {
-            // `fstat` is one of the few syscalls an O_PATH descriptor accepts.
-            let st = rustix::fs::fstat(&*fd).map_err(rustix_errno)?;
-            match rustix::fs::FileType::from_raw_mode(st.st_mode) {
-                rustix::fs::FileType::RegularFile | rustix::fs::FileType::Directory => {}
-                _ => return Err(EOPNOTSUPP),
-            }
             reopen(&fd, rustix::fs::OFlags::RDONLY).map_err(errno)
         })
         .await
