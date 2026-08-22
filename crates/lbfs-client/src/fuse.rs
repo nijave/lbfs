@@ -51,7 +51,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::consts::{
     FOPEN_KEEP_CACHE, FUSE_ASYNC_DIO, FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO,
-    FUSE_WRITEBACK_CACHE,
+    FUSE_WRITEBACK_CACHE, FUSE_WRITE_KILL_PRIV,
 };
 use fuser::{
     KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -409,6 +409,22 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
 /// `--no-writeback` turns off dirty-page aggregation, not reading.
 fn open_flags() -> u32 {
     FOPEN_KEEP_CACHE
+}
+
+/// Whether this `WRITE` must clear set-user-ID and set-group-ID first.
+///
+/// The kernel sets `FUSE_WRITE_KILL_SUIDGID` — fuser's `FUSE_WRITE_KILL_PRIV`,
+/// the same bit 2 — when the writing task holds no `CAP_FSETID`. On a mount
+/// that negotiated `FUSE_HANDLE_KILLPRIV_V2` this bit is the *only* notice the
+/// server gets, because the kernel has stopped clearing the bits through its
+/// own `SETATTR`. Dropping it, which is what this bridge did before, means a
+/// setuid binary in the export survives being overwritten.
+///
+/// The direct-I/O path sets the bit whether or not the kernel granted the
+/// capability (`fs/fuse/file.c:1701-1703`), so forwarding it is safe on any
+/// mount: at worst the server strips more often than the contract demands.
+fn kill_suidgid(write_flags: u32) -> bool {
+    write_flags & FUSE_WRITE_KILL_PRIV != 0
 }
 
 /// The mount options this client uses.
@@ -859,12 +875,13 @@ impl fuser::Filesystem for LbfsFuse {
         fh: u64,
         offset: i64,
         data: &[u8],
-        _write_flags: u32,
+        write_flags: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         let (conn, _) = self.ctx();
+        let kill = kill_suidgid(write_flags);
         // The slice borrows the session's single receive buffer, which is
         // reused the moment this callback returns. The copy is what lets the
         // write outlive the callback.
@@ -874,7 +891,7 @@ impl fuser::Filesystem for LbfsFuse {
                 reply.error(libc::EINVAL);
                 return;
             };
-            match conn.write(ino, fh, offset, data).await {
+            match conn.write(ino, fh, offset, data, kill).await {
                 Ok(written) => reply.written(written),
                 Err(e) => reply.error(errno(e)),
             }
@@ -1629,5 +1646,21 @@ mod tests {
             // produce.
             assert!(!opts.contains(&MountOption::AllowRoot));
         }
+    }
+
+    /// fuser names bit 2 `FUSE_WRITE_KILL_PRIV`; the current kernel uapi calls
+    /// the same bit `FUSE_WRITE_KILL_SUIDGID` and keeps the older name as an
+    /// alias. Pin the value so a fuser upgrade that renames it cannot silently
+    /// change which bit the bridge reads.
+    #[test]
+    fn the_kill_flag_is_bit_two_and_nothing_else() {
+        assert_eq!(fuser::consts::FUSE_WRITE_KILL_PRIV, 1 << 2);
+        assert!(kill_suidgid(1 << 2));
+        assert!(kill_suidgid(0xFFFF_FFFF));
+        assert!(!kill_suidgid(0));
+        // FUSE_WRITE_CACHE and FUSE_WRITE_LOCKOWNER must not read as a strip.
+        assert!(!kill_suidgid(1 << 0));
+        assert!(!kill_suidgid(1 << 1));
+        assert!(!kill_suidgid((1 << 0) | (1 << 1)));
     }
 }

@@ -116,7 +116,10 @@ async fn connect_lookup_getattr_read_and_write() {
 
     let fh = conn.open(entry.node, libc::O_RDWR as u32).await.unwrap();
     assert_eq!(conn.read(entry.node, fh, 0, 4096).await.unwrap(), b"xyz");
-    let written = conn.write(entry.node, fh, 3, b"!!".to_vec()).await.unwrap();
+    let written = conn
+        .write(entry.node, fh, 3, b"!!".to_vec(), false)
+        .await
+        .unwrap();
     assert_eq!(written, 2);
     conn.fsync(entry.node, fh, false).await.unwrap();
     conn.flush(entry.node, fh).await.unwrap();
@@ -225,7 +228,7 @@ async fn every_typed_call_reaches_its_own_opcode() {
         .await
         .unwrap();
     assert_eq!(
-        conn.write(file.node, fh, 0, b"hello".to_vec())
+        conn.write(file.node, fh, 0, b"hello".to_vec(), false)
             .await
             .unwrap(),
         5

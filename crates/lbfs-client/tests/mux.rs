@@ -722,7 +722,7 @@ async fn cancelling_a_call_parked_on_a_full_queue_gives_its_permit_back() {
     // 1. Park the writer on a frame nobody is reading. It holds one permit.
     let stuck = {
         let conn = Arc::clone(&conn);
-        tokio::spawn(async move { conn.write(2, 7, 0, vec![0xCD; STALL_BYTES]).await })
+        tokio::spawn(async move { conn.write(2, 7, 0, vec![0xCD; STALL_BYTES], false).await })
     };
 
     // 2. Fill the outbound queue behind it. Forgets are the only frames that
@@ -870,7 +870,7 @@ async fn a_stalled_writer_makes_the_forget_queue_lossy_not_unbounded() {
 
     let stuck = {
         let conn = Arc::clone(&conn);
-        tokio::spawn(async move { conn.write(2, 7, 0, vec![0xCD; STALL_BYTES]).await })
+        tokio::spawn(async move { conn.write(2, 7, 0, vec![0xCD; STALL_BYTES], false).await })
     };
     tokio::time::sleep(NEVER).await;
 
@@ -1129,7 +1129,10 @@ async fn an_oversized_write_is_refused_locally_rather_than_sent() {
 
     // The server closes the connection over a data segment past the negotiated
     // ceiling, so one caller's mistake must not reach the wire.
-    let err = conn.write(2, 7, 0, vec![0u8; 4097]).await.unwrap_err();
+    let err = conn
+        .write(2, 7, 0, vec![0u8; 4097], false)
+        .await
+        .unwrap_err();
     assert_eq!(err, Errno::EINVAL);
     assert!(sess.recv_within(NEVER).await.is_none(), "nothing was sent");
     assert!(!conn.is_dead(), "and the mount is still usable");
@@ -1137,7 +1140,7 @@ async fn an_oversized_write_is_refused_locally_rather_than_sent() {
     // Exactly at the ceiling still goes out.
     let call = {
         let conn = Arc::clone(&conn);
-        tokio::spawn(async move { conn.write(2, 7, 0, vec![1u8; 4096]).await })
+        tokio::spawn(async move { conn.write(2, 7, 0, vec![1u8; 4096], false).await })
     };
     let req = sess.recv().await;
     assert_eq!(req.data.len(), 4096);

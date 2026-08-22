@@ -851,9 +851,19 @@ impl Connection {
         fh: Fh,
         offset: u64,
         data: Vec<u8>,
+        kill_suidgid: bool,
     ) -> Result<u32, Errno> {
         let (reply, _): (WriteReply, _) = self
-            .call(Opcode::Write, &WriteRequest { node, fh, offset }, data)
+            .call(
+                Opcode::Write,
+                &WriteRequest {
+                    node,
+                    fh,
+                    offset,
+                    kill_suidgid,
+                },
+                data,
+            )
             .await?;
         Ok(reply.written)
     }

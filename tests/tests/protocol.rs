@@ -294,7 +294,7 @@ async fn every_opcode_happy_path() {
     assert_eq!(f.attr.size, 0);
 
     // WRITE carries its payload in the data segment.
-    let written: WriteReply = c.write(f.node, fh, 0, b"hello world").await.ok();
+    let written: WriteReply = c.write(f.node, fh, 0, b"hello world", false).await.ok();
     assert_eq!(written.written, 11);
 
     // READ answers in the data segment and leaves the body empty.
@@ -682,7 +682,9 @@ async fn a_handle_or_node_the_client_does_not_own_is_refused() {
     let (an, bn, afh, bfh) = (a.entry.node, b.entry.node, a.fh, b.fh);
 
     c.read(bn, afh, 0, 1).await.expect_errno(libc::EBADF);
-    c.write(bn, afh, 0, b"x").await.expect_errno(libc::EBADF);
+    c.write(bn, afh, 0, b"x", false)
+        .await
+        .expect_errno(libc::EBADF);
     c.call(Opcode::Flush, &FlushRequest { node: bn, fh: afh })
         .await
         .expect_errno(libc::EBADF);
@@ -937,7 +939,10 @@ async fn fsync_ignore_acknowledges_without_the_syscall() {
         .create(ROOT_NODE, b"s", 0o644, libc::O_WRONLY | libc::O_SYNC)
         .await
         .ok();
-    let written: WriteReply = c.write(s.entry.node, s.fh, 0, b"durable enough").await.ok();
+    let written: WriteReply = c
+        .write(s.entry.node, s.fh, 0, b"durable enough", false)
+        .await
+        .ok();
     assert_eq!(written.written, 14);
     c.call(
         Opcode::Fsync,
@@ -1628,7 +1633,7 @@ async fn non_utf8_names_round_trip() {
 
     let created: CreateReply = c.create(ROOT_NODE, odd, 0o644, libc::O_RDWR).await.ok();
     let written: WriteReply = c
-        .write(created.entry.node, created.fh, 0, b"bytes")
+        .write(created.entry.node, created.fh, 0, b"bytes", false)
         .await
         .ok();
     assert_eq!(written.written, 5);

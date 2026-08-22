@@ -535,9 +535,25 @@ impl TestClient {
         .await
     }
 
-    pub async fn write(&mut self, node: NodeId, fh: Fh, offset: u64, data: &[u8]) -> Reply {
-        self.call_data(Opcode::Write, &WriteRequest { node, fh, offset }, data)
-            .await
+    pub async fn write(
+        &mut self,
+        node: NodeId,
+        fh: Fh,
+        offset: u64,
+        data: &[u8],
+        kill_suidgid: bool,
+    ) -> Reply {
+        self.call_data(
+            Opcode::Write,
+            &WriteRequest {
+                node,
+                fh,
+                offset,
+                kill_suidgid,
+            },
+            data,
+        )
+        .await
     }
 
     pub async fn release(&mut self, node: NodeId, fh: Fh) -> Reply {

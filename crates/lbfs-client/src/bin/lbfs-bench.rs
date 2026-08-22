@@ -205,7 +205,7 @@ async fn fill(
             let want = chunk.min((size - offset) as u32);
             let (conn, block, at) = (Arc::clone(conn), Arc::clone(&block), offset);
             set.spawn(async move {
-                conn.write(node, fh, at, block[..want as usize].to_vec())
+                conn.write(node, fh, at, block[..want as usize].to_vec(), false)
                     .await
                     .map(|_| ())
             });
@@ -247,7 +247,8 @@ async fn drive(
                         // The copy is not an artefact of the tool: the bridge
                         // hands the multiplexer an owned buffer per write too,
                         // because a frame outlives the callback that made it.
-                        conn.write(node, fh, at, block.as_ref().clone()).await?;
+                        conn.write(node, fh, at, block.as_ref().clone(), false)
+                            .await?;
                     }
                 }
                 Ok(started.elapsed().as_nanos() as u64)
