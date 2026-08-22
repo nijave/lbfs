@@ -441,6 +441,12 @@ Future work:
   (Seekable OCI, the lazy-loading successor to eStargz) so the server
   can serve a layer's files on demand from an index instead of unpacking
   whole layers up front.
+- Container-workload benchmark: mount an assembled container filesystem
+  through lbfs — once against a cold server cache, once warm — and race
+  it against a traditional containerd flow on the client (pull, unpack,
+  start), measuring time-to-first-file and time-to-ready for typical
+  images. This prices the real-time-attach thesis against the status
+  quo.
 - Feasibility analysis — kernel-module client: a native lbfs kernel
   driver speaking the wire protocol (the shape of the in-kernel NFS
   client) instead of FUSE. The NFS comparison prices the userspace
