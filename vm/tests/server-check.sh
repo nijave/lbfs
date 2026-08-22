@@ -19,8 +19,14 @@ die() {
   exit 1
 }
 
+# An empty side is a failed command, not a match. Two `stat`s that both failed
+# would otherwise compare equal-and-empty and report success — the inode
+# comparison below is exactly that shape.
 check() {
   local what="$1" want="$2" got="$3"
+  if [ -z "$want" ] || [ -z "$got" ]; then
+    die "$what: an empty value means the command that produced it failed (want [$want], got [$got])"
+  fi
   if [ "$want" != "$got" ]; then
     die "$what: want [$want], got [$got]"
   fi

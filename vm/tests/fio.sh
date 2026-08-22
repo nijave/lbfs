@@ -41,6 +41,18 @@ mbps() {
   awk -v b="$1" 'BEGIN { printf "%.1f", b / 1000000 }'
 }
 
+# fio's own size grammar — `256M` is 256 MiB — reduced to bytes.
+to_bytes() {
+  awk -v s="$1" 'BEGIN {
+    n = s + 0
+    u = toupper(substr(s, length(s)))
+    if (u == "K") n *= 1024
+    else if (u == "M") n *= 1048576
+    else if (u == "G") n *= 1073741824
+    printf "%d", n
+  }'
+}
+
 # Both an exit status and the per-job error field: fio can complete a job that
 # hit an I/O error and still exit zero if the error was on the verify path in
 # some configurations, and the field is the unambiguous one.
@@ -62,12 +74,31 @@ run_fio() {
 
 # --- integrity --------------------------------------------------------------
 
+# What the job file says it will write, and therefore what the verify pass owes
+# a read of. Taken from the job rather than repeated here, so the two cannot
+# drift apart.
+want_bytes="$(to_bytes "$(awk -F= '/^[[:blank:]]*size[[:blank:]]*=/ {
+  gsub(/[[:blank:]]/, "", $2); print $2; exit
+}' "$JOB")")"
+[ "${want_bytes:-0}" -gt 0 ] || die "no size= in $JOB, so there is nothing to hold the verify pass to"
+
 if ! run_fio --directory="$MNT" "$JOB"; then
   die 'fio crc32c verify reported an error'
 fi
+# An error field of zero is not enough. A job that never verified anything —
+# `do_verify` dropped, or a `verify=` fio does not recognise — completes clean
+# and reports zero bytes read, and the step would print "checked 0 MiB" and
+# pass. The byte count is what says the verify pass actually happened.
 verified="$(jq -r '.jobs[0].read.io_bytes' "$OUT")"
-ok "fio crc32c verify re-read and checked $((verified / 1048576)) MiB with no mismatch"
-rm -f "$MNT"/verify-rw.*
+written="$(jq -r '.jobs[0].write.io_bytes' "$OUT")"
+[ "$written" = "$want_bytes" ] ||
+  die "the verify job wrote $written bytes, not the $want_bytes its size= promises"
+[ "$verified" = "$want_bytes" ] ||
+  die "fio read back $verified bytes of the $want_bytes it wrote; the verify pass did not run in full"
+ok "fio crc32c verify wrote and re-read all $((want_bytes / 1048576)) MiB with no mismatch"
+# The data file, and the verify-state file fio drops in its working directory
+# alongside it — which is this ssh session's home, not the mount.
+rm -f "$MNT"/verify-rw.* ./local-verify-rw-*.state "$HOME"/local-verify-rw-*.state
 
 # --- sequential write -------------------------------------------------------
 

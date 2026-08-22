@@ -26,8 +26,17 @@ die() {
 # Two arguments in `want got` order, because every call site reads better that
 # way: the expectation is the short literal and the observation is the command
 # substitution that wraps.
+#
+# Both sides must be non-empty. Several call sites compare one command
+# substitution against another — two `stat`s that should agree — and a `stat`
+# that fails prints nothing to stdout, so a pair of failures would compare
+# empty against empty and pass. An empty expectation is never something this
+# file means to assert.
 check() {
   local what="$1" want="$2" got="$3"
+  if [ -z "$want" ] || [ -z "$got" ]; then
+    die "$what: an empty value means the command that produced it failed (want [$want], got [$got])"
+  fi
   if [ "$want" != "$got" ]; then
     die "$what: want [$want], got [$got]"
   fi
@@ -85,8 +94,14 @@ check 'reading through a symlink' 'hello lbfs' "$(cat link.sym)"
 ln dir/sub/file.txt link.hard
 check 'link count after hardlink' 2 "$(stat -c%h link.hard)"
 check 'hardlinks share one inode' "$(stat -c%i dir/sub/file.txt)" "$(stat -c%i link.hard)"
-check 'writing through one link is visible from the other' \
-  'hello lbfs' "$(cat link.hard)"
+# Actually write, in both directions. Reading the same bytes through a second
+# name only proves the name resolves; it takes a write to prove the server did
+# not quietly hand out a file of its own.
+echo 'via the hard link' >link.hard
+check 'a write through one link is visible through the other' \
+  'via the hard link' "$(cat dir/sub/file.txt)"
+echo 'hello lbfs' >dir/sub/file.txt
+check 'and a write back the other way' 'hello lbfs' "$(cat link.hard)"
 
 # --- truncate, both directions ---------------------------------------------
 

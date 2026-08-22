@@ -74,7 +74,8 @@ done
   printf '%%.o: %%.c common.h\n\t$(CC) $(CFLAGS) -c -o $@ $<\n'
 } >Makefile
 gen="$(elapsed "$start")"
-ok "generated $((UNITS * 2 + 3)) source files in ${gen}s"
+# One .c per unit, plus common.h, main.c and the Makefile.
+ok "generated $((UNITS + 3)) files in ${gen}s"
 
 start="$(now)"
 if ! make -j"$(nproc)" -s >/tmp/lbfs-build.log 2>&1; then
@@ -94,7 +95,11 @@ ok 'the linked binary executed from the mount'
 # `make` stats everything and compiles nothing.
 start="$(now)"
 if ! make -j"$(nproc)" -s -q; then die 'make thinks the tree is out of date immediately after a build'; fi
-ok "a no-op rebuild stat'd $((UNITS * 2 + 2)) paths in $(elapsed "$start")s"
+noop="$(elapsed "$start")"
+# Counted rather than derived: make stats each source, each object, the header
+# and the link target, and an arithmetic guess at that has been wrong once
+# already.
+ok "a no-op rebuild walked a $(find . -type f | wc -l)-file tree in ${noop}s"
 
 # Touch one header and make sure the world rebuilds — this is the dependency
 # graph seeing an mtime change that came back through the mount.

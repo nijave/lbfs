@@ -28,6 +28,10 @@ source "$(dirname "$0")/lib.sh"
 
 TESTS="$VM_DIR/tests"
 CLIENT_LOG=/tmp/lbfs-client.log
+# Where `make build-guest` leaves the binaries the guests are supposed to be
+# running. Same default as deploy.sh, and the same override, so the two agree
+# about what "deployed" means.
+GUEST_BIN="${LBFS_GUEST_BIN:-$REPO_DIR/target/guest/release}"
 FLOOR_MBPS="${LBFS_FLOOR_MBPS:-20}"
 # Where the live-node probe stops, and the floor it has to clear. The cap is a
 # runtime budget, not a ceiling anyone expects to meet: at roughly 1400
@@ -60,7 +64,8 @@ reset_pair() {
     pkill -KILL -x lbfs-client 2>/dev/null || true
     rm -f /tmp/lbfs-*.log /tmp/lbfs-*.job /tmp/lbfs-*.json /tmp/lbfs-*.err \
       /tmp/lbfs-*.txt /tmp/lbfs-*.bin /tmp/lbfs-dd-rc \
-      /tmp/lbfs-e2e.sh /tmp/lbfs-build.sh /tmp/lbfs-fio.sh
+      /tmp/lbfs-e2e.sh /tmp/lbfs-build.sh /tmp/lbfs-fio.sh \
+      ~/local-verify-rw-*.state /tmp/local-verify-rw-*.state
     exit 0" || true
   vm_ssh "$SERVER_IP" "systemctl is-active --quiet lbfs-server ||
       sudo systemctl start lbfs-server
@@ -145,6 +150,31 @@ vm_ssh "$CLIENT_IP" '[ -x /usr/local/bin/lbfs-client ]' || {
   echo "lbfs-client is not installed on $CLIENT_IP - run 'make vm-deploy'" >&2
   exit 1
 }
+# The suite's twelve PASS lines say what the guests are running, not what this
+# checkout says. Without this they would happily vouch for last week's binary
+# while the change under test sat unbuilt in the tree — the single most
+# expensive way for a green run to be wrong.
+[ -d "$GUEST_BIN" ] || {
+  echo "no guest binaries at $GUEST_BIN - run 'make build-guest && make vm-deploy'" >&2
+  exit 1
+}
+for pair in "lbfs-server:$SERVER_IP" "lbfs-client:$CLIENT_IP"; do
+  bin="${pair%%:*}"
+  ip="${pair##*:}"
+  [ -x "$GUEST_BIN/$bin" ] || {
+    echo "$GUEST_BIN/$bin is missing - run 'make build-guest'" >&2
+    exit 1
+  }
+  local_md5="$(md5sum "$GUEST_BIN/$bin" | cut -d' ' -f1)"
+  guest_md5="$(vm_ssh "$ip" "md5sum /usr/local/bin/$bin | cut -d' ' -f1")"
+  [ "$local_md5" = "$guest_md5" ] || {
+    echo "$bin on $ip is not the binary in this checkout - run 'make vm-deploy'" >&2
+    echo "  checkout $GUEST_BIN/$bin  $local_md5" >&2
+    echo "  guest    /usr/local/bin/$bin  $guest_md5" >&2
+    exit 1
+  }
+  echo "  ok    $bin on $ip matches the checkout ($local_md5)"
+done
 # Whatever a previous run or a manual poke left behind, from here the pair looks
 # the same every time.
 reset_pair
@@ -169,7 +199,15 @@ grep -q 'fuse ' <<<"$opts" || {
   echo 'the mount is not a fuse mount' >&2
   exit 1
 }
-grep -q 'max_read=1048576' <<<"$opts" || echo "  note: max_read is not the negotiated 1 MiB" >&2
+# The negotiated I/O ceiling, as the kernel recorded it. A mount that came up
+# with a smaller max_read still works and still passes every other step — it
+# just quietly does four times the round trips, which is exactly the kind of
+# regression a printed note gets scrolled past.
+grep -q 'max_read=1048576' <<<"$opts" || {
+  echo 'the mount did not negotiate the 1 MiB max_read the handshake settles on' >&2
+  exit 1
+}
+echo '  ok    mounted with the negotiated max_read=1048576'
 pass
 
 # ---------------------------------------------------------------------------
@@ -224,12 +262,16 @@ probe="$(vm_ssh "$CLIENT_IP" "cd $CLIENT_MOUNT && rm -rf nodeprobe && mkdir node
 limits="$(vm_ssh "$SERVER_IP" 'grep -i "open files" /proc/$(pgrep -x lbfs-server)/limits |
   tr -s "[:blank:]" " "')"
 echo "  server $limits"
-# Recovery is the client forgetting the nodes, not the server reclaiming them,
-# and it has to come before the rm: a server that *is* out of descriptors cannot
-# open the directory to read it, so `rm -r` fails too. Cheap enough to keep now
-# that the ceiling is out of reach — it is the step's own undo.
-vm_ssh "$CLIENT_IP" "sync; sudo sysctl -q vm.drop_caches=3"
-vm_ssh "$CLIENT_IP" "rm -rf $CLIENT_MOUNT/nodeprobe"
+# Straight to the rm, with every node still live and still holding a descriptor.
+# Before the fix this could not work — a server out of descriptors cannot open
+# the directory to read it, so the only way out was the client dropping its
+# inode cache. Doing it the hard way makes the removal itself the assertion that
+# the ceiling is really gone, rather than something a preparatory drop_caches
+# had already tidied away.
+vm_ssh "$CLIENT_IP" "rm -rf $CLIENT_MOUNT/nodeprobe" || {
+  echo "could not remove the probe tree through the mount; is the server out of descriptors?" >&2
+  exit 1
+}
 if [ "$probe" -lt "$NODE_PROBE_CAP" ]; then
   printf '  NOTE  the server refused the %dth simultaneously live node (EMFILE)\n' \
     "$((probe + 1))"
@@ -243,9 +285,10 @@ fi
   echo "expected at least $NODE_PROBE_FLOOR - is the startup RLIMIT_NOFILE raise in place?" >&2
   exit 1
 }
-echo "  ok    the export is usable again after the client dropped its inode cache"
+echo '  ok    the whole probe tree came back out through the mount'
 vm_ssh "$CLIENT_IP" "echo probe > $CLIENT_MOUNT/recheck &&
   [ \"\$(cat $CLIENT_MOUNT/recheck)\" = probe ] && rm -f $CLIENT_MOUNT/recheck"
+echo '  ok    the export still reads and writes after the probe'
 pass
 
 # ---------------------------------------------------------------------------
@@ -320,6 +363,10 @@ vm_ssh "$CLIENT_IP" "! grep -q ' /tmp/lbfs-deny ' /proc/mounts && rmdir /tmp/lbf
 missing="$(vm_ssh "$CLIENT_IP" "mkdir -p /tmp/lbfs-deny &&
   lbfs-client $SERVER_IP:$SERVER_PORT /srv/exports/nonexistent /tmp/lbfs-deny 2>&1; echo rc=\$?")"
 echo "  $missing"
+grep -q 'does not export that path' <<<"$missing" || {
+  echo 'the client did not report the missing export distinctly' >&2
+  exit 1
+}
 grep -q 'rc=1' <<<"$missing" || {
   echo 'the client exited zero attaching a path that does not exist' >&2
   exit 1
@@ -340,9 +387,13 @@ pass
 # ---------------------------------------------------------------------------
 
 step 'the pair is left clean'
-reset_pair
+# Asserted before the cleanup, not after. `reset_pair` unmounts, kills clients
+# and empties the export, so running it first would make every assertion below
+# a check on reset_pair rather than on the eleven steps that came before — and a
+# suite that leaked a mount or left a file in the export would still say so.
 vm_ssh "$SERVER_IP" "[ -z \"\$(ls -A $SERVER_EXPORT)\" ]" || {
-  echo "$SERVER_EXPORT is not empty" >&2
+  echo "$SERVER_EXPORT is not empty:" >&2
+  vm_ssh "$SERVER_IP" "find $SERVER_EXPORT -mindepth 1 | head -20" >&2 || true
   exit 1
 }
 vm_ssh "$CLIENT_IP" "! grep -q ' $CLIENT_MOUNT ' /proc/mounts" || {
@@ -358,6 +409,9 @@ vm_ssh "$SERVER_IP" 'systemctl is-active --quiet lbfs-server' || {
   exit 1
 }
 echo '  ok    export empty, nothing mounted, no client running, server up'
+# Now the belt and braces, for the temp files and any state the assertions above
+# do not cover. The EXIT trap runs it again; it is idempotent.
+reset_pair
 pass
 
 printf '\nALL VM TESTS PASSED (%d steps)\n' "$STEP"

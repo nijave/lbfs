@@ -45,7 +45,12 @@ SERVER_PORT="9423"
 # What cloud-init must have installed before a guest counts as ready. Kept
 # beside the addresses because it is the same kind of promise: up.sh asserts it,
 # and the template in cloud-init/user-data.tmpl.yaml has to match.
-GUEST_PACKAGES="fuse3 attr fio gcc curl make"
+#
+# jq is on the list because vm/tests/fio.sh reads fio's JSON with it. Today's
+# Ubuntu cloud image happens to ship it, which is exactly the kind of luck that
+# turns into "jq: command not found" on the first respin, in a step whose
+# failure would look like a throughput regression.
+GUEST_PACKAGES="fuse3 attr fio gcc curl make jq"
 
 VIRSH=(virsh --connect qemu:///system)
 
