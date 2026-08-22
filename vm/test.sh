@@ -29,10 +29,12 @@ source "$(dirname "$0")/lib.sh"
 TESTS="$VM_DIR/tests"
 CLIENT_LOG=/tmp/lbfs-client.log
 FLOOR_MBPS="${LBFS_FLOOR_MBPS:-20}"
-# Where the live-node probe gives up if it never runs out of descriptors. Twice
-# systemd's default RLIMIT_NOFILE, so the ceiling this pair actually has lands
-# comfortably inside it.
-NODE_PROBE_CAP="${LBFS_NODE_PROBE_CAP:-2048}"
+# Where the live-node probe stops, and the floor it has to clear. The cap is a
+# runtime budget, not a ceiling anyone expects to meet: at roughly 1400
+# creates/s through the mount, 3000 files costs a couple of seconds. The floor
+# is what the descriptor fix bought — a stock unit used to stop at 1008.
+NODE_PROBE_CAP="${LBFS_NODE_PROBE_CAP:-3000}"
+NODE_PROBE_FLOOR="${LBFS_NODE_PROBE_FLOOR:-2000}"
 
 STEP=0
 CURRENT=""
@@ -201,33 +203,44 @@ pass
 
 step 'live-node ceiling: how many files the client can hold open at the server'
 # The server keeps one O_PATH descriptor per node the client still remembers
-# (spec §"node table"), so its RLIMIT_NOFILE is a hard ceiling on how large a
-# tree a client may have live at once. Nothing in the product raises that limit
-# and nothing in the unit file sets it, so on a stock systemd service it is
-# 1024, which a build tree reaches easily. Measured rather than assumed: the
-# number is printed on every run, so raising the limit shows up here.
+# (spec §"node table"), so its RLIMIT_NOFILE is the largest tree a client may
+# have live at once. It used to be systemd's default 1024, and the 1008th file
+# in a tree failed with EMFILE — on the build workload this filesystem exists
+# for. The server now raises its own soft limit to the hard one at startup and
+# the unit sets that hard limit; this step is what says so on real hardware
+# rather than in a unit test that shares cargo's own limits.
 probe="$(vm_ssh "$CLIENT_IP" "cd $CLIENT_MOUNT && rm -rf nodeprobe && mkdir nodeprobe && cd nodeprobe
   n=0
   for i in \$(seq 1 $NODE_PROBE_CAP); do
     if : > \"p-\$i\" 2>/dev/null; then n=\$i; else break; fi
   done
   echo \$n")"
-# Recovery is the client forgetting the nodes, not the server reclaiming them.
-# It has to happen before the rm: at the ceiling the server cannot even open the
-# directory to read it, so `rm -r` fails too.
+# What the server thinks its budget is, alongside how many nodes the client
+# actually got. The two lines together are the whole story when this step is the
+# one that fails.
+# SC2016: the command substitution is the guest's, evaluated over there against
+# the guest's own process table.
+# shellcheck disable=SC2016
+limits="$(vm_ssh "$SERVER_IP" 'grep -i "open files" /proc/$(pgrep -x lbfs-server)/limits |
+  tr -s "[:blank:]" " "')"
+echo "  server $limits"
+# Recovery is the client forgetting the nodes, not the server reclaiming them,
+# and it has to come before the rm: a server that *is* out of descriptors cannot
+# open the directory to read it, so `rm -r` fails too. Cheap enough to keep now
+# that the ceiling is out of reach — it is the step's own undo.
 vm_ssh "$CLIENT_IP" "sync; sudo sysctl -q vm.drop_caches=3"
 vm_ssh "$CLIENT_IP" "rm -rf $CLIENT_MOUNT/nodeprobe"
 if [ "$probe" -lt "$NODE_PROBE_CAP" ]; then
   printf '  NOTE  the server refused the %dth simultaneously live node (EMFILE)\n' \
     "$((probe + 1))"
-  printf '  NOTE  one O_PATH fd per live node, and neither lbfs-server nor its unit\n'
-  printf '  NOTE  raises RLIMIT_NOFILE, so a tree this size wedges the export until\n'
-  printf '  NOTE  the client drops its inode cache or unmounts\n'
+  printf '  NOTE  one O_PATH fd per live node, so this is its RLIMIT_NOFILE; a tree\n'
+  printf '  NOTE  past it wedges the export until the client forgets the nodes\n'
 else
   printf '  ok    %d simultaneously live nodes with no ceiling reached\n' "$probe"
 fi
-[ "$probe" -ge 256 ] || {
-  echo "the server ran out of descriptors after only $probe live nodes" >&2
+[ "$probe" -ge "$NODE_PROBE_FLOOR" ] || {
+  echo "the server ran out of descriptors after only $probe live nodes;" >&2
+  echo "expected at least $NODE_PROBE_FLOOR - is the startup RLIMIT_NOFILE raise in place?" >&2
   exit 1
 }
 echo "  ok    the export is usable again after the client dropped its inode cache"

@@ -154,6 +154,15 @@ impl Server {
 ///   with different permissions than the same call on a local disk. virtiofsd
 ///   and every other passthrough server do the same. Once per process, since
 ///   this is global state and a second call would race a concurrent `open`.
+/// * **`RLIMIT_NOFILE` raised to its hard ceiling.** The node table holds one
+///   `O_PATH` descriptor per node a client still remembers, so this process's
+///   soft descriptor limit *is* the largest tree a client may have live at
+///   once. At the traditional 1024 that ceiling arrives around the thousandth
+///   file, which a build tree — the workload this filesystem exists for —
+///   reaches without trying. Worse, a client that hits it cannot clean up
+///   through the mount, because `rm -r` needs a descriptor to read the
+///   directory; only forgetting the nodes gets the export back. virtiofsd
+///   raises the same limit at startup for the same reason.
 /// * **The `/proc` probe.** `LocalFs` reopens `O_PATH` descriptors through
 ///   `/proc/self/fd/N` for chmod, utimens, truncate and xattrs, and `ATTACH`
 ///   reads the same path to verify the export root. Without `/proc` mounted
@@ -161,11 +170,61 @@ impl Server {
 ///   refuse to start rather than answer `ENOENT` to a client's `chmod` an hour
 ///   later.
 fn init_process() -> io::Result<()> {
-    static UMASK: Once = Once::new();
-    UMASK.call_once(|| {
+    static SETUP: Once = Once::new();
+    SETUP.call_once(|| {
         rustix::process::umask(rustix::fs::Mode::empty());
+        raise_nofile();
     });
     probe_proc()
+}
+
+/// Move the soft descriptor limit up to the hard one.
+///
+/// Not fatal if it fails. A container can be handed a hard limit lower than the
+/// soft limit this process would like, and a server that refused to start over
+/// it would be trading a workload ceiling for no server at all. The number it
+/// settled on goes in the log either way, because when a client does meet
+/// `EMFILE` this line is the first thing worth reading.
+fn raise_nofile() {
+    use rustix::process::{getrlimit, setrlimit, Resource};
+
+    let before = getrlimit(Resource::Nofile);
+    let Some(target) = nofile_target(before) else {
+        tracing::info!(nofile = %nofile_label(before.current), "descriptor limit already at its ceiling");
+        return;
+    };
+    match setrlimit(Resource::Nofile, target) {
+        Ok(()) => tracing::info!(
+            nofile = %nofile_label(getrlimit(Resource::Nofile).current),
+            was = %nofile_label(before.current),
+            "raised the descriptor limit to its hard ceiling"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            nofile = %nofile_label(before.current),
+            hard = %nofile_label(before.maximum),
+            "could not raise the descriptor limit; large trees may meet EMFILE"
+        ),
+    }
+}
+
+/// The limit to install, or `None` when the soft limit is already the hard one.
+///
+/// Split out from the syscalls so the decision can be tested on a process whose
+/// own limits are whatever the developer's shell happened to set.
+fn nofile_target(limit: rustix::process::Rlimit) -> Option<rustix::process::Rlimit> {
+    if limit.current == limit.maximum {
+        return None;
+    }
+    Some(rustix::process::Rlimit {
+        current: limit.maximum,
+        maximum: limit.maximum,
+    })
+}
+
+/// `None` is `RLIM_INFINITY`, which reads better as a word than as `None`.
+fn nofile_label(limit: Option<u64>) -> String {
+    limit.map_or_else(|| "unlimited".to_string(), |n| n.to_string())
 }
 
 fn probe_proc() -> io::Result<()> {
@@ -792,6 +851,73 @@ mod tests {
         // The trick `LocalFs` and `ATTACH` are built on. If this fails the
         // server is right to refuse to start.
         probe_proc().unwrap();
+    }
+
+    #[test]
+    fn the_descriptor_target_is_the_hard_limit_and_nothing_when_already_there() {
+        use rustix::process::Rlimit;
+
+        let raise = |current, maximum| nofile_target(Rlimit { current, maximum });
+
+        // The case that matters: a stock 1024 against a much larger ceiling.
+        assert_eq!(
+            raise(Some(1024), Some(524_288)),
+            Some(Rlimit {
+                current: Some(524_288),
+                maximum: Some(524_288),
+            })
+        );
+        // An unlimited hard limit means an unlimited soft limit, not a number.
+        assert_eq!(
+            raise(Some(1024), None),
+            Some(Rlimit {
+                current: None,
+                maximum: None,
+            })
+        );
+        // Already at the ceiling, so no syscall: `setrlimit` would succeed but
+        // the log line would claim a raise that did not happen.
+        assert_eq!(raise(Some(4096), Some(4096)), None);
+        assert_eq!(raise(None, None), None);
+        // The hard limit is never touched, in either direction.
+        for target in [raise(Some(1), Some(9)), raise(Some(8), Some(9))]
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(target.maximum, Some(9));
+        }
+    }
+
+    #[test]
+    fn init_leaves_the_process_at_its_hard_descriptor_limit() {
+        use rustix::process::{getrlimit, Resource};
+
+        // This process shares one limit with every other case in the binary,
+        // and `init_process` is behind a `Once`, so by the time this runs the
+        // raise may already have happened — or the developer's shell may have
+        // handed cargo a soft limit that was the hard limit to begin with.
+        // Either way there is nothing left to observe, and saying so is more
+        // honest than asserting a tautology.
+        let before = getrlimit(Resource::Nofile);
+        if before.current == before.maximum {
+            eprintln!(
+                "skipped: this process already runs at its descriptor ceiling ({})",
+                nofile_label(before.current)
+            );
+            return;
+        }
+
+        init_process().unwrap();
+
+        let after = getrlimit(Resource::Nofile);
+        assert_eq!(
+            after.current, before.maximum,
+            "init must leave the soft descriptor limit at the hard one"
+        );
+        assert_eq!(
+            after.maximum, before.maximum,
+            "init must not move the hard descriptor limit"
+        );
     }
 
     #[test]

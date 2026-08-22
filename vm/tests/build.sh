@@ -16,10 +16,10 @@ set -euo pipefail
 
 MNT="${1:?usage: build.sh <mountpoint>}"
 UNITS="${2:-120}"
-# Deliberately well under the server's live-node ceiling, which test.sh measures
-# in a step of its own: the server holds one O_PATH descriptor per node the
-# client still remembers, so a churn large enough to exhaust its RLIMIT_NOFILE
-# would fail here for a reason that has nothing to do with metadata throughput.
+# A throughput sample, not a scale test. The server holds one O_PATH descriptor
+# per node the client still remembers, and test.sh measures that ceiling in a
+# step of its own; keeping this well under it means a number here always means
+# what it says rather than "the descriptor budget ran out".
 CHURN="${3:-500}"
 TREE="$MNT/buildtree"
 CHURNDIR="$MNT/churn"
