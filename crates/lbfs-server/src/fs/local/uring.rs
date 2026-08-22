@@ -40,19 +40,32 @@
 //!   with the memory before it can be freed - including when the caller drops
 //!   the future, because the payload is then dropped on the ring thread after
 //!   the CQE, not at cancellation time.
-//! * **Callers keep every `RawFd` alive.** The `RawFd` arguments below are
-//!   borrowed, not owned: the caller must hold the owning `OwnedFd` until the
-//!   returned future resolves. `LocalFs` satisfies this by holding an
-//!   `Arc<OwnedFd>` across each call.
+//! * **The slab owns a descriptor reference too.** Every fd argument is an
+//!   `&Arc<OwnedFd>`, and the executor clones that `Arc` into the slab entry.
+//!   A descriptor therefore cannot close while an operation naming it sits in
+//!   the backlog or in flight, even if every caller has dropped its future and
+//!   its own handle. Without this the ring thread could submit a
+//!   `write`/`unlinkat`/`renameat` against a descriptor number the kernel has
+//!   already recycled onto an unrelated file.
 //!
 //! Buffer lengths are the third leg: [`PooledBuf`] storage is recycled without
 //! zeroing, so the ring is never given a length beyond what the caller asked
 //! for, and `set_len` on completion uses the CQE result.
+//!
+//! # Cancellation
+//!
+//! Dropping a returned future does **not** cancel the operation. It kills only
+//! the [`oneshot::Receiver`]; the SQE still runs and its CQE is still reaped.
+//! Everything the operation owns - payload buffers, path strings, descriptor
+//! references, and the `OwnedFd` an `openat2` produced - is released on the
+//! ring thread once that CQE lands. This is what makes cancellation safe rather
+//! than merely tolerated, and it is why callers owe the executor nothing beyond
+//! passing a live `Arc`.
 
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -82,6 +95,22 @@ const _: () = {
 /// Dropping the last clone shuts the lanes down: the submission channels close,
 /// each ring thread is woken through its eventfd, drains the completions it
 /// still has in flight, and exits before `drop` returns.
+///
+/// # Descriptor and cancellation contract
+///
+/// Every fd argument is an `&Arc<OwnedFd>` and the executor clones it into the
+/// operation, so it holds its own reference until the CQE arrives. Two
+/// consequences:
+///
+/// * **Callers owe no liveness beyond passing a live `Arc`.** They may drop
+///   their own handle at any point; the descriptor stays open for as long as
+///   the ring needs it.
+/// * **Dropping a returned future does not cancel the operation.** The write
+///   still happens, the directory is still created. Cancellation only discards
+///   the result: the payload, the descriptor reference, and any `OwnedFd` the
+///   operation produced are all released on the ring thread when the CQE lands.
+///
+/// Callers that need an operation to *not* happen must not start it.
 #[derive(Clone)]
 pub struct UringExecutor(Arc<Inner>);
 
@@ -133,7 +162,7 @@ impl UringExecutor {
 
     pub async fn read(
         &self,
-        fd: RawFd,
+        fd: &Arc<OwnedFd>,
         offset: u64,
         buf: PooledBuf,
         len: u32,
@@ -143,7 +172,14 @@ impl UringExecutor {
             "read length exceeds buffer capacity"
         );
         let (res, payload) = self
-            .submit(OpDesc::Read { fd, offset, len }, OpPayload::Rw { buf })
+            .submit(
+                OpDesc::Read {
+                    fd: fd.clone(),
+                    offset,
+                    len,
+                },
+                OpPayload::Rw { buf },
+            )
             .await;
         let OpPayload::Rw { buf } = payload else {
             unreachable!("read completed with a non-Rw payload")
@@ -153,7 +189,7 @@ impl UringExecutor {
 
     pub async fn write(
         &self,
-        fd: RawFd,
+        fd: &Arc<OwnedFd>,
         offset: u64,
         buf: PooledBuf,
         len: u32,
@@ -163,7 +199,14 @@ impl UringExecutor {
             "write length exceeds buffer capacity"
         );
         let (res, payload) = self
-            .submit(OpDesc::Write { fd, offset, len }, OpPayload::Rw { buf })
+            .submit(
+                OpDesc::Write {
+                    fd: fd.clone(),
+                    offset,
+                    len,
+                },
+                OpPayload::Rw { buf },
+            )
             .await;
         let OpPayload::Rw { buf } = payload else {
             unreachable!("write completed with a non-Rw payload")
@@ -173,18 +216,30 @@ impl UringExecutor {
         (buf, unit_or_count(res))
     }
 
-    pub async fn fsync(&self, fd: RawFd, datasync: bool) -> io::Result<()> {
+    pub async fn fsync(&self, fd: &Arc<OwnedFd>, datasync: bool) -> io::Result<()> {
         let (res, _) = self
-            .submit(OpDesc::Fsync { fd, datasync }, OpPayload::Bare)
+            .submit(
+                OpDesc::Fsync {
+                    fd: fd.clone(),
+                    datasync,
+                },
+                OpPayload::Bare,
+            )
             .await;
         unit(res)
     }
 
-    pub async fn fallocate(&self, fd: RawFd, mode: i32, offset: u64, len: u64) -> io::Result<()> {
+    pub async fn fallocate(
+        &self,
+        fd: &Arc<OwnedFd>,
+        mode: i32,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
         let (res, _) = self
             .submit(
                 OpDesc::Fallocate {
-                    fd,
+                    fd: fd.clone(),
                     mode,
                     offset,
                     len,
@@ -195,34 +250,39 @@ impl UringExecutor {
         unit(res)
     }
 
+    /// The descriptor is wrapped on the ring thread, not here, so a cancelled
+    /// caller cannot leak it: the failed oneshot send drops the payload, which
+    /// drops the `OwnedFd`, which closes the file.
     pub async fn openat2(
         &self,
-        dirfd: RawFd,
+        dirfd: &Arc<OwnedFd>,
         name: CString,
         how: types::OpenHow,
     ) -> io::Result<OwnedFd> {
-        let (res, _) = self
+        let (res, payload) = self
             .submit(
-                OpDesc::OpenAt2 { dirfd },
+                OpDesc::OpenAt2 {
+                    dirfd: dirfd.clone(),
+                },
                 OpPayload::Open {
                     name,
                     how: Box::new(how),
+                    opened: None,
                 },
             )
             .await;
-        if res < 0 {
-            return Err(io::Error::from_raw_os_error(-res));
+        let OpPayload::Open { opened, .. } = payload else {
+            unreachable!("openat2 completed with a non-Open payload")
+        };
+        match opened {
+            Some(fd) => Ok(fd),
+            None => Err(io::Error::from_raw_os_error(-res)),
         }
-        // SAFETY: a non-negative openat2 result is a descriptor the kernel just
-        // created for this call. Nothing else in the process holds it - the ring
-        // thread never stored it anywhere - so wrapping it here is the single
-        // transfer of ownership, and `OwnedFd` closes it exactly once.
-        Ok(unsafe { OwnedFd::from_raw_fd(res) })
     }
 
     pub async fn statx(
         &self,
-        dirfd: RawFd,
+        dirfd: &Arc<OwnedFd>,
         name: CString,
         flags: i32,
         mask: u32,
@@ -235,7 +295,11 @@ impl UringExecutor {
         let out: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
         let (res, payload) = self
             .submit(
-                OpDesc::Statx { dirfd, flags, mask },
+                OpDesc::Statx {
+                    dirfd: dirfd.clone(),
+                    flags,
+                    mask,
+                },
                 OpPayload::Statx { name, out },
             )
             .await;
@@ -245,33 +309,50 @@ impl UringExecutor {
         unit(res).map(|()| *out)
     }
 
-    pub async fn unlinkat(&self, dirfd: RawFd, name: CString, rmdir: bool) -> io::Result<()> {
+    pub async fn unlinkat(
+        &self,
+        dirfd: &Arc<OwnedFd>,
+        name: CString,
+        rmdir: bool,
+    ) -> io::Result<()> {
         let (res, _) = self
-            .submit(OpDesc::UnlinkAt { dirfd, rmdir }, OpPayload::Path { name })
+            .submit(
+                OpDesc::UnlinkAt {
+                    dirfd: dirfd.clone(),
+                    rmdir,
+                },
+                OpPayload::Path { name },
+            )
             .await;
         unit(res)
     }
 
-    pub async fn mkdirat(&self, dirfd: RawFd, name: CString, mode: u32) -> io::Result<()> {
+    pub async fn mkdirat(&self, dirfd: &Arc<OwnedFd>, name: CString, mode: u32) -> io::Result<()> {
         let (res, _) = self
-            .submit(OpDesc::MkDirAt { dirfd, mode }, OpPayload::Path { name })
+            .submit(
+                OpDesc::MkDirAt {
+                    dirfd: dirfd.clone(),
+                    mode,
+                },
+                OpPayload::Path { name },
+            )
             .await;
         unit(res)
     }
 
     pub async fn renameat(
         &self,
-        olddir: RawFd,
+        olddir: &Arc<OwnedFd>,
         old: CString,
-        newdir: RawFd,
+        newdir: &Arc<OwnedFd>,
         new: CString,
         flags: u32,
     ) -> io::Result<()> {
         let (res, _) = self
             .submit(
                 OpDesc::RenameAt {
-                    olddir,
-                    newdir,
+                    olddir: olddir.clone(),
+                    newdir: newdir.clone(),
                     flags,
                 },
                 OpPayload::TwoPath { a: old, b: new },
@@ -282,17 +363,17 @@ impl UringExecutor {
 
     pub async fn linkat(
         &self,
-        olddir: RawFd,
+        olddir: &Arc<OwnedFd>,
         old: CString,
-        newdir: RawFd,
+        newdir: &Arc<OwnedFd>,
         new: CString,
         flags: i32,
     ) -> io::Result<()> {
         let (res, _) = self
             .submit(
                 OpDesc::LinkAt {
-                    olddir,
-                    newdir,
+                    olddir: olddir.clone(),
+                    newdir: newdir.clone(),
                     flags,
                 },
                 OpPayload::TwoPath { a: old, b: new },
@@ -301,10 +382,17 @@ impl UringExecutor {
         unit(res)
     }
 
-    pub async fn symlinkat(&self, target: CString, newdir: RawFd, name: CString) -> io::Result<()> {
+    pub async fn symlinkat(
+        &self,
+        target: CString,
+        newdir: &Arc<OwnedFd>,
+        name: CString,
+    ) -> io::Result<()> {
         let (res, _) = self
             .submit(
-                OpDesc::SymlinkAt { newdir },
+                OpDesc::SymlinkAt {
+                    newdir: newdir.clone(),
+                },
                 OpPayload::TwoPath { a: target, b: name },
             )
             .await;
@@ -313,7 +401,7 @@ impl UringExecutor {
 
     pub async fn fgetxattr(
         &self,
-        fd: RawFd,
+        fd: &Arc<OwnedFd>,
         name: CString,
         buf: PooledBuf,
         len: u32,
@@ -324,7 +412,10 @@ impl UringExecutor {
         );
         let (res, payload) = self
             .submit(
-                OpDesc::FGetXattr { fd, len },
+                OpDesc::FGetXattr {
+                    fd: fd.clone(),
+                    len,
+                },
                 OpPayload::XattrRw { buf, name },
             )
             .await;
@@ -336,7 +427,7 @@ impl UringExecutor {
 
     pub async fn fsetxattr(
         &self,
-        fd: RawFd,
+        fd: &Arc<OwnedFd>,
         name: CString,
         value: PooledBuf,
         len: u32,
@@ -348,7 +439,11 @@ impl UringExecutor {
         );
         let (res, payload) = self
             .submit(
-                OpDesc::FSetXattr { fd, len, flags },
+                OpDesc::FSetXattr {
+                    fd: fd.clone(),
+                    len,
+                    flags,
+                },
                 OpPayload::XattrRw { buf: value, name },
             )
             .await;
@@ -382,9 +477,11 @@ fn finish_transfer(mut buf: PooledBuf, res: i32) -> (PooledBuf, io::Result<u32>)
     if res < 0 {
         return (buf, Err(io::Error::from_raw_os_error(-res)));
     }
+    // Clamp once and report the clamped figure: the count the caller sees must
+    // never exceed what `as_slice` will hand back.
     let n = (res as usize).min(buf.capacity());
     buf.set_len(n);
-    (buf, Ok(res as u32))
+    (buf, Ok(n as u32))
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +581,10 @@ enum OpPayload {
     Open {
         name: CString,
         how: Box<types::OpenHow>,
+        /// Filled in by `reap` from a successful CQE. Living in the payload is
+        /// what makes cancellation close the file: a failed oneshot send drops
+        /// the payload, and the `OwnedFd` with it.
+        opened: Option<OwnedFd>,
     },
     Statx {
         name: CString,
@@ -492,76 +593,77 @@ enum OpPayload {
     Bare,
 }
 
-/// Scalar arguments: descriptors, offsets, lengths, flags. Anything that is
-/// copied into the SQE by value rather than pointed at.
+/// Non-pointer arguments: descriptors, offsets, lengths, flags.
+///
+/// The descriptors are `Arc<OwnedFd>` rather than `RawFd` on purpose. The slab
+/// holds this value for as long as the operation lives, so cloning the `Arc`
+/// here is what keeps the file open across a caller's cancellation.
 enum OpDesc {
     Read {
-        fd: RawFd,
+        fd: Arc<OwnedFd>,
         offset: u64,
         len: u32,
     },
     Write {
-        fd: RawFd,
+        fd: Arc<OwnedFd>,
         offset: u64,
         len: u32,
     },
     Fsync {
-        fd: RawFd,
+        fd: Arc<OwnedFd>,
         datasync: bool,
     },
     Fallocate {
-        fd: RawFd,
+        fd: Arc<OwnedFd>,
         mode: i32,
         offset: u64,
         len: u64,
     },
     OpenAt2 {
-        dirfd: RawFd,
+        dirfd: Arc<OwnedFd>,
     },
     Statx {
-        dirfd: RawFd,
+        dirfd: Arc<OwnedFd>,
         flags: i32,
         mask: u32,
     },
     UnlinkAt {
-        dirfd: RawFd,
+        dirfd: Arc<OwnedFd>,
         rmdir: bool,
     },
     MkDirAt {
-        dirfd: RawFd,
+        dirfd: Arc<OwnedFd>,
         mode: u32,
     },
     RenameAt {
-        olddir: RawFd,
-        newdir: RawFd,
+        olddir: Arc<OwnedFd>,
+        newdir: Arc<OwnedFd>,
         flags: u32,
     },
     LinkAt {
-        olddir: RawFd,
-        newdir: RawFd,
+        olddir: Arc<OwnedFd>,
+        newdir: Arc<OwnedFd>,
         flags: i32,
     },
     SymlinkAt {
-        newdir: RawFd,
+        newdir: Arc<OwnedFd>,
     },
     FGetXattr {
-        fd: RawFd,
+        fd: Arc<OwnedFd>,
         len: u32,
     },
     FSetXattr {
-        fd: RawFd,
+        fd: Arc<OwnedFd>,
         len: u32,
         flags: i32,
     },
 }
 
+/// One unit of work: on the channel before submission, in the slab after it.
+/// `op` stays alive alongside `payload` because it holds the descriptor
+/// references the in-flight SQE names.
 struct Task {
     op: OpDesc,
-    payload: OpPayload,
-    done: oneshot::Sender<(i32, OpPayload)>,
-}
-
-struct InFlight {
     payload: OpPayload,
     done: oneshot::Sender<(i32, OpPayload)>,
 }
@@ -572,17 +674,18 @@ struct InFlight {
 /// already moved into the slab. Raw pointers into heap allocations survive the
 /// slab's `Vec` reallocating, and the slab entry outlives the CQE, so each
 /// pointer is valid for the kernel's entire use of it.
-fn build_sqe(op: &OpDesc, payload: &mut OpPayload) -> squeue::Entry {
-    match (op, payload) {
+fn build_sqe(task: &mut Task) -> squeue::Entry {
+    let Task { op, payload, .. } = task;
+    match (&*op, payload) {
         (OpDesc::Read { fd, offset, len }, OpPayload::Rw { buf }) => {
             let ptr = buf.as_mut_slice().as_mut_ptr();
-            opcode::Read::new(types::Fd(*fd), ptr, *len)
+            opcode::Read::new(types::Fd(fd.as_raw_fd()), ptr, *len)
                 .offset(*offset)
                 .build()
         }
         (OpDesc::Write { fd, offset, len }, OpPayload::Rw { buf }) => {
             let ptr = buf.as_mut_slice().as_ptr();
-            opcode::Write::new(types::Fd(*fd), ptr, *len)
+            opcode::Write::new(types::Fd(fd.as_raw_fd()), ptr, *len)
                 .offset(*offset)
                 .build()
         }
@@ -592,7 +695,9 @@ fn build_sqe(op: &OpDesc, payload: &mut OpPayload) -> squeue::Entry {
             } else {
                 types::FsyncFlags::empty()
             };
-            opcode::Fsync::new(types::Fd(*fd)).flags(flags).build()
+            opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
+                .flags(flags)
+                .build()
         }
         (
             OpDesc::Fallocate {
@@ -602,29 +707,29 @@ fn build_sqe(op: &OpDesc, payload: &mut OpPayload) -> squeue::Entry {
                 len,
             },
             OpPayload::Bare,
-        ) => opcode::Fallocate::new(types::Fd(*fd), *len)
+        ) => opcode::Fallocate::new(types::Fd(fd.as_raw_fd()), *len)
             .offset(*offset)
             .mode(*mode)
             .build(),
-        (OpDesc::OpenAt2 { dirfd }, OpPayload::Open { name, how }) => {
+        (OpDesc::OpenAt2 { dirfd }, OpPayload::Open { name, how, .. }) => {
             let how_ptr: *const types::OpenHow = &**how;
-            opcode::OpenAt2::new(types::Fd(*dirfd), name.as_ptr(), how_ptr).build()
+            opcode::OpenAt2::new(types::Fd(dirfd.as_raw_fd()), name.as_ptr(), how_ptr).build()
         }
         (OpDesc::Statx { dirfd, flags, mask }, OpPayload::Statx { name, out }) => {
             let out_ptr: *mut types::statx = std::ptr::from_mut::<libc::statx>(&mut **out).cast();
-            opcode::Statx::new(types::Fd(*dirfd), name.as_ptr(), out_ptr)
+            opcode::Statx::new(types::Fd(dirfd.as_raw_fd()), name.as_ptr(), out_ptr)
                 .flags(*flags)
                 .mask(*mask)
                 .build()
         }
         (OpDesc::UnlinkAt { dirfd, rmdir }, OpPayload::Path { name }) => {
             let flags = if *rmdir { libc::AT_REMOVEDIR } else { 0 };
-            opcode::UnlinkAt::new(types::Fd(*dirfd), name.as_ptr())
+            opcode::UnlinkAt::new(types::Fd(dirfd.as_raw_fd()), name.as_ptr())
                 .flags(flags)
                 .build()
         }
         (OpDesc::MkDirAt { dirfd, mode }, OpPayload::Path { name }) => {
-            opcode::MkDirAt::new(types::Fd(*dirfd), name.as_ptr())
+            opcode::MkDirAt::new(types::Fd(dirfd.as_raw_fd()), name.as_ptr())
                 .mode(*mode)
                 .build()
         }
@@ -636,9 +741,9 @@ fn build_sqe(op: &OpDesc, payload: &mut OpPayload) -> squeue::Entry {
             },
             OpPayload::TwoPath { a, b },
         ) => opcode::RenameAt::new(
-            types::Fd(*olddir),
+            types::Fd(olddir.as_raw_fd()),
             a.as_ptr(),
-            types::Fd(*newdir),
+            types::Fd(newdir.as_raw_fd()),
             b.as_ptr(),
         )
         .flags(*flags)
@@ -651,23 +756,23 @@ fn build_sqe(op: &OpDesc, payload: &mut OpPayload) -> squeue::Entry {
             },
             OpPayload::TwoPath { a, b },
         ) => opcode::LinkAt::new(
-            types::Fd(*olddir),
+            types::Fd(olddir.as_raw_fd()),
             a.as_ptr(),
-            types::Fd(*newdir),
+            types::Fd(newdir.as_raw_fd()),
             b.as_ptr(),
         )
         .flags(*flags)
         .build(),
         (OpDesc::SymlinkAt { newdir }, OpPayload::TwoPath { a, b }) => {
-            opcode::SymlinkAt::new(types::Fd(*newdir), a.as_ptr(), b.as_ptr()).build()
+            opcode::SymlinkAt::new(types::Fd(newdir.as_raw_fd()), a.as_ptr(), b.as_ptr()).build()
         }
         (OpDesc::FGetXattr { fd, len }, OpPayload::XattrRw { buf, name }) => {
             let value = buf.as_mut_slice().as_mut_ptr().cast::<libc::c_void>();
-            opcode::FGetXattr::new(types::Fd(*fd), name.as_ptr(), value, *len).build()
+            opcode::FGetXattr::new(types::Fd(fd.as_raw_fd()), name.as_ptr(), value, *len).build()
         }
         (OpDesc::FSetXattr { fd, len, flags }, OpPayload::XattrRw { buf, name }) => {
             let value = buf.as_mut_slice().as_ptr().cast::<libc::c_void>();
-            opcode::FSetXattr::new(types::Fd(*fd), name.as_ptr(), value, *len)
+            opcode::FSetXattr::new(types::Fd(fd.as_raw_fd()), name.as_ptr(), value, *len)
                 .flags(*flags)
                 .build()
         }
@@ -684,7 +789,7 @@ fn build_sqe(op: &OpDesc, payload: &mut OpPayload) -> squeue::Entry {
 /// A key is only reused after its CQE has been reaped, which is what lets the
 /// key double as `user_data`.
 struct Slab {
-    entries: Vec<Option<InFlight>>,
+    entries: Vec<Option<Task>>,
     free: Vec<usize>,
     live: usize,
     cap: usize,
@@ -708,7 +813,7 @@ impl Slab {
         self.live >= self.cap
     }
 
-    fn insert(&mut self, value: InFlight) -> usize {
+    fn insert(&mut self, value: Task) -> usize {
         self.live += 1;
         match self.free.pop() {
             Some(key) => {
@@ -722,14 +827,13 @@ impl Slab {
         }
     }
 
-    fn payload_mut(&mut self, key: usize) -> &mut OpPayload {
-        &mut self.entries[key]
+    fn get_mut(&mut self, key: usize) -> &mut Task {
+        self.entries[key]
             .as_mut()
             .expect("slab key is live until its CQE arrives")
-            .payload
     }
 
-    fn remove(&mut self, key: usize) -> Option<InFlight> {
+    fn remove(&mut self, key: usize) -> Option<Task> {
         let taken = self.entries.get_mut(key).and_then(Option::take);
         if taken.is_some() {
             self.live -= 1;
@@ -738,7 +842,7 @@ impl Slab {
         taken
     }
 
-    fn drain(&mut self) -> impl Iterator<Item = InFlight> + '_ {
+    fn drain(&mut self) -> impl Iterator<Item = Task> + '_ {
         self.live = 0;
         self.free.clear();
         self.entries.drain(..).flatten()
@@ -769,9 +873,23 @@ fn ring_thread(ring: IoUring, rx: Receiver<Task>, wake: OwnedFd, max_inflight: u
         slab: Slab::new(max_inflight),
         backlog: VecDeque::new(),
     };
-    if let Err(e) = state.run(&rx) {
-        tracing::error!(error = %e, "io_uring lane aborted");
-        state.abandon();
+    // A panic must not unwind through `RingState`'s drop glue. Field order puts
+    // `ring` first, so an ordinary drop would close the ring before freeing the
+    // payloads the kernel may still be writing to. `catch_unwind` turns that
+    // into the same controlled leak the error path takes. `AssertUnwindSafe` is
+    // honest here: the only thing we do with `state` afterwards is `abandon`,
+    // which never reads a value that a torn invariant could corrupt.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.run(&rx)));
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "io_uring lane aborted");
+            state.abandon();
+        }
+        Err(_) => {
+            tracing::error!("io_uring lane panicked");
+            state.abandon();
+        }
     }
 }
 
@@ -823,12 +941,12 @@ impl RingState {
 
     fn fill(&mut self) -> io::Result<()> {
         while !self.backlog.is_empty() && !self.slab.is_full() {
-            let Task { op, payload, done } = self
+            let task = self
                 .backlog
                 .pop_front()
                 .expect("backlog was checked non-empty");
-            let key = self.slab.insert(InFlight { payload, done });
-            let entry = build_sqe(&op, self.slab.payload_mut(key)).user_data(key as u64 + 1);
+            let key = self.slab.insert(task);
+            let entry = build_sqe(self.slab.get_mut(key)).user_data(key as u64 + 1);
             if let Err(e) = push(&mut self.ring, &entry) {
                 // The SQE never reached the kernel, so the payload is ours to
                 // return; nothing is in flight against it.
@@ -859,7 +977,21 @@ impl RingState {
                 // `EBUSY` means the completion queue is full and the kernel
                 // refused new submissions; reaping frees space, so this makes
                 // progress rather than spinning.
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => self.reap(),
+                //
+                // This branch is unreachable in practice, and that matters:
+                // `reap` can clear `ev_armed`, and the retry below does not
+                // re-arm, so an empty slab here would block forever. The
+                // in-flight cap (<= `entries`, against a CQ of `2 * entries`)
+                // is the only reason the CQ never fills. Anything that raises
+                // the cap must also make this branch return to `run` instead of
+                // retrying in place.
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                    debug_assert!(
+                        !self.slab.is_empty(),
+                        "EBUSY with an empty slab: the in-flight cap no longer bounds the CQ"
+                    );
+                    self.reap();
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -879,12 +1011,33 @@ impl RingState {
                 *ev_armed = false;
                 continue;
             }
-            if let Some(f) = slab.remove((user_data - 1) as usize) {
-                // A dropped receiver means the caller's future was cancelled.
-                // The payload then drops here, after the CQE, which is exactly
-                // when the kernel is finished with it.
-                let _ = f.done.send((cqe.result(), f.payload));
+            let Some(task) = slab.remove((user_data - 1) as usize) else {
+                continue;
+            };
+            let Task {
+                op,
+                mut payload,
+                done,
+            } = task;
+            let res = cqe.result();
+            if res >= 0 {
+                if let OpPayload::Open { opened, .. } = &mut payload {
+                    // SAFETY: `OpPayload::Open` belongs to `openat2` alone, so a
+                    // non-negative result here is the descriptor the kernel just
+                    // created for this SQE. The ring thread has not stored it
+                    // anywhere and no other owner exists, so this is the single
+                    // transfer of ownership and `OwnedFd` closes it exactly once
+                    // - whether it reaches the caller or dies with a cancelled
+                    // payload two lines below.
+                    *opened = Some(unsafe { OwnedFd::from_raw_fd(res) });
+                }
             }
+            // A dropped receiver means the caller cancelled. Everything the
+            // operation owns - buffers, path strings, the descriptor references
+            // in `op`, and any freshly opened fd - is released here, after the
+            // CQE, which is exactly when the kernel is finished with it.
+            let _ = done.send((res, payload));
+            drop(op);
         }
     }
 
@@ -893,16 +1046,28 @@ impl RingState {
     ///
     /// Leaking is the conservative choice - closing the ring fd does not
     /// synchronously guarantee that every in-flight request has stopped
-    /// touching its buffers, so the payloads and the ring itself are forgotten
-    /// rather than dropped. Dropping the oneshot senders turns each waiting
-    /// caller's `await` into a failure instead of a hang.
+    /// touching its buffers, so the payloads, the descriptor references, and
+    /// the ring itself are forgotten rather than dropped. Dropping the oneshot
+    /// senders makes each waiting caller's `await` panic instead of hang.
+    ///
+    /// Backlogged tasks were never submitted, so those drop normally.
     fn abandon(mut self) {
-        for f in self.slab.drain() {
-            std::mem::forget(f.payload);
-            drop(f.done);
+        for task in self.slab.drain() {
+            let Task { op, payload, done } = task;
+            // The kernel may still write into the payload, and may still name
+            // the descriptors in `op`; neither may be released.
+            std::mem::forget(op);
+            std::mem::forget(payload);
+            drop(done);
         }
-        self.backlog.clear();
+        // Order matters. Backlogged tasks were never submitted, so releasing
+        // them is correct - but releasing them can itself panic (`PooledBuf`
+        // returns to a pool behind a `Mutex`). Leak the ring and `ev_buf`
+        // first, so an unwind out of this handler can no longer free the
+        // eventfd read's destination while that read is still armed.
+        let backlog = std::mem::take(&mut self.backlog);
         std::mem::forget(self);
+        drop(backlog);
     }
 }
 
@@ -939,10 +1104,15 @@ fn io_errno(e: &io::Error) -> i32 {
 mod tests {
     use super::*;
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd, IntoRawFd};
 
     fn cstr(s: &str) -> CString {
         CString::new(s).unwrap()
+    }
+
+    /// Every fd argument is an `Arc<OwnedFd>`; the executor keeps its own
+    /// reference for as long as an operation names the descriptor.
+    fn owned(file: std::fs::File) -> Arc<OwnedFd> {
+        Arc::new(OwnedFd::from(file))
     }
 
     fn rw_file(path: std::path::PathBuf) -> std::fs::File {
@@ -955,49 +1125,62 @@ mod tests {
             .unwrap()
     }
 
+    fn create_how() -> types::OpenHow {
+        types::OpenHow::new()
+            .flags((libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) as u64)
+            .mode(0o644)
+    }
+
+    /// Descriptors this process holds onto anything under `root`.
+    ///
+    /// Scoping to one tempdir rather than counting all of `/proc/self/fd` is
+    /// what makes this deterministic: `cargo test` runs these tests in parallel
+    /// threads of one process, so a whole-process count drifts with whatever
+    /// the neighbours have open.
+    fn fds_under(root: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| target.starts_with(root))
+            .count()
+    }
+
     #[tokio::test]
     async fn write_then_read_round_trips_through_ring() {
         let exec = UringExecutor::new(1, 64).unwrap();
         let dir = tempfile::tempdir().unwrap();
         // Read+write, not `File::create`: an O_WRONLY descriptor makes the
         // read below fail with EBADF before it ever reaches the ring.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(dir.path().join("f"))
-            .unwrap();
-        let fd = file.as_raw_fd();
+        let fd = owned(rw_file(dir.path().join("f")));
 
         let pool = super::super::buffers::BufferPool::new(4096, 4);
         let mut buf = pool.get();
         buf.as_mut_slice()[..5].copy_from_slice(b"hello");
-        let (_buf, res) = exec.write(fd, 0, buf, 5).await;
+        let (_buf, res) = exec.write(&fd, 0, buf, 5).await;
         assert_eq!(res.unwrap(), 5);
 
         let rbuf = pool.get();
-        let (rbuf, res) = exec.read(fd, 0, rbuf, 5).await;
+        let (rbuf, res) = exec.read(&fd, 0, rbuf, 5).await;
         assert_eq!(res.unwrap(), 5);
         assert_eq!(&rbuf.as_mut_ref_for_test()[..5], b"hello");
-        exec.fsync(fd, false).await.unwrap();
+        exec.fsync(&fd, false).await.unwrap();
     }
 
     #[tokio::test]
     async fn mkdir_statx_unlink_via_ring() {
         let exec = UringExecutor::new(1, 64).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let dfd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+        let dfd = owned(std::fs::File::open(dir.path()).unwrap());
 
-        exec.mkdirat(dfd, cstr("sub"), 0o755).await.unwrap();
+        exec.mkdirat(&dfd, cstr("sub"), 0o755).await.unwrap();
         let st = exec
-            .statx(dfd, cstr("sub"), 0, libc::STATX_BASIC_STATS)
+            .statx(&dfd, cstr("sub"), 0, libc::STATX_BASIC_STATS)
             .await
             .unwrap();
         assert_eq!(st.stx_mode as u32 & libc::S_IFMT, libc::S_IFDIR);
-        exec.unlinkat(dfd, cstr("sub"), true).await.unwrap();
+        exec.unlinkat(&dfd, cstr("sub"), true).await.unwrap();
         let err = exec
-            .statx(dfd, cstr("sub"), 0, libc::STATX_BASIC_STATS)
+            .statx(&dfd, cstr("sub"), 0, libc::STATX_BASIC_STATS)
             .await
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
@@ -1007,9 +1190,9 @@ mod tests {
     async fn many_concurrent_ops_complete() {
         let exec = UringExecutor::new(1, 8).unwrap(); // entries smaller than op count
         let dir = tempfile::tempdir().unwrap();
-        let dfd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+        let dfd = owned(std::fs::File::open(dir.path()).unwrap());
         let futs: Vec<_> = (0..64)
-            .map(|i| exec.mkdirat(dfd, cstr(&format!("d{i}")), 0o755))
+            .map(|i| exec.mkdirat(&dfd, cstr(&format!("d{i}")), 0o755))
             .collect();
         for f in futures::future::join_all(futs).await {
             f.unwrap();
@@ -1020,32 +1203,28 @@ mod tests {
     async fn open_fallocate_link_rename_symlink_via_ring() {
         let exec = UringExecutor::new(2, 32).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let dirfile = std::fs::File::open(dir.path()).unwrap();
-        let dfd = dirfile.as_raw_fd();
+        let dfd = owned(std::fs::File::open(dir.path()).unwrap());
 
-        let how = types::OpenHow::new()
-            .flags((libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) as u64)
-            .mode(0o644);
-        let file = exec.openat2(dfd, cstr("a"), how).await.unwrap();
-        exec.fallocate(file.as_raw_fd(), 0, 0, 4096).await.unwrap();
+        let file = Arc::new(exec.openat2(&dfd, cstr("a"), create_how()).await.unwrap());
+        exec.fallocate(&file, 0, 0, 4096).await.unwrap();
 
         let st = exec
-            .statx(dfd, cstr("a"), 0, libc::STATX_BASIC_STATS)
+            .statx(&dfd, cstr("a"), 0, libc::STATX_BASIC_STATS)
             .await
             .unwrap();
         assert_eq!(st.stx_size, 4096);
 
-        exec.linkat(dfd, cstr("a"), dfd, cstr("b"), 0)
+        exec.linkat(&dfd, cstr("a"), &dfd, cstr("b"), 0)
             .await
             .unwrap();
-        exec.renameat(dfd, cstr("b"), dfd, cstr("c"), 0)
+        exec.renameat(&dfd, cstr("b"), &dfd, cstr("c"), 0)
             .await
             .unwrap();
-        exec.symlinkat(cstr("c"), dfd, cstr("l")).await.unwrap();
+        exec.symlinkat(cstr("c"), &dfd, cstr("l")).await.unwrap();
 
         let link = exec
             .statx(
-                dfd,
+                &dfd,
                 cstr("l"),
                 libc::AT_SYMLINK_NOFOLLOW,
                 libc::STATX_BASIC_STATS,
@@ -1055,7 +1234,7 @@ mod tests {
         assert_eq!(link.stx_mode as u32 & libc::S_IFMT, libc::S_IFLNK);
 
         for name in ["a", "c", "l"] {
-            exec.unlinkat(dfd, cstr(name), false).await.unwrap();
+            exec.unlinkat(&dfd, cstr(name), false).await.unwrap();
         }
     }
 
@@ -1063,13 +1242,12 @@ mod tests {
     async fn xattr_round_trips_through_ring() {
         let exec = UringExecutor::new(1, 8).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let file = rw_file(dir.path().join("x"));
-        let fd = file.as_raw_fd();
+        let fd = owned(rw_file(dir.path().join("x")));
         let pool = super::super::buffers::BufferPool::new(64, 2);
 
         let mut value = pool.get();
         value.as_mut_slice()[..3].copy_from_slice(b"bar");
-        let (_value, res) = exec.fsetxattr(fd, cstr("user.lbfs"), value, 3, 0).await;
+        let (_value, res) = exec.fsetxattr(&fd, cstr("user.lbfs"), value, 3, 0).await;
         match res {
             Ok(()) => {}
             // Filesystems without user-namespace xattrs have nothing to prove
@@ -1079,7 +1257,7 @@ mod tests {
         }
 
         let out = pool.get();
-        let (out, res) = exec.fgetxattr(fd, cstr("user.lbfs"), out, 64).await;
+        let (out, res) = exec.fgetxattr(&fd, cstr("user.lbfs"), out, 64).await;
         assert_eq!(res.unwrap(), 3);
         assert_eq!(out.as_slice(), b"bar");
     }
@@ -1088,8 +1266,7 @@ mod tests {
     async fn short_read_hides_recycled_buffer_tail() {
         let exec = UringExecutor::new(1, 8).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let file = rw_file(dir.path().join("f"));
-        let fd = file.as_raw_fd();
+        let fd = owned(rw_file(dir.path().join("f")));
         let pool = super::super::buffers::BufferPool::new(32, 1);
 
         // Dirty the pooled storage, then hand it back. The pool does not zero.
@@ -1099,12 +1276,12 @@ mod tests {
 
         let mut w = pool.get();
         w.as_mut_slice()[..3].copy_from_slice(b"abc");
-        let (w, res) = exec.write(fd, 0, w, 3).await;
+        let (w, res) = exec.write(&fd, 0, w, 3).await;
         assert_eq!(res.unwrap(), 3);
         drop(w);
 
         let r = pool.get();
-        let (r, res) = exec.read(fd, 0, r, 32).await;
+        let (r, res) = exec.read(&fd, 0, r, 32).await;
         assert_eq!(res.unwrap(), 3);
         assert_eq!(r.as_slice(), b"abc");
     }
@@ -1116,14 +1293,70 @@ mod tests {
         for _ in 0..4 {
             let exec = UringExecutor::new(3, 4).unwrap();
             let dir = tempfile::tempdir().unwrap();
-            let dirfile = std::fs::File::open(dir.path()).unwrap();
+            let dfd = owned(std::fs::File::open(dir.path()).unwrap());
             let clone = exec.clone();
-            clone
-                .mkdirat(dirfile.as_raw_fd(), cstr("z"), 0o755)
-                .await
-                .unwrap();
+            clone.mkdirat(&dfd, cstr("z"), 0o755).await.unwrap();
             drop(clone);
             drop(exec);
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_futures_leave_the_lane_usable() {
+        let exec = UringExecutor::new(1, 4).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dfd = owned(std::fs::File::open(dir.path()).unwrap());
+
+        // Poll each future once so the task reaches the ring, then drop it. The
+        // executor still owns the payload and the directory fd, so the ring
+        // thread completes and reaps every one of these on its own.
+        for i in 0..16 {
+            let mut fut = Box::pin(exec.mkdirat(&dfd, cstr(&format!("c{i}")), 0o755));
+            let _ = futures::poll!(fut.as_mut());
+            drop(fut);
+        }
+        // The caller's own handle goes away too: only the executor's clone of
+        // the Arc keeps the directory descriptor open now.
+        drop(dfd);
+
+        // The lane must still serve later work rather than wedge on the
+        // cancelled entries.
+        let dfd = owned(std::fs::File::open(dir.path()).unwrap());
+        for i in 0..8 {
+            exec.mkdirat(&dfd, cstr(&format!("after{i}")), 0o755)
+                .await
+                .unwrap();
+        }
+        drop(exec); // drains and joins; a wedged lane would hang here
+    }
+
+    #[tokio::test]
+    async fn cancelled_openat2_closes_the_descriptor_it_opened() {
+        const OPENS: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let dfd = owned(std::fs::File::open(dir.path()).unwrap());
+
+        assert_eq!(fds_under(dir.path()), 1, "only `dfd` should be open yet");
+        {
+            let exec = UringExecutor::new(1, 8).unwrap();
+            let mut futs = Vec::new();
+            for i in 0..OPENS {
+                let mut fut = Box::pin(exec.openat2(&dfd, cstr(&format!("o{i}")), create_how()));
+                let _ = futures::poll!(fut.as_mut());
+                futs.push(fut);
+            }
+            drop(futs); // every caller cancels before its CQE
+            drop(exec); // drains: the ring thread owns each opened fd and must close it
+        }
+
+        // `dfd` and nothing else. Wrapping the CQE result on the ring thread is
+        // what makes this hold; decoding it in the caller's future would leak
+        // all `OPENS` descriptors instead.
+        assert_eq!(
+            fds_under(dir.path()),
+            1,
+            "cancelled opens leaked descriptors into {:?}",
+            dir.path()
+        );
     }
 }
