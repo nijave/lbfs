@@ -5,13 +5,20 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# The harness in `src/lib.rs` starts a real server and speaks frames to it, so
+# the server and the protocol are ordinary dependencies rather than dev ones:
+# a dev-dependency is not visible to a crate's own library target.
 [dependencies]
-
-[dev-dependencies]
 lbfs-proto = { workspace = true, features = ["io"] }
+lbfs-server = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 postcard = { workspace = true }
 tempfile = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }
+rustix = { workspace = true }
 
 [lints]
 workspace = true
