@@ -7,5 +7,13 @@ ExecStart=/usr/local/bin/lbfs-server --config /etc/lbfs.toml
 Restart=no
 User=ubuntu
 
+# The server holds one O_PATH descriptor per node a client still remembers, so
+# this number is the largest tree a client may have live at once. It raises its
+# own soft limit to the hard one at startup, which is what makes it correct
+# under any launcher; this sets the hard limit that raise aims at, because
+# systemd's default of 524288 is a policy decision the unit should make rather
+# than inherit. Belt and braces: either mechanism alone clears a build tree.
+LimitNOFILE=1048576
+
 [Install]
 WantedBy=multi-user.target
