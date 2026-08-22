@@ -4,7 +4,26 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_PORT: u16 = 9423;
 pub const DEFAULT_MAX_INFLIGHT: u32 = 128;
 pub const WINDOW_CLAMP: (u32, u32) = (8, 1024);
-pub const DEFAULT_MAX_IO_SIZE: u32 = 1 << 20;
+/// The I/O ceiling both ends propose when nothing overrides it.
+///
+/// Streaming through the mount is bound by per-request software cost — a
+/// megabyte read costs ~632 µs and a megabyte write ~2757 µs on the two-VM
+/// pair, against a 36 Gbit/s link that no shape comes close to filling — so the
+/// number of requests it takes to move a gigabyte is the lever. Four megabytes
+/// quarters that count.
+///
+/// The client's kernel has the last word: FUSE splits application I/O at
+/// `fs.fuse.max_pages_limit` pages, 256 (1 MiB) out of the box, and
+/// the kernel clamps the mount to that many pages whatever the handshake said.
+/// A mount that wants the whole four megabytes needs the sysctl at 1024 pages
+/// or more; a kernel left at its default splits at a megabyte instead, which
+/// costs throughput and nothing else.
+///
+/// The server sizes a pooled buffer at whatever it settles on, and retains up
+/// to `2 × max_inflight` of them, so this figure also prices the server's
+/// steady-state memory for a busy session. An export served to a small guest
+/// wants `max_io_size` in its config file rather than this default.
+pub const DEFAULT_MAX_IO_SIZE: u32 = 4 << 20;
 pub const MAX_BODY_SIZE: u32 = 64 << 10;
 
 pub const FLAG_NO_REPLY: u16 = 1 << 0;

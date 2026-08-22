@@ -1463,8 +1463,10 @@ mod tests {
         };
         assert!(check_settled(&proposal, &below_floor).is_err());
 
+        // One byte over what this client asked for, whatever it asked for: the
+        // rule is "never above the proposal", not a particular size.
         let over_ask = HelloReply {
-            max_io_size: (1 << 20) + 1,
+            max_io_size: proposal.max_io_size + 1,
             ..settled(0)
         };
         assert!(check_settled(&proposal, &over_ask).is_err());

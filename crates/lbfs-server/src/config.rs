@@ -173,7 +173,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.max_inflight, 128);
-        assert_eq!(cfg.max_io_size, 1 << 20);
+        assert_eq!(cfg.max_io_size, DEFAULT_MAX_IO_SIZE);
         assert!(matches!(cfg.fsync, FsyncPolicy::Honor));
     }
 

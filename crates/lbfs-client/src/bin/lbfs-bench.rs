@@ -23,14 +23,17 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use lbfs_client::conn::Connection;
+use lbfs_proto::frame::DEFAULT_MAX_IO_SIZE;
 use lbfs_proto::types::{Fh, NodeId, ROOT_NODE};
 use lbfs_proto::Errno;
 use tokio::task::JoinSet;
 
-/// The protocol's own ceiling on one I/O. A larger block would be refused by
-/// the multiplexer before it reached the wire, so it is refused here instead,
-/// where the message can say which flag was wrong.
-const MAX_BS: u32 = 1 << 20;
+/// The largest block this tool will try. A block over what the session settles
+/// on would be refused by the multiplexer before it reached the wire, so it is
+/// refused here instead, where the message can say which flag was wrong. The
+/// default ceiling is the bound before a handshake has happened; the settled
+/// one is checked against as well, once there is a connection to ask.
+const MAX_BS: u32 = DEFAULT_MAX_IO_SIZE;
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Op {
