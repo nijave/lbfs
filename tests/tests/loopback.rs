@@ -650,6 +650,98 @@ fn file_content_round_trips_without_the_writeback_cache() {
     file_content_round_trips(false);
 }
 
+/// The promise `FUSE_HANDLE_KILLPRIV_V2` buys, checked end to end.
+///
+/// Asking the kernel for that capability tells it to stop clearing set-user-ID
+/// itself, which is worth one round trip per write and worth nothing at all if
+/// the bits then survive. So this walks the whole path: chmod through the
+/// mount, write through the mount, and read the mode off the export directly,
+/// behind the mount's back.
+///
+/// Both writeback settings, because the kernel reaches the wire flag by two
+/// different routes. With the cache on, `fuse_cache_write_iter` sees a file
+/// needing a strip and switches to the write-through path so the flag can ride
+/// a synchronous request (`fs/fuse/file.c:1489-1491`, `file.c:1205-1206`). With
+/// it off, `fuse_perform_write` gets there directly.
+fn privileged_bits_die_on_write(writeback: bool) {
+    let lb = Loopback::start(Opts {
+        writeback,
+        ..Opts::default()
+    });
+    lb.wait_ready();
+
+    let seen = lb.mnt().join("suid");
+    let real = lb.export().join("suid");
+
+    std::fs::write(&seen, b"old").unwrap();
+    std::fs::set_permissions(&seen, std::os::unix::fs::PermissionsExt::from_mode(0o4755)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&real).unwrap().mode() & 0o7777,
+        0o4755,
+        "the chmod did not reach the export"
+    );
+
+    std::fs::write(&seen, b"new").unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&real).unwrap().mode() & 0o7777,
+        0o0755,
+        "set-user-ID survived a write through the mount"
+    );
+    assert_eq!(std::fs::read(&real).unwrap(), b"new");
+
+    // Set-group-ID with group execute goes the same way; without it the bit is
+    // a mandatory-locking marker and stays.
+    let exec = lb.mnt().join("sgid-exec");
+    let exec_real = lb.export().join("sgid-exec");
+    std::fs::write(&exec, b"old").unwrap();
+    std::fs::set_permissions(&exec, std::os::unix::fs::PermissionsExt::from_mode(0o2775)).unwrap();
+    std::fs::write(&exec, b"new").unwrap();
+    assert_eq!(
+        std::fs::metadata(&exec_real).unwrap().mode() & 0o7777,
+        0o0775
+    );
+
+    let mark = lb.mnt().join("sgid-mand");
+    let mark_real = lb.export().join("sgid-mand");
+    std::fs::write(&mark, b"old").unwrap();
+    std::fs::set_permissions(&mark, std::os::unix::fs::PermissionsExt::from_mode(0o2664)).unwrap();
+    std::fs::write(&mark, b"new").unwrap();
+    assert_eq!(
+        std::fs::metadata(&mark_real).unwrap().mode() & 0o7777,
+        0o2664
+    );
+
+    // Truncate carries the same obligation as write.
+    let trunc = lb.mnt().join("suid-trunc");
+    let trunc_real = lb.export().join("suid-trunc");
+    std::fs::write(&trunc, b"0123456789").unwrap();
+    std::fs::set_permissions(&trunc, std::os::unix::fs::PermissionsExt::from_mode(0o4755)).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&trunc)
+        .unwrap()
+        .set_len(4)
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&trunc_real).unwrap().mode() & 0o7777,
+        0o0755
+    );
+    assert_eq!(std::fs::metadata(&trunc_real).unwrap().len(), 4);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn privileged_bits_die_on_write_with_the_writeback_cache() {
+    privileged_bits_die_on_write(true);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn privileged_bits_die_on_write_without_the_writeback_cache() {
+    privileged_bits_die_on_write(false);
+}
+
 /// Several times the negotiated I/O ceiling in one call, so the kernel has to
 /// split it and the client has to put the pieces back at the right offsets.
 #[test]
