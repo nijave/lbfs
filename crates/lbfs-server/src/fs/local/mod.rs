@@ -361,6 +361,12 @@ impl LocalFs {
     /// `O_PATH` — so `fchmod` takes it directly and no `/proc` detour is
     /// needed. `statx` first, because the common case has nothing to clear and
     /// an unconditional `fchmod` would bump `ctime` on every write.
+    ///
+    /// The truncate half of the same promise lives in [`apply_setattr`], which
+    /// holds only an `O_PATH` descriptor and so spells the same two steps
+    /// differently. Only the descriptor kind differs: a change to what a strip
+    /// *means* belongs in [`stripped_mode`], and a change to when one happens
+    /// belongs in both.
     async fn strip_privileged_bits(&self, fd: &Arc<OwnedFd>) -> FsResult<()> {
         let st = self.statx_fd(fd).await.map_err(errno)?;
         let Some(mode) = stripped_mode(u32::from(st.stx_mode)) else {
@@ -924,6 +930,10 @@ fn apply_setattr(
     // `dentry_needs_remove_privs` into the `iattr` and that predicate turns on
     // the caller lacking `CAP_FSETID`. Under `Explicit` the kernel steps aside
     // and this is the strip.
+    //
+    // The write half of the same promise is `LocalFs::strip_privileged_bits`,
+    // which owns a real open handle and therefore uses `fchmod` where this uses
+    // `/proc`. Only the descriptor kind differs; keep the two in step.
     if killpriv == KillPrivPolicy::Explicit && args.size.is_some() {
         let st = rustix::fs::statx(
             fd,
@@ -2223,6 +2233,39 @@ mod tests {
             b"old",
             "a refused resize truncated the file anyway"
         );
+    }
+
+    /// No size, no strip — even on the branch that does the stripping.
+    ///
+    /// The counterpart to [`an_unflagged_write_strips_nothing_under_explicit`],
+    /// and the only test that holds `apply_setattr`'s `args.size.is_some()`
+    /// guard in place: `chmod u+s` is a legitimate request, and widening the
+    /// guard to every `SETATTR` would quietly refuse it. The unprivileged
+    /// backing kernel is not an actor here either way, because it clears
+    /// set-user-ID for a `chown`, not for a `chmod` that names the bit.
+    #[tokio::test]
+    async fn a_chmod_with_no_size_strips_nothing_under_explicit() {
+        let (_dir, fs, path) = explicit_fs_with_a_suid_file("suid").await;
+        let e = fs.lookup(ROOT_NODE, b"suid").await.unwrap();
+
+        let attr = fs
+            .setattr(
+                e.node,
+                SetattrArgs {
+                    mode: Some(0o4755),
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime: TimeSet::Omit,
+                    mtime: TimeSet::Omit,
+                    fh: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attr.mode & 0o7777, 0o4755);
+        assert_eq!(mode_bits(&path), 0o4755, "a sizeless SETATTR over-stripped");
     }
 
     /// `CREATE` owes the client exactly one `FORGET` for the entry it returns,
