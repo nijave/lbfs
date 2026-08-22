@@ -2512,17 +2512,28 @@ forwarding a kill signal. The reasoning is in
 `docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
 ```
 
-- [ ] **Step 3: Check the prose gate**
+- [ ] **Step 3: Update the pre-epoch limitation**
+
+In `README.md`, find the known-limitations paragraph on pre-1970 timestamps
+(near line 211) and append one sentence:
+
+```markdown
+The 0.18.0 pin repairs the outbound half of this — replies now carry a
+fractional pre-1970 time intact — while the inbound half (`utimensat` through
+`system_time_from_time`) still waits on a later fuser release.
+```
+
+- [ ] **Step 4: Check the prose gate**
 
 Run: `vale --output=line README.md docs/superpowers/specs/2026-08-20-lbfs-design.md`
 Expected: no output.
 
-- [ ] **Step 4: Run the whole gate one last time**
+- [ ] **Step 5: Run the whole gate one last time**
 
 Run: `make check && make test-loopback && make vm-test`
 Expected: PASS throughout.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add README.md docs/superpowers/specs/2026-08-20-lbfs-design.md
@@ -2552,7 +2563,7 @@ git commit -m "docs: why the fuser pin is exact, and what moving it costs"
 - **The 0.18.0 sweep is one large commit, and no smaller one would be truthful.** Changing the pin breaks every callback at once, so no intermediate state compiles. Tasks 7 through 9 exist to keep the judgement calls out of it, which leaves a diff that is large but purely mechanical. A reviewer should read Step 12's table and spot-check three callbacks rather than read all 33.
 - **`ForgetOne` may become public in a later release, at which point the deleted override is worth revisiting.** Today the trait default calls `forget` once per node and our `send_forget` batches behind the scenes, so the loop costs nothing. If upstream exports the type and adds anything to it that the per-node path loses, this is the place to look.
 - **The tripwire is a guarantee check by default, not a forwarding check.** On this deployment the server runs unprivileged, so its own kernel strips set-user-ID inside `write(2)` whatever the client forwards, and the assertion would hold even if fuser dropped every kill signal. The kill-priv plan's own risk list says so and offers the five-line `Explicit` override that closes it. Running `make test-loopback` once under `sudo`, by hand, is what exercises the forwarding path; the suite cannot demand root.
-- **The pre-epoch reply fix arrives, and its inbound half does not.** 0.18.0's `time_from_system_time` stops mangling a fractional pre-1970 time on the way to the kernel, which is half of the limitation at `README.md:211`. `system_time_from_time` — the inbound half, reached by `utimensat` — waits for the next release. Leaving the README paragraph as it stands would overstate the problem and rewriting it would understate it; the right move is a sentence noting that this release repairs the outbound half, and this plan budgets no such sentence.
+- **The pre-epoch reply fix arrives, and its inbound half does not.** 0.18.0's `time_from_system_time` stops mangling a fractional pre-1970 time on the way to the kernel, which is half of the limitation at `README.md:211`. `system_time_from_time` — the inbound half, reached by `utimensat` — waits for the next release. Leaving the README paragraph as it stands would overstate the problem and rewriting it would understate it; the right move is a sentence noting that this release repairs the outbound half, and Task 11 Step 3 now budgets exactly that sentence (added after the code-review adjudication flagged the gap).
 - **`--fuse-threads` is a visible flag rather than a hidden one.** The assessment recommends hiding it. Visible loses nothing today and documents itself, yet it widens the support surface for a knob nobody should turn on this hardware. If it starts appearing in bug reports, `#[arg(long, hide = true)]` costs one line.
 - **A four-vCPU guest is the measurement this plan does not take.** Every number behind the "leave the threads off" recommendation comes from two vCPUs with tokio workers already on one of them. Task 10 records the two-vCPU reading, so the next person reopens the question with evidence rather than rearguing it.
 - **Reverting past Task 6 means reverting Tasks 7 through 9 with it.** Each of the three rests on 0.18.0 types. That is the ordinary shape of a dependency upgrade, and the two-commit split in step 1 is where the cheap revert lives; past the 0.18.0 pin, the branch is the unit.

@@ -97,7 +97,9 @@ Every message is one frame:
 - `data`: bulk payload — present only on `WRITE` requests, `READ`/`GETXATTR`/
   `LISTXATTR` responses, and `SETXATTR` requests. Never passes through the
   serializer: senders emit it with vectored writes directly from the source
-  buffer; receivers read it directly into a pooled buffer.
+  buffer; the server reads it directly into a pooled buffer, and the client
+  reads each reply's payload into a fresh buffer — a deliberate v1 choice,
+  since fuser's reply API copies the slice either way.
 
 Protocol violations that desynchronize the stream (lengths exceeding
 negotiated maxima, unknown opcodes, window overflow, malformed
