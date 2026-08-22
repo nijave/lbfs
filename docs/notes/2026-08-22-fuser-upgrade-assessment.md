@@ -4,6 +4,20 @@ Sizing exercise, not a plan. It answers two questions: what the three released
 upgrade steps cost against *our* code and what they buy, and whether the four
 things no fuser release carries are worth building ourselves.
 
+> Correction (2026-08-22): the upgrade plan at
+> `docs/superpowers/plans/2026-08-22-fuser-two-step-upgrade.md` checked this
+> note against the published crates by compiling them and found eight deltas.
+> The largest: `ForgetOne` is private at 0.18.0, so the `batch_forget`
+> override goes away rather than migrating; `join()` at 0.18.0 no longer
+> unmounts, so callers need `umount_and_join()`; `Config` is
+> `#[non_exhaustive]`, so struct expressions with `..Default::default()`
+> fail to build. Smaller: `lseek` keeps `offset: i64`; `rename`,
+> `copy_file_range`, and `setattr` carry three more bitflags conversions;
+> the dependency audit belongs at 0.18.0 (0.16.0's dependency list matches
+> 0.15.1); the TTL complaint lives at `fuse.rs:465-467`, not `:29`; the
+> stale-prose list is longer than the one below. The plan is the executable
+> authority where the two disagree.
+
 Sources read first-hand for this note:
 
 - vendored `fuser-0.15.1` under `~/.cargo/registry/src/index.crates.io-*/`
