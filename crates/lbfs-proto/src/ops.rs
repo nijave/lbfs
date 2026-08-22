@@ -88,6 +88,14 @@ pub struct HelloRequest {
     pub version: u32,
     pub max_inflight: u32,
     pub max_io_size: u32,
+    /// Whether the client mounted with `FUSE_WRITEBACK_CACHE`.
+    ///
+    /// Not a server option and not negotiable: it says whose kernel owns the
+    /// page cache and the file size, which changes what an `OPEN` flag means
+    /// on the server (`O_APPEND` and `O_WRONLY` in particular — see
+    /// `LocalFs::mask_open_flags`). Only the client knows it, so it travels
+    /// with the handshake rather than being guessed at attach.
+    pub writeback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +449,14 @@ mod tests {
             version: 1,
             max_inflight: 128,
             max_io_size: 1 << 20,
+            writeback: true,
+        });
+        round_trip(&HelloRequest {
+            magic: MAGIC,
+            version: 1,
+            max_inflight: 8,
+            max_io_size: 4096,
+            writeback: false,
         });
         round_trip(&HelloReply {
             version: 1,
