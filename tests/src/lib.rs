@@ -53,6 +53,16 @@ use tokio::net::TcpStream;
 /// far larger than any operation here needs and far smaller than "forever".
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The largest reply data segment this harness will allocate for.
+///
+/// A reply's `body_len` has `MAX_BODY_SIZE` to check against; its `data_len`
+/// has no protocol constant of its own, only whatever the session negotiated.
+/// Trusting the header outright would turn a server that reported a nonsense
+/// length into an allocation that takes the test runner down instead of a test
+/// that fails. Two megabytes sits comfortably above the 1 MiB ceiling any case
+/// here settles on, so a legitimate reply never meets it.
+const MAX_REPLY_DATA: u32 = 2 << 20;
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -392,6 +402,12 @@ impl TestClient {
         let body = read_body(&mut self.sock, hdr.body_len, MAX_BODY_SIZE)
             .await
             .expect("reply body is within MAX_BODY_SIZE");
+        assert!(
+            hdr.data_len <= MAX_REPLY_DATA,
+            "reply {} claims a {}-byte data segment, past this harness's {MAX_REPLY_DATA}-byte bound",
+            hdr.request_id,
+            hdr.data_len
+        );
         let mut data = vec![0u8; hdr.data_len as usize];
         self.sock
             .read_exact(&mut data)

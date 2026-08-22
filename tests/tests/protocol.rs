@@ -791,10 +791,16 @@ async fn a_handle_or_node_the_client_does_not_own_is_refused() {
     .await
     .expect_errno(libc::ESTALE);
 
+    // RELEASE retires the handle it answers for, and the only way to see that
+    // from the wire is to use the handle afterwards. Nothing else in the
+    // workspace proves it: a refactor that answered OK without removing the
+    // handle would leak one descriptor per open with every test still green.
+    c.release(an, afh).await.ok_unit();
+    c.read(an, afh, 0, 1).await.expect_errno(libc::EBADF);
+
     // RELEASE and FLUSH are the two that tolerate a handle they cannot find: a
     // RELEASE whose reply was lost gets retried, and refusing the retry would
     // surface EBADF from the application's close(2).
-    c.release(an, afh).await.ok_unit();
     c.release(an, afh).await.ok_unit();
     c.call(Opcode::Flush, &FlushRequest { node: an, fh: afh })
         .await
@@ -882,7 +888,11 @@ async fn fsync_honor_runs_the_syscall() {
         .await
         .ok_unit();
     }
-    // One policy, files and directories alike.
+    // FSYNCDIR reaching the policy at all, which is all this can show: there
+    // is no directory analogue of the FIFO, so `ignore` answers OK here too.
+    // What makes that acceptable is that both halves run through the same
+    // `maybe_fsync`, and the file case above already discriminates the two
+    // policies against it.
     let dh: OpendirReply = c.opendir(ROOT_NODE).await.ok();
     c.call(
         Opcode::Fsyncdir,
