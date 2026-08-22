@@ -92,7 +92,8 @@ mod tests {
     fn plain_modes_need_no_strip() {
         assert_eq!(stripped_mode(libc::S_IFREG | 0o644), None);
         assert_eq!(stripped_mode(libc::S_IFREG | 0o777), None);
-        assert_eq!(stripped_mode(libc::S_IFREG | 0o000), None);
+        // Mode 0o000, spelled without the `| 0o000` clippy reads as a no-op.
+        assert_eq!(stripped_mode(libc::S_IFREG), None);
     }
 
     #[test]

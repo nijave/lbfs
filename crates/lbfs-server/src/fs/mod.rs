@@ -62,6 +62,11 @@ pub trait FileSystem: Send + Sync + 'static {
     /// Returns the pooled buffer the read filled; a short read at EOF comes
     /// back with the smaller length, not an error.
     async fn read(&self, node: NodeId, fh: Fh, offset: u64, size: u32) -> FsResult<PooledBuf>;
+    /// `kill_suidgid` carries the kernel's `FUSE_WRITE_KILL_SUIDGID`: the
+    /// writer holds no `CAP_FSETID`, so the file loses set-user-ID — and
+    /// set-group-ID when it also carries group execute — before these bytes
+    /// land. Under `FUSE_HANDLE_KILLPRIV_V2` the client's kernel does nothing
+    /// about it, so this flag is the only notice a backend receives.
     async fn write(
         &self,
         node: NodeId,
@@ -69,6 +74,7 @@ pub trait FileSystem: Send + Sync + 'static {
         offset: u64,
         data: PooledBuf,
         len: u32,
+        kill_suidgid: bool,
     ) -> FsResult<u32>;
     async fn flush(&self, node: NodeId, fh: Fh) -> FsResult<()>;
     async fn release(&self, node: NodeId, fh: Fh) -> FsResult<()>;

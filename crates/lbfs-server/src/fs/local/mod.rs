@@ -56,6 +56,7 @@ use lbfs_proto::types::{
 use lbfs_proto::Errno;
 
 use crate::config::FsyncPolicy;
+use crate::fs::local::killpriv::{stripped_mode, KillPrivPolicy};
 use crate::fs::{FileSystem, FsResult};
 use buffers::{BufferPool, PooledBuf};
 use nodes::{FileKey, NodeTable};
@@ -240,6 +241,9 @@ pub struct LocalFs {
     /// `(dev, ino)` of the export root, kept only for the loop guard in
     /// [`LocalFs::lookup_impl`].
     root_key: FileKey,
+    /// Whether this process must clear set-user-ID itself, decided once at
+    /// construction. See [`killpriv`].
+    killpriv: KillPrivPolicy,
 }
 
 impl LocalFs {
@@ -290,6 +294,11 @@ impl LocalFs {
             rustix::fs::StatxFlags::BASIC_STATS,
         )?;
         let root_key = make_key(st.stx_dev_major, st.stx_dev_minor, st.stx_ino);
+        let killpriv = KillPrivPolicy::detect();
+        tracing::info!(
+            policy = ?killpriv,
+            "set-user-ID stripping policy chosen from this process's CAP_FSETID"
+        );
         Ok(LocalFs {
             uring,
             nodes: NodeTable::new(root, root_key),
@@ -299,6 +308,7 @@ impl LocalFs {
             fsync_policy: fsync,
             writeback,
             root_key,
+            killpriv,
         })
     }
 
@@ -337,6 +347,32 @@ impl LocalFs {
                 libc::STATX_BASIC_STATS,
             )
             .await
+    }
+
+    /// Clear set-user-ID and set-group-ID before a write lands.
+    ///
+    /// Runs only under [`KillPrivPolicy::Explicit`]; the caller checks. The
+    /// order matches the VFS, where `file_remove_privs_flags`
+    /// (`fs/inode.c:2317-2341`) runs before the copy rather than after it, so
+    /// a crash between the two steps leaves the old bytes under a safe mode
+    /// rather than new bytes under a privileged one.
+    ///
+    /// `fd` is the handle's own descriptor — a real open file, not the node's
+    /// `O_PATH` — so `fchmod` takes it directly and no `/proc` detour is
+    /// needed. `statx` first, because the common case has nothing to clear and
+    /// an unconditional `fchmod` would bump `ctime` on every write.
+    async fn strip_privileged_bits(&self, fd: &Arc<OwnedFd>) -> FsResult<()> {
+        let st = self.statx_fd(fd).await.map_err(errno)?;
+        let Some(mode) = stripped_mode(u32::from(st.stx_mode)) else {
+            return Ok(());
+        };
+        let fd = Arc::clone(fd);
+        tokio::task::spawn_blocking(move || {
+            rustix::fs::fchmod(&*fd, rustix::fs::Mode::from_bits_truncate(mode & 0o7777))
+                .map_err(rustix_errno)
+        })
+        .await
+        .map_err(join_errno)?
     }
 
     /// Resolve one child and turn it into the [`Entry`] the client gets back.
@@ -1136,8 +1172,15 @@ impl FileSystem for LocalFs {
         offset: u64,
         data: PooledBuf,
         len: u32,
+        kill_suidgid: bool,
     ) -> FsResult<u32> {
         let fd = self.file_fd(node, fh)?;
+        // Under `Kernel` this whole branch is dead code and the backing kernel
+        // does the strip inside the `write(2)` below — which is the case every
+        // deployment and every benchmark runs, so the hot path pays nothing.
+        if kill_suidgid && self.killpriv == KillPrivPolicy::Explicit {
+            self.strip_privileged_bits(&fd).await?;
+        }
         // Bounded by the buffer's *initialized prefix*, not its capacity.
         // Pooled storage is recycled without zeroing, so a `len` larger than
         // what the caller actually put there would write another request's
@@ -1860,7 +1903,7 @@ mod tests {
         // The length is the contract: `write` will not send bytes past it, so a
         // caller that fills the buffer owes the count.
         buf.set_len(5);
-        assert_eq!(fs.write(entry.node, fh, 0, buf, 5).await.unwrap(), 5);
+        assert_eq!(fs.write(entry.node, fh, 0, buf, 5, false).await.unwrap(), 5);
 
         let out = fs.read(entry.node, fh, 1, 3).await.unwrap();
         assert_eq!(out.as_slice(), b"ell");
@@ -1893,10 +1936,61 @@ mod tests {
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..5].copy_from_slice(b"hello");
         buf.set_len(2); // only "he" is the caller's
-        assert_eq!(fs.write(e.node, fh, 0, buf, 5).await.unwrap(), 2);
+        assert_eq!(fs.write(e.node, fh, 0, buf, 5, false).await.unwrap(), 2);
         assert_eq!(fs.getattr(e.node, None).await.unwrap().size, 2);
         let out = fs.read(e.node, fh, 0, 5).await.unwrap();
         assert_eq!(out.as_slice(), b"he");
+    }
+
+    /// The end of the promise, from the backend's side.
+    ///
+    /// Under `Kernel` the backing kernel does this inside the server's own
+    /// `write(2)` and the test proves the outcome rather than the mechanism —
+    /// which is the right thing to pin, because the mechanism switches with the
+    /// server's capabilities and the outcome must not.
+    #[tokio::test]
+    async fn a_flagged_write_clears_set_user_id() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let path = dir.path().join("suid");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o4755))
+            .unwrap();
+
+        let e = fs.lookup(ROOT_NODE, b"suid").await.unwrap();
+        let fh = fs.open(e.node, libc::O_WRONLY as u32).await.unwrap();
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..3].copy_from_slice(b"new");
+        buf.set_len(3);
+        assert_eq!(fs.write(e.node, fh, 0, buf, 3, true).await.unwrap(), 3);
+
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&path).unwrap());
+        assert_eq!(
+            mode & 0o7777,
+            0o0755,
+            "set-user-ID survived a flagged write"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// Set-group-ID with no group execute is a mandatory-locking marker, and
+    /// neither the kernel nor the server may clear it.
+    #[tokio::test]
+    async fn a_flagged_write_keeps_a_mandatory_locking_marker() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let path = dir.path().join("mand");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o2644))
+            .unwrap();
+
+        let e = fs.lookup(ROOT_NODE, b"mand").await.unwrap();
+        let fh = fs.open(e.node, libc::O_WRONLY as u32).await.unwrap();
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..3].copy_from_slice(b"new");
+        buf.set_len(3);
+        fs.write(e.node, fh, 0, buf, 3, true).await.unwrap();
+
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&path).unwrap());
+        assert_eq!(mode & 0o7777, 0o2644);
     }
 
     /// `CREATE` owes the client exactly one `FORGET` for the entry it returns,
@@ -2142,7 +2236,7 @@ mod tests {
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..1].copy_from_slice(b"x");
         buf.set_len(1);
-        fs.write(e.node, fh, 1 << 20, buf, 1).await.unwrap(); // data at 1 MiB
+        fs.write(e.node, fh, 1 << 20, buf, 1, false).await.unwrap(); // data at 1 MiB
         let data_at = fs
             .lseek(e.node, fh, 0, libc::SEEK_DATA as u32)
             .await
@@ -2171,7 +2265,7 @@ mod tests {
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..4].copy_from_slice(b"data");
         buf.set_len(4);
-        fs.write(a.node, fha, 0, buf, 4).await.unwrap();
+        fs.write(a.node, fha, 0, buf, 4, false).await.unwrap();
         let (b, fhb) = fs
             .create(ROOT_NODE, b"b", 0o644, libc::O_RDWR as u32)
             .await
@@ -2210,7 +2304,7 @@ mod tests {
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..2].copy_from_slice(b"hi");
         buf.set_len(2);
-        fs.write(e.node, fh, 0, buf, 2).await.unwrap();
+        fs.write(e.node, fh, 0, buf, 2, false).await.unwrap();
         let out = fs.read(e.node, fh, 0, u32::MAX).await.unwrap();
         assert_eq!(out.as_slice(), b"hi");
     }
@@ -2234,7 +2328,10 @@ mod tests {
 
         assert_eq!(fs.read(b.node, fha, 0, 1).await.err(), Some(EBADF));
         let buf = fs.pool_for_test().get();
-        assert_eq!(fs.write(b.node, fha, 0, buf, 1).await.unwrap_err(), EBADF);
+        assert_eq!(
+            fs.write(b.node, fha, 0, buf, 1, false).await.unwrap_err(),
+            EBADF
+        );
         assert_eq!(fs.flush(b.node, fha).await.unwrap_err(), EBADF);
         assert_eq!(fs.fsync(b.node, fha, false).await.unwrap_err(), EBADF);
         assert_eq!(fs.fallocate(b.node, fha, 0, 1, 0).await.unwrap_err(), EBADF);
@@ -2269,7 +2366,7 @@ mod tests {
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..4].copy_from_slice(b"keep");
         buf.set_len(4);
-        fs.write(a.node, fha, 0, buf, 4).await.unwrap();
+        fs.write(a.node, fha, 0, buf, 4, false).await.unwrap();
 
         let truncate = |fh| SetattrArgs {
             mode: None,

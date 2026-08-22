@@ -222,7 +222,10 @@ pub(crate) async fn dispatch(
             // so a larger number would write a previous request's bytes into
             // the client's file.
             let len = u32::try_from(buf.as_slice().len()).unwrap_or(u32::MAX);
-            match fs.write(req.node, req.fh, req.offset, buf, len).await {
+            match fs
+                .write(req.node, req.fh, req.offset, buf, len, req.kill_suidgid)
+                .await
+            {
                 Ok(written) => ok(&WriteReply { written }),
                 Err(e) => err(e),
             }

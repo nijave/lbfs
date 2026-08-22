@@ -219,6 +219,7 @@ async fn hello_attach_lookup_read_write_over_tcp() {
         node: entry.node,
         fh: open.fh,
         offset: 11,
+        kill_suidgid: false,
     });
     send(&mut s, 12, Opcode::Write as u16, 0, &body, b"!!").await;
     let (hdr, body, _) = recv(&mut s).await;
@@ -491,6 +492,7 @@ async fn oversize_write_data_closes_connection() {
         node: ROOT_NODE,
         fh: 1,
         offset: 0,
+        kill_suidgid: false,
     });
     send(&mut s, 3, Opcode::Write as u16, 0, &body, &vec![0u8; 8192]).await;
     assert!(at_eof(&mut s).await, "oversize data is connection-fatal");
