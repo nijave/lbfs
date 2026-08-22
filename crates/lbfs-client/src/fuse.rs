@@ -354,6 +354,20 @@ struct Capability {
 /// all or nothing: one unsupported bit in a combined ask makes it add none of
 /// them, so a kernel too old for the writeback cache would quietly cost this
 /// mount `READDIRPLUS` as well.
+/// `FUSE_HANDLE_KILLPRIV_V2`, which fuser 0.15.1 does not name.
+///
+/// fuser's `consts` stops at `FUSE_HANDLE_KILLPRIV` (bit 19). Bit 28 arrived
+/// with ABI 7.33 and fuser negotiates at most 7.31 — but the kernel does not
+/// check the minor version for this flag. `process_init_reply` reads it inside
+/// one `if (arg->minor >= 6)` and applies it with no further guard
+/// (`fs/fuse/inode.c:1411-1414`), exactly as it does for `FUSE_ASYNC_DIO`, and
+/// `fuse_new_init` offers it unconditionally (`inode.c:1505`). The value fits
+/// in `u32`, so fuser's `fuse_init_in.flags` carries it without the `flags2`
+/// extension fuser lacks, and `KernelConfig::add_capabilities` checks the ask
+/// against the kernel's own offered bits rather than a list of names fuser
+/// knows. A locally declared constant is therefore the whole mechanism.
+const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+
 fn capabilities(writeback: bool) -> Vec<Capability> {
     let mut caps = vec![
         // What makes READDIRPLUS available at all. Without it a listing costs
@@ -379,6 +393,20 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
         Capability {
             bit: FUSE_ASYNC_DIO,
             name: "FUSE_ASYNC_DIO",
+            required: false,
+        },
+        // The reason a write costs two round trips without it. The kernel
+        // probes `security.capability` before every write to decide whether it
+        // must strip set-user-ID (`cap_inode_need_killpriv`,
+        // `security/commoncap.c:326-333`), and lbfs answers ENODATA, which the
+        // kernel never latches. This flag sets `SB_NOSEC` on the superblock
+        // (`fs/fuse/inode.c:1411-1414`), the inode latches `S_NOSEC` after the
+        // first write, and every write after that short-circuits with no
+        // request at all. The price is a promise: the server clears the bits
+        // instead. See spec §5.3 and `fs::local::killpriv`.
+        Capability {
+            bit: FUSE_HANDLE_KILLPRIV_V2,
+            name: "FUSE_HANDLE_KILLPRIV_V2",
             required: false,
         },
     ];
@@ -1568,6 +1596,37 @@ mod tests {
     fn async_dio_is_always_requested() {
         for writeback in [true, false] {
             assert_eq!(requested(writeback) & FUSE_ASYNC_DIO, FUSE_ASYNC_DIO);
+        }
+    }
+
+    /// The one capability this whole change exists for. Bit 28 per
+    /// `include/uapi/linux/fuse.h`; fuser 0.15.1 has no constant for it, and
+    /// `KernelConfig::add_capabilities` accepts any bit the kernel offered, so
+    /// the local constant is the whole mechanism.
+    #[test]
+    fn killpriv_v2_is_always_requested_at_bit_twenty_eight() {
+        assert_eq!(FUSE_HANDLE_KILLPRIV_V2, 1 << 28);
+        for writeback in [true, false] {
+            assert_eq!(
+                requested(writeback) & FUSE_HANDLE_KILLPRIV_V2,
+                FUSE_HANDLE_KILLPRIV_V2
+            );
+        }
+    }
+
+    /// A kernel that refuses it leaves a correct, slower mount, so refusing to
+    /// mount over it would be an over-reaction. Only the writeback cache earns
+    /// that, because only the writeback cache changes what the server already
+    /// promised at HELLO.
+    #[test]
+    fn killpriv_v2_is_optional() {
+        for writeback in [true, false] {
+            let cap = capabilities(writeback)
+                .into_iter()
+                .find(|c| c.bit == FUSE_HANDLE_KILLPRIV_V2)
+                .expect("the capability list carries it");
+            assert!(!cap.required);
+            assert_eq!(cap.name, "FUSE_HANDLE_KILLPRIV_V2");
         }
     }
 
