@@ -1,0 +1,20 @@
+# Data integrity, not speed. fio writes a crc32c-tagged pattern in random order,
+# then reads every block back and checks the tag; verify_fatal stops the run on
+# the first block that does not match rather than reporting a count at the end.
+#
+# Random order matters: it is the ordering that would expose a client that
+# mismatched a request to its reply, or a server that applied two writes to the
+# same file out of order. A sequential pattern would still pass with the offsets
+# shuffled between them.
+#
+# 256 MiB against a 2 GiB guest, so the verify pass is not simply reading the
+# page cache back. The directory comes from the command line.
+[verify-rw]
+rw=randwrite
+bs=64k
+size=256M
+ioengine=psync
+direct=0
+verify=crc32c
+verify_fatal=1
+do_verify=1
