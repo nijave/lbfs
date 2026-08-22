@@ -48,7 +48,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lbfs_proto::ops::{ReaddirReply, ReaddirplusReply};
-use lbfs_proto::types::{Entry, Fh, FileAttr, NodeId, SetattrArgs, StatfsReply, TimeSet};
+use lbfs_proto::types::{
+    DirEntry, DirEntryPlus, Entry, Fh, FileAttr, FileKind, NodeId, SetattrArgs, StatfsReply,
+    TimeSet,
+};
 use lbfs_proto::Errno;
 
 use crate::config::FsyncPolicy;
@@ -64,6 +67,34 @@ const ELOOP: Errno = Errno(libc::ELOOP as u16);
 /// Also absent from [`Errno`]'s list: a handle the client never opened, one it
 /// already released, or one it is presenting against the wrong node.
 const EBADF: Errno = Errno(libc::EBADF as u16);
+
+/// What an operation this backend declines to perform on this file type
+/// answers, matching what the underlying syscall would have said. v1 uses it
+/// for xattrs on anything that is not a regular file or a directory.
+const EOPNOTSUPP: Errno = Errno(libc::EOPNOTSUPP as u16);
+
+/// `setxattr(2)`'s own answer to a value past the ceiling.
+const E2BIG: Errno = Errno(libc::E2BIG as u16);
+
+/// `XATTR_SIZE_MAX`: the kernel's ceiling on one xattr value, and also the
+/// bound spec §3.2 puts on the frame body that would have to carry it.
+const MAX_XATTR_SIZE: usize = 65536;
+
+/// `XATTR_LIST_MAX`: the same ceiling for a whole name list.
+const MAX_XATTR_LIST: usize = 65536;
+
+/// Bytes one [`DirEntry`] costs on the wire beyond its name: postcard writes a
+/// length prefix, a one-byte [`FileKind`] tag, and a varint cursor. An upper
+/// bound, deliberately — a page that overshoots the client's budget is a
+/// protocol violation, one that undershoots is only a wasted round trip.
+const READDIR_ENTRY_OVERHEAD: usize = 24;
+
+/// The same for [`DirEntryPlus`], which carries a whole [`Entry`]: two varint
+/// u64s plus fifteen [`FileAttr`] fields, none wider than a 10-byte varint.
+const READDIRPLUS_ENTRY_OVERHEAD: usize = 160;
+
+/// The reply's own framing: the entry-count prefix and the `end` flag.
+const READDIR_REPLY_OVERHEAD: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Handles
@@ -127,11 +158,57 @@ pub struct FileHandle {
     fd: Arc<OwnedFd>,
 }
 
+/// One name from the `OPENDIR` snapshot.
+struct SnapshotEntry {
+    name: Vec<u8>,
+    kind: FileKind,
+    /// The `d_off` `getdents64` reported for this entry: the kernel's own
+    /// cursor to the position *after* it. This is what a client passes back to
+    /// resume, so it must be the kernel's number rather than an array index —
+    /// see [`DirHandle::resume_at`].
+    cookie: u64,
+}
+
 /// Snapshot of one open directory.
 ///
-/// Task 11 fills this in with the entry list taken at `OPENDIR` and the
-/// reopened `O_RDONLY | O_DIRECTORY` descriptor `FSYNCDIR` needs.
-pub struct DirHandle;
+/// `OPENDIR` reads the whole listing in a single `getdents64` sweep and serves
+/// every later `READDIR`/`READDIRPLUS` page out of it. POSIX permits snapshot
+/// semantics for a directory mutated during a walk, and it buys two things
+/// worth more than freshness here: a resume cursor that means the same thing
+/// for the handle's whole life, and one syscall batch instead of one per page.
+/// The cost is memory proportional to the directory — a million-entry
+/// directory is a million names held until `RELEASEDIR`.
+///
+/// The node id is the same guard [`FileHandle`] carries and for the same
+/// reason: nothing stops a client pairing any `Dh` with any `NodeId`, and
+/// `FSYNCDIR` would otherwise sync a directory the handle never opened.
+pub struct DirHandle {
+    node: NodeId,
+    /// The node's descriptor reopened `O_RDONLY | O_DIRECTORY`. `getdents64`
+    /// needs the read access an `O_PATH` node fd does not carry, and
+    /// `FSYNCDIR` needs a descriptor at all.
+    fd: Arc<OwnedFd>,
+    entries: Vec<SnapshotEntry>,
+    /// `cookie -> index of the entry that follows it`, so resuming is a hash
+    /// lookup rather than a scan of the snapshot. Built once at `OPENDIR`.
+    resume: HashMap<u64, usize>,
+}
+
+impl DirHandle {
+    /// Turn a client's cursor back into a position in the snapshot.
+    ///
+    /// Zero is the start of the listing, by FUSE convention. Anything else has
+    /// to be a cookie this handle handed out — including the last entry's,
+    /// which resolves to one past the end and yields the empty final page that
+    /// tells the client it is done. A cursor we never issued is a client bug,
+    /// and `EINVAL` says so rather than silently truncating the listing.
+    fn resume_at(&self, offset: u64) -> FsResult<usize> {
+        if offset == 0 {
+            return Ok(0);
+        }
+        self.resume.get(&offset).copied().ok_or(Errno::EINVAL)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LocalFs
@@ -145,8 +222,8 @@ pub struct LocalFs {
     /// `OPEN`/`CREATE` park their data descriptors here, and `SETATTR` reads
     /// it so a truncate against an open handle uses that handle's descriptor.
     files: HandleTable<FileHandle>,
-    /// Task 11: `OPENDIR` parks its directory snapshots here.
-    #[allow(dead_code)]
+    /// `OPENDIR` parks its directory snapshots here. `Arc` because `get`
+    /// clones, and a snapshot is the one handle payload big enough to care.
     dirs: HandleTable<Arc<DirHandle>>,
     /// Masks `O_SYNC`/`O_DSYNC` and short-circuits `FSYNC` (spec §6).
     fsync_policy: FsyncPolicy,
@@ -293,6 +370,53 @@ impl LocalFs {
         }
     }
 
+    /// Resolves `(node, dh)` to the directory snapshot that handle owns.
+    ///
+    /// The directory twin of [`LocalFs::file_fd`], and refused for the same
+    /// reason: a `Dh` that is unknown, already released, or presented against
+    /// a different node is `EBADF`, never somebody else's directory.
+    fn dir_handle(&self, node: NodeId, dh: Fh) -> FsResult<Arc<DirHandle>> {
+        match self.dirs.get(dh) {
+            Some(handle) if handle.node == node => Ok(handle),
+            _ => Err(EBADF),
+        }
+    }
+
+    /// The descriptor the xattr operations run against.
+    ///
+    /// `fgetxattr` and friends reject an `O_PATH` descriptor, so the node has
+    /// to be reopened for real — and *that* is why v1 answers `EOPNOTSUPP` for
+    /// everything but a regular file or a directory. Reopening the other file
+    /// types through `/proc/self/fd/N` is not merely unhelpful, it is harmful:
+    /// a symlink's magic link cannot be opened without `O_PATH` at all
+    /// (`ELOOP`), a FIFO with no peer blocks the open indefinitely, and a
+    /// device node runs its driver's `open` — a side effect no client asked
+    /// for by reading an attribute. libfuse sidesteps this by calling the
+    /// path-based `getxattr` on the `/proc` name; that route has no io_uring
+    /// opcode, so v1 narrows the file types instead.
+    ///
+    /// Known limitation, inherent to the reopen: it needs *read* permission,
+    /// so an unprivileged server exporting a mode-0222 file answers `EACCES`
+    /// to an xattr op the backing filesystem would have allowed.
+    async fn xattr_fd(&self, node: NodeId) -> FsResult<Arc<OwnedFd>> {
+        let fd = self.node_fd(node)?;
+        // Blocking: `reopen` is an `open(2)`, and the `fstat` that guards it
+        // belongs on the same thread rather than costing a second round trip
+        // through the ring.
+        let opened = tokio::task::spawn_blocking(move || {
+            // `fstat` is one of the few syscalls an O_PATH descriptor accepts.
+            let st = rustix::fs::fstat(&*fd).map_err(rustix_errno)?;
+            match rustix::fs::FileType::from_raw_mode(st.st_mode) {
+                rustix::fs::FileType::RegularFile | rustix::fs::FileType::Directory => {}
+                _ => return Err(EOPNOTSUPP),
+            }
+            reopen(&fd, rustix::fs::OFlags::RDONLY).map_err(errno)
+        })
+        .await
+        .map_err(join_errno)??;
+        Ok(Arc::new(opened))
+    }
+
     /// Reduces a client's `open` flags to the ones this server will honor.
     ///
     /// An allowlist, not a denylist. `flags` is a raw `u32` the client copied
@@ -366,8 +490,8 @@ impl LocalFs {
     ///
     /// `honor` runs the real `fsync`/`fdatasync`; `ignore` acknowledges without
     /// touching disk, the same trade an NFS `async` export makes — latency for
-    /// crash durability. Task 11's `FSYNCDIR` joins here once a directory
-    /// handle owns a descriptor.
+    /// crash durability. `FSYNC` and `FSYNCDIR` both land here, which is what
+    /// keeps one policy from applying to files and another to directories.
     async fn maybe_fsync(&self, fd: &Arc<OwnedFd>, datasync: bool) -> FsResult<()> {
         match self.fsync_policy {
             FsyncPolicy::Honor => self.uring.fsync(fd, datasync).await.map_err(errno),
@@ -412,6 +536,86 @@ fn valid_name(name: &[u8]) -> FsResult<CString> {
         return Err(Errno::EINVAL);
     }
     CString::new(name).map_err(|_| Errno::EINVAL)
+}
+
+/// Validates an xattr name arriving from the wire.
+///
+/// Unlike a filename this is not restricted to one path component — `user.k`,
+/// `security.capability` and whatever else the backing filesystem holds are
+/// all opaque bytes to us. NUL is the single byte that cannot travel, because
+/// the syscall takes a NUL-terminated string: `user.a\0evil` would otherwise
+/// reach the kernel as `user.a`, an attribute the client never named.
+fn xattr_name(name: &[u8]) -> FsResult<CString> {
+    CString::new(name).map_err(|_| Errno::EINVAL)
+}
+
+/// One `getdents64` sweep of an open directory, taken whole at `OPENDIR`.
+///
+/// Runs on a blocking thread: there is no io_uring opcode for `getdents`
+/// (spec §5.3), and a large directory is many syscalls' worth of work.
+fn snapshot_dir(fd: &OwnedFd) -> FsResult<Vec<SnapshotEntry>> {
+    let mut dir = rustix::fs::Dir::read_from(fd).map_err(rustix_errno)?;
+    let mut entries = Vec::new();
+    while let Some(entry) = dir.read() {
+        let entry = entry.map_err(rustix_errno)?;
+        let name = entry.file_name();
+        let kind = match file_kind(entry.file_type()) {
+            Some(kind) => kind,
+            None => resolve_kind(fd, name),
+        };
+        entries.push(SnapshotEntry {
+            name: name.to_bytes().to_vec(),
+            kind,
+            // `d_off` is signed in the kernel's struct and opaque on the wire;
+            // the cast is a reinterpretation, not a range claim.
+            cookie: entry.offset() as u64,
+        });
+    }
+    Ok(entries)
+}
+
+/// `d_type` to the wire's [`FileKind`]; `None` for `DT_UNKNOWN`.
+fn file_kind(t: rustix::fs::FileType) -> Option<FileKind> {
+    Some(match t {
+        rustix::fs::FileType::RegularFile => FileKind::Regular,
+        rustix::fs::FileType::Directory => FileKind::Directory,
+        rustix::fs::FileType::Symlink => FileKind::Symlink,
+        rustix::fs::FileType::Fifo => FileKind::Fifo,
+        rustix::fs::FileType::Socket => FileKind::Socket,
+        rustix::fs::FileType::CharacterDevice => FileKind::CharDevice,
+        rustix::fs::FileType::BlockDevice => FileKind::BlockDevice,
+        rustix::fs::FileType::Unknown => return None,
+    })
+}
+
+/// The type of an entry whose `d_type` the filesystem did not fill in.
+///
+/// `DT_UNKNOWN` is legal and real — XFS without `ftype`, and several network
+/// filesystems, never populate the field. The wire [`FileKind`] has no
+/// "unknown" to forward, and guessing `Regular` for a directory is not a
+/// harmless default: it is what makes a client's `find -type d` miss subtrees
+/// and `rm -r` decline to descend. One `statat` per such entry buys the truth,
+/// and costs nothing on the filesystems that do fill `d_type`.
+///
+/// A name from `getdents64` holds no `/`, and `AT_SYMLINK_NOFOLLOW` keeps the
+/// stat on the entry itself, so this cannot leave the directory. An entry
+/// unlinked between the sweep and the stat falls back to `Regular`; the type
+/// of a name that no longer exists is nobody's answer.
+fn resolve_kind(dirfd: &OwnedFd, name: &std::ffi::CStr) -> FileKind {
+    rustix::fs::statat(dirfd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .ok()
+        .and_then(|st| file_kind(rustix::fs::FileType::from_raw_mode(st.st_mode)))
+        .unwrap_or(FileKind::Regular)
+}
+
+/// One `statfs` field narrowed to the width the wire carries.
+///
+/// `f_bsize`, `f_namelen` and `f_frsize` are `c_long` in the kernel's struct
+/// and `u32` in [`StatfsReply`], matching FUSE's own reply. Real values are
+/// kilobytes at most; saturating is a formality that keeps a hostile or
+/// corrupt filesystem from wrapping the number into something small.
+fn statfs_field<T: TryInto<u32>>(v: T) -> u32 {
+    v.try_into().unwrap_or(u32::MAX)
 }
 
 /// The one `FileKey` constructor, so attach and lookup cannot disagree.
@@ -999,64 +1203,278 @@ impl FileSystem for LocalFs {
         .map_err(join_errno)?
     }
 
-    // --- Task 11: directories, statfs, xattrs ------------------------------
+    // --- Directories -------------------------------------------------------
 
-    async fn opendir(&self, _node: NodeId) -> FsResult<Fh> {
-        Err(Errno::ENOSYS) // Task 11
+    async fn opendir(&self, node: NodeId) -> FsResult<Fh> {
+        let fd = self.node_fd(node)?;
+        // One blocking hop for both halves: the reopen is an `open(2)` and the
+        // sweep is a run of `getdents64`, and neither belongs on a runtime
+        // worker. `O_DIRECTORY` is what makes a file node fail `ENOTDIR` here
+        // rather than somewhere less legible; `O_RDONLY` is the access
+        // `getdents64` and `FSYNCDIR` both need and an `O_PATH` node fd lacks.
+        let (dir_fd, entries) = tokio::task::spawn_blocking(move || {
+            let dir_fd = reopen(
+                &fd,
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            )
+            .map_err(errno)?;
+            let entries = snapshot_dir(&dir_fd)?;
+            Ok::<_, Errno>((dir_fd, entries))
+        })
+        .await
+        .map_err(join_errno)??;
+
+        let resume = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.cookie, i + 1))
+            .collect();
+        Ok(self.dirs.insert(Arc::new(DirHandle {
+            node,
+            fd: Arc::new(dir_fd),
+            entries,
+            resume,
+        })))
     }
 
     async fn readdir(
         &self,
-        _node: NodeId,
-        _dh: Fh,
-        _offset: u64,
-        _max_bytes: u32,
+        node: NodeId,
+        dh: Fh,
+        offset: u64,
+        max_bytes: u32,
     ) -> FsResult<ReaddirReply> {
-        Err(Errno::ENOSYS) // Task 11
+        let handle = self.dir_handle(node, dh)?;
+        let start = handle.resume_at(offset)?;
+        let budget = max_bytes as usize;
+        let mut used = READDIR_REPLY_OVERHEAD;
+        let mut entries = Vec::new();
+        let mut cursor = start;
+
+        while let Some(e) = handle.entries.get(cursor) {
+            let cost = e.name.len() + READDIR_ENTRY_OVERHEAD;
+            // The first entry of a page ignores the budget. A name long enough
+            // to overshoot on its own is still under 300 bytes, far inside the
+            // negotiated frame, and refusing it would leave the client
+            // re-issuing the same offset forever.
+            if cursor > start && used + cost > budget {
+                break;
+            }
+            used += cost;
+            entries.push(DirEntry {
+                name: e.name.clone(),
+                kind: e.kind,
+                offset: e.cookie,
+            });
+            cursor += 1;
+        }
+        Ok(ReaddirReply {
+            entries,
+            end: cursor >= handle.entries.len(),
+        })
     }
 
     async fn readdirplus(
         &self,
-        _node: NodeId,
-        _dh: Fh,
-        _offset: u64,
-        _max_bytes: u32,
+        node: NodeId,
+        dh: Fh,
+        offset: u64,
+        max_bytes: u32,
     ) -> FsResult<ReaddirplusReply> {
-        Err(Errno::ENOSYS) // Task 11
+        let handle = self.dir_handle(node, dh)?;
+        let start = handle.resume_at(offset)?;
+        // Before the loop, deliberately. `.` and `..` need the directory's own
+        // attributes, and this is the last step that may fail the whole call:
+        // once the loop below has registered an entry, returning an error
+        // instead of the reply strands a lookup count no FORGET will retire.
+        let dir_attr = attr_from_statx(&self.statx_fd(&handle.fd).await.map_err(errno)?);
+
+        let budget = max_bytes as usize;
+        let mut used = READDIR_REPLY_OVERHEAD;
+        let mut entries = Vec::new();
+        let mut cursor = start;
+
+        while let Some(e) = handle.entries.get(cursor) {
+            let cost = e.name.len() + READDIRPLUS_ENTRY_OVERHEAD;
+            if cursor > start && used + cost > budget {
+                break;
+            }
+            cursor += 1;
+            // Spent whether or not the entry survives below, so a page bounds
+            // the work it does as well as the bytes it returns.
+            used += cost;
+
+            let entry = if e.name == b"." || e.name == b".." {
+                // Node 0 is FUSE's "attributes only": the client's kernel does
+                // not instantiate a dentry for it and takes no lookup count.
+                // Registering these would put two entries per directory on the
+                // FORGET ledger that no client will ever retire.
+                Entry {
+                    node: 0,
+                    generation: 0,
+                    attr: dir_attr,
+                }
+            } else {
+                // Through `lookup_impl`, because every `Entry` a client
+                // receives is one lookup count it owes exactly one FORGET for,
+                // and that is the only place a node is registered.
+                let Ok(name) = CString::new(e.name.clone()) else {
+                    continue;
+                };
+                match self.lookup_impl(&handle.fd, &name).await {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        // Skipped, never fatal. The snapshot is older than the
+                        // directory, so a name unlinked since the sweep is
+                        // ordinary rather than exceptional - and failing the
+                        // page would also strand every lookup count already
+                        // registered into it. The client sees a listing
+                        // missing that name, which is what a listing of a
+                        // directory it no longer belongs to should look like.
+                        tracing::debug!(?err, "readdirplus skipped an entry");
+                        continue;
+                    }
+                }
+            };
+            entries.push(DirEntryPlus {
+                name: e.name.clone(),
+                entry,
+                offset: e.cookie,
+            });
+        }
+        Ok(ReaddirplusReply {
+            entries,
+            end: cursor >= handle.entries.len(),
+        })
     }
 
-    async fn releasedir(&self, _node: NodeId, _dh: Fh) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 11
+    async fn releasedir(&self, node: NodeId, dh: Fh) -> FsResult<()> {
+        match self.dirs.get(dh) {
+            Some(handle) if handle.node == node => {}
+            Some(_) => return Err(EBADF),
+            // The same tolerance `release` extends: a RELEASEDIR whose reply
+            // was lost gets retried, and refusing the retry would surface
+            // EBADF from the application's `closedir(3)`.
+            None => return Ok(()),
+        }
+        // Unlike `release`, no blocking hop: closing a directory descriptor
+        // frees no file blocks, and the snapshot is plain heap memory.
+        drop(self.dirs.remove(dh));
+        Ok(())
     }
 
-    async fn fsyncdir(&self, _node: NodeId, _dh: Fh, _datasync: bool) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 11
+    async fn fsyncdir(&self, node: NodeId, dh: Fh, datasync: bool) -> FsResult<()> {
+        let handle = self.dir_handle(node, dh)?;
+        // The durability policy is one policy (spec §6), and this is the
+        // descriptor `OPENDIR` reopened so a directory could honor it.
+        self.maybe_fsync(&handle.fd, datasync).await
     }
 
-    async fn statfs(&self, _node: NodeId) -> FsResult<StatfsReply> {
-        Err(Errno::ENOSYS) // Task 11
+    async fn statfs(&self, node: NodeId) -> FsResult<StatfsReply> {
+        let fd = self.node_fd(node)?;
+        // No io_uring opcode for statfs (spec §5.3), and it is a filesystem
+        // round trip on anything but a local disk.
+        let st = tokio::task::spawn_blocking(move || {
+            // `fstatfs` is one of the few syscalls an O_PATH descriptor takes,
+            // so the node's own fd answers without a reopen.
+            rustix::fs::fstatfs(&*fd).map_err(rustix_errno)
+        })
+        .await
+        .map_err(join_errno)??;
+        Ok(StatfsReply {
+            blocks: st.f_blocks,
+            bfree: st.f_bfree,
+            bavail: st.f_bavail,
+            files: st.f_files,
+            ffree: st.f_ffree,
+            bsize: statfs_field(st.f_bsize),
+            namelen: statfs_field(st.f_namelen),
+            frsize: statfs_field(st.f_frsize),
+        })
     }
 
-    async fn getxattr(&self, _node: NodeId, _name: &[u8], _size: u32) -> FsResult<(u32, Vec<u8>)> {
-        Err(Errno::ENOSYS) // Task 11
+    // --- Xattrs ------------------------------------------------------------
+
+    async fn getxattr(&self, node: NodeId, name: &[u8], size: u32) -> FsResult<(u32, Vec<u8>)> {
+        let name = xattr_name(name)?;
+        let fd = self.xattr_fd(node).await?;
+        let buf = self.pool.get();
+        // `size == 0` is FUSE's length probe: the kernel reports how big the
+        // value is and writes nothing. Otherwise the ask is clamped to what
+        // can actually be carried - a value cannot exceed XATTR_SIZE_MAX, and
+        // the pooled buffer is this server's own ceiling.
+        let want = if size == 0 {
+            0
+        } else {
+            (size as usize).min(MAX_XATTR_SIZE).min(buf.capacity()) as u32
+        };
+        let (buf, res) = self.uring.fgetxattr(&fd, name, buf, want).await;
+        // A buffer shorter than the value is ERANGE straight from the syscall,
+        // which is the answer the client's own getxattr(2) expects.
+        let n = res.map_err(errno)?;
+        if want == 0 {
+            // The completion published the *needed* size as the buffer's
+            // length, but the kernel wrote no bytes into it: reading it now
+            // would hand the client whatever the last request left in the
+            // recycled storage. The count is the entire answer.
+            return Ok((n, Vec::new()));
+        }
+        Ok((n, buf.as_slice().to_vec()))
     }
 
-    async fn setxattr(
-        &self,
-        _node: NodeId,
-        _name: &[u8],
-        _value: &[u8],
-        _flags: u32,
-    ) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 11
+    async fn setxattr(&self, node: NodeId, name: &[u8], value: &[u8], flags: u32) -> FsResult<()> {
+        let name = xattr_name(name)?;
+        let mut buf = self.pool.get();
+        // XATTR_SIZE_MAX is the kernel's ceiling and the pooled buffer is
+        // ours; past either, E2BIG is what `setxattr(2)` itself would say.
+        if value.len() > MAX_XATTR_SIZE || value.len() > buf.capacity() {
+            return Err(E2BIG);
+        }
+        let fd = self.xattr_fd(node).await?;
+        buf.as_mut_slice()[..value.len()].copy_from_slice(value);
+        // The length is the contract the ring reads: nothing past it is sent,
+        // so the recycled tail of the buffer cannot become part of the value.
+        buf.set_len(value.len());
+        let len = value.len() as u32;
+        // `flags` (XATTR_CREATE, XATTR_REPLACE) goes to the kernel as it
+        // arrived; it is the one that knows whether the attribute exists.
+        let (_buf, res) = self
+            .uring
+            .fsetxattr(&fd, name, buf, len, flags as i32)
+            .await;
+        res.map_err(errno)
     }
 
-    async fn listxattr(&self, _node: NodeId, _size: u32) -> FsResult<(u32, Vec<u8>)> {
-        Err(Errno::ENOSYS) // Task 11
+    async fn listxattr(&self, node: NodeId, size: u32) -> FsResult<(u32, Vec<u8>)> {
+        let fd = self.xattr_fd(node).await?;
+        // No io_uring opcode for listxattr (spec §5.3).
+        tokio::task::spawn_blocking(move || {
+            if size == 0 {
+                // The same length probe `getxattr` honors, with the same rule:
+                // the reply is the count and nothing else.
+                let n = rustix::fs::flistxattr(&*fd, &mut [0u8; 0]).map_err(rustix_errno)?;
+                return Ok((n as u32, Vec::new()));
+            }
+            let mut list = vec![0u8; (size as usize).min(MAX_XATTR_LIST)];
+            let n = rustix::fs::flistxattr(&*fd, &mut list[..]).map_err(rustix_errno)?;
+            // The kernel filled `n` bytes; the zeros past them are ours, not
+            // the filesystem's, and must not travel as names.
+            list.truncate(n);
+            Ok((n as u32, list))
+        })
+        .await
+        .map_err(join_errno)?
     }
 
-    async fn removexattr(&self, _node: NodeId, _name: &[u8]) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 11
+    async fn removexattr(&self, node: NodeId, name: &[u8]) -> FsResult<()> {
+        let name = xattr_name(name)?;
+        let fd = self.xattr_fd(node).await?;
+        // No io_uring opcode for removexattr either (spec §5.3).
+        tokio::task::spawn_blocking(move || {
+            rustix::fs::fremovexattr(&*fd, name.as_c_str()).map_err(rustix_errno)
+        })
+        .await
+        .map_err(join_errno)?
     }
 }
 
@@ -1833,11 +2251,415 @@ mod tests {
         assert_eq!((a.st_dev, a.st_ino), (b.st_dev, b.st_ino));
     }
 
-    /// Unimplemented opcodes must say so rather than pretend to succeed.
+    // --- Task 11: directories, statfs, xattrs ------------------------------
+
     #[tokio::test]
-    async fn unimplemented_opcodes_report_enosys() {
+    async fn readdir_pages_and_terminates() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"").unwrap();
+        }
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            // Tiny budget forces pagination.
+            let page = fs.readdir(ROOT_NODE, dh, offset, 64).await.unwrap();
+            for e in &page.entries {
+                names.push(e.name.clone());
+                offset = e.offset;
+            }
+            if page.end {
+                break;
+            }
+        }
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+        for i in 0..10 {
+            assert!(names.contains(&format!("f{i}").into_bytes()));
+        }
+        assert!(names.contains(&b".".to_vec()));
+        assert!(names.contains(&b"..".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn readdirplus_returns_attrs_and_registers_nodes() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"abc").unwrap();
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        let page = fs.readdirplus(ROOT_NODE, dh, 0, 1 << 16).await.unwrap();
+        let f = page.entries.iter().find(|e| e.name == b"f").unwrap();
+        assert_eq!(f.entry.attr.size, 3);
+        assert!(f.entry.node > 1);
+        let dot = page.entries.iter().find(|e| e.name == b".").unwrap();
+        assert_eq!(dot.entry.node, 0); // attr-only, no lookup count
+        assert_eq!(dot.entry.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        // The registered node answers getattr (lookup count held).
+        assert!(fs.getattr(f.entry.node, None).await.is_ok());
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// The listing is snapshotted at `OPENDIR` — POSIX permits it, and it is
+    /// what lets a resume cursor mean the same thing for the handle's life.
+    #[tokio::test]
+    async fn opendir_snapshots_the_directory() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("before"), b"").unwrap();
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        std::fs::write(dir.path().join("after"), b"").unwrap();
+
+        let page = fs.readdir(ROOT_NODE, dh, 0, 1 << 16).await.unwrap();
+        assert!(page.end);
+        let names: Vec<_> = page.entries.iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&b"before".to_vec()));
+        assert!(!names.contains(&b"after".to_vec()));
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// A page always advances. A budget too small for even one entry must
+    /// still return one: a client re-issuing the same cursor against an empty
+    /// page that says `end: false` never finishes.
+    #[tokio::test]
+    async fn a_page_too_small_for_one_entry_still_makes_progress() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"").unwrap();
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+
+        let page = fs.readdir(ROOT_NODE, dh, 0, 0).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(!page.end);
+        let plus = fs.readdirplus(ROOT_NODE, dh, 0, 0).await.unwrap();
+        assert_eq!(plus.entries.len(), 1);
+        assert!(!plus.end);
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// A directory larger than one `getdents64` buffer, paged with a budget
+    /// that forces dozens of round trips. The reassembled listing equalling
+    /// the single-shot one only holds if every `d_off` cookie is distinct and
+    /// each page resumes exactly one entry past the last it returned.
+    #[tokio::test]
+    async fn a_large_directory_pages_without_gaps_or_repeats() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        for i in 0..512 {
+            std::fs::write(dir.path().join(format!("entry-{i:04}")), b"").unwrap();
+        }
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        let whole = fs.readdir(ROOT_NODE, dh, 0, 1 << 20).await.unwrap();
+        assert!(whole.end);
+        assert_eq!(whole.entries.len(), 514); // 512 files, "." and ".."
+
+        let mut paged = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = fs.readdir(ROOT_NODE, dh, offset, 256).await.unwrap();
+            assert!(!page.entries.is_empty() || page.end);
+            if let Some(last) = page.entries.last() {
+                offset = last.offset;
+            }
+            let end = page.end;
+            paged.extend(page.entries);
+            if end {
+                break;
+            }
+        }
+        assert_eq!(paged, whole.entries);
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// A `READDIR` cursor is the `d_off` the kernel reported for that entry,
+    /// so a client that stopped mid-listing resumes exactly where it stopped:
+    /// no name repeated, none dropped. A cursor we never issued is a client
+    /// bug, not a silently empty listing.
+    #[tokio::test]
+    async fn readdir_resumes_from_a_returned_cookie() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        for i in 0..8 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"").unwrap();
+        }
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        let whole = fs.readdir(ROOT_NODE, dh, 0, 1 << 16).await.unwrap();
+        assert!(whole.end);
+        assert_eq!(whole.entries.len(), 10); // 8 files, "." and ".."
+
+        let mut resumed = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = fs.readdir(ROOT_NODE, dh, offset, 64).await.unwrap();
+            if let Some(last) = page.entries.last() {
+                offset = last.offset;
+            }
+            let end = page.end;
+            resumed.extend(page.entries);
+            if end {
+                break;
+            }
+        }
+        assert_eq!(resumed, whole.entries);
+        assert!(resumed.len() > 2, "the budget must have forced pagination");
+
+        assert_eq!(
+            fs.readdir(ROOT_NODE, dh, u64::MAX, 4096).await.unwrap_err(),
+            Errno::EINVAL
+        );
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// Every `Entry` in a `READDIRPLUS` page is a lookup the client's kernel
+    /// counts, so each owes exactly one `FORGET` — and `.`/`..` are the two
+    /// names it must *not* count, which is why they come back as node 0.
+    #[tokio::test]
+    async fn readdirplus_registers_one_lookup_per_entry_and_none_for_dots() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        for name in ["a", "b"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        let page = fs.readdirplus(ROOT_NODE, dh, 0, 1 << 16).await.unwrap();
+        assert_eq!(page.entries.len(), 4);
+
+        let mut dots = 0;
+        for e in &page.entries {
+            if e.name == b"." || e.name == b".." {
+                dots += 1;
+                assert_eq!(e.entry.node, 0, "{:?} must take no lookup count", e.name);
+                continue;
+            }
+            assert!(e.entry.node > ROOT_NODE);
+            assert!(fs.getattr(e.entry.node, None).await.is_ok());
+            fs.forget(e.entry.node, 1).await;
+            assert_eq!(
+                fs.getattr(e.entry.node, None).await.unwrap_err(),
+                Errno::ESTALE,
+                "one FORGET must retire the entry readdirplus registered"
+            );
+        }
+        assert_eq!(dots, 2);
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// The snapshot is older than the directory it describes. A name unlinked
+    /// between `OPENDIR` and the page that would have reported it is skipped
+    /// rather than fatal — failing the page instead would strand every lookup
+    /// count already registered into it, and no `FORGET` would ever arrive to
+    /// retire them.
+    #[tokio::test]
+    async fn readdirplus_skips_an_entry_that_vanished_after_the_snapshot() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        for name in ["keep", "gone"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        std::fs::remove_file(dir.path().join("gone")).unwrap();
+
+        let page = fs.readdirplus(ROOT_NODE, dh, 0, 1 << 16).await.unwrap();
+        assert!(page.end);
+        let names: Vec<_> = page.entries.iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&b"keep".to_vec()));
+        assert!(!names.contains(&b"gone".to_vec()));
+        // The cursor still walked past the vanished name: "." and ".." plus
+        // the one file that is still there.
+        assert_eq!(page.entries.len(), 3);
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// A directory handle is bound to the node it was opened on, exactly like
+    /// a file handle: nothing stops a client pairing any `Dh` with any
+    /// `NodeId`, and every directory op here is descriptor-relative.
+    #[tokio::test]
+    async fn a_dir_handle_is_bound_to_the_node_it_was_opened_on() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let sub = fs.lookup(ROOT_NODE, b"sub").await.unwrap();
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+
+        assert_eq!(fs.readdir(sub.node, dh, 0, 4096).await.unwrap_err(), EBADF);
+        assert_eq!(
+            fs.readdirplus(sub.node, dh, 0, 4096).await.unwrap_err(),
+            EBADF
+        );
+        assert_eq!(fs.fsyncdir(sub.node, dh, false).await.unwrap_err(), EBADF);
+        assert_eq!(fs.releasedir(sub.node, dh).await.unwrap_err(), EBADF);
+        assert_eq!(
+            fs.readdir(ROOT_NODE, 9999, 0, 4096).await.unwrap_err(),
+            EBADF
+        );
+
+        // Rejected, not consumed: the handle still works on its own node.
+        fs.fsyncdir(ROOT_NODE, dh, true).await.unwrap();
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+        // A RELEASEDIR whose reply was lost gets retried; the second one must
+        // not fail the application's closedir(3).
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+        assert_eq!(fs.readdir(ROOT_NODE, dh, 0, 4096).await.unwrap_err(), EBADF);
+    }
+
+    #[tokio::test]
+    async fn opendir_refuses_a_non_directory_and_an_unknown_node() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let f = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        assert_eq!(
+            fs.opendir(f.node).await.unwrap_err(),
+            Errno(libc::ENOTDIR as u16)
+        );
+        assert_eq!(fs.opendir(9999).await.unwrap_err(), Errno::ESTALE);
+    }
+
+    /// `FSYNCDIR` answers to the same durability policy as `FSYNC` (spec §6),
+    /// which it can only do because the handle owns a real descriptor.
+    #[tokio::test]
+    async fn fsyncdir_runs_through_the_durability_policy() {
+        for policy in [FsyncPolicy::Honor, FsyncPolicy::Ignore] {
+            let (_dir, fs) = test_fs(policy).await;
+            let dh = fs.opendir(ROOT_NODE).await.unwrap();
+            fs.fsyncdir(ROOT_NODE, dh, false).await.unwrap();
+            fs.fsyncdir(ROOT_NODE, dh, true).await.unwrap();
+            fs.releasedir(ROOT_NODE, dh).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn statfs_reports_filesystem_numbers() {
         let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
-        assert_eq!(fs.opendir(ROOT_NODE).await.unwrap_err(), Errno::ENOSYS);
-        assert_eq!(fs.statfs(ROOT_NODE).await.unwrap_err(), Errno::ENOSYS);
+        let s = fs.statfs(ROOT_NODE).await.unwrap();
+        assert!(s.bsize > 0);
+        assert!(s.blocks > 0);
+        assert!(s.namelen > 0);
+        assert_eq!(fs.statfs(9999).await.unwrap_err(), Errno::ESTALE);
+    }
+
+    #[tokio::test]
+    async fn xattr_set_get_list_remove() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+
+        match fs.setxattr(e.node, b"user.k", b"v1", 0).await {
+            // A filesystem without user xattrs has nothing to prove here.
+            Err(err) if err == EOPNOTSUPP => return,
+            other => other.unwrap(),
+        }
+        let (size, val) = fs.getxattr(e.node, b"user.k", 64).await.unwrap();
+        assert_eq!((size, val.as_slice()), (2, b"v1".as_slice()));
+        let (size, val) = fs.getxattr(e.node, b"user.k", 0).await.unwrap(); // length probe
+        assert_eq!(size, 2);
+        assert!(
+            val.is_empty(),
+            "a probe writes nothing, so it returns nothing"
+        );
+        let (size, list) = fs.listxattr(e.node, 256).await.unwrap();
+        assert_eq!(size as usize, list.len());
+        assert!(list.windows(6).any(|w| w == b"user.k"));
+        fs.removexattr(e.node, b"user.k").await.unwrap();
+        assert_eq!(
+            fs.getxattr(e.node, b"user.k", 64).await.unwrap_err(),
+            Errno::ENODATA
+        );
+    }
+
+    /// `size == 0` is FUSE's length probe, and it is the case that must never
+    /// hand back a pooled buffer's recycled tail: the kernel reports the value
+    /// size without writing a byte. A short buffer is `ERANGE` from the
+    /// syscall itself.
+    #[tokio::test]
+    async fn getxattr_probes_the_length_and_refuses_a_short_buffer() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        // Dirty the pool, so a probe that leaked its buffer would show it.
+        let mut dirty = fs.pool_for_test().get();
+        dirty.as_mut_slice().fill(b'X');
+        drop(dirty);
+
+        std::fs::write(dir.path().join("f"), b"").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        match fs.setxattr(e.node, b"user.k", b"value", 0).await {
+            Err(err) if err == EOPNOTSUPP => return,
+            other => other.unwrap(),
+        }
+        assert_eq!(
+            fs.getxattr(e.node, b"user.k", 0).await.unwrap(),
+            (5, Vec::new())
+        );
+        assert_eq!(
+            fs.getxattr(e.node, b"user.k", 2).await.unwrap_err(),
+            Errno::ERANGE
+        );
+        let (size, list) = fs.listxattr(e.node, 0).await.unwrap();
+        assert!(size > 0);
+        assert!(list.is_empty(), "a probe returns the length alone");
+    }
+
+    /// A `size` past one pooled buffer is clamped, not allocated for. Without
+    /// the clamp `UringExecutor::fgetxattr`'s length assert fires in this
+    /// task, before anything is submitted, so a client's number panics its own
+    /// request handler. The same hazard, and the same fix, as `READ`.
+    #[tokio::test]
+    async fn getxattr_clamps_the_request_to_the_pool_buffer() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        match fs.setxattr(e.node, b"user.k", b"v1", 0).await {
+            Err(err) if err == EOPNOTSUPP => return,
+            other => other.unwrap(),
+        }
+        let (size, val) = fs.getxattr(e.node, b"user.k", u32::MAX).await.unwrap();
+        assert_eq!((size, val.as_slice()), (2, b"v1".as_slice()));
+    }
+
+    /// An xattr name is arbitrary bytes to this server, but the syscall takes
+    /// a NUL-terminated string: `user.a\0evil` reaching the kernel as `user.a`
+    /// is a name the client did not ask for.
+    #[tokio::test]
+    async fn xattr_rejects_an_embedded_nul_and_an_oversized_value() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+
+        for name in [b"user.a\0evil".as_slice(), b"\0".as_slice()] {
+            assert_eq!(
+                fs.getxattr(e.node, name, 64).await.unwrap_err(),
+                Errno::EINVAL
+            );
+            assert_eq!(
+                fs.setxattr(e.node, name, b"v", 0).await.unwrap_err(),
+                Errno::EINVAL
+            );
+            assert_eq!(
+                fs.removexattr(e.node, name).await.unwrap_err(),
+                Errno::EINVAL
+            );
+        }
+
+        let huge = vec![0u8; MAX_XATTR_SIZE + 1];
+        assert_eq!(
+            fs.setxattr(e.node, b"user.k", &huge, 0).await.unwrap_err(),
+            E2BIG
+        );
+    }
+
+    /// v1 scopes xattrs to regular files and directories. The reopen the ring
+    /// ops need would dereference a symlink's magic link, block forever on a
+    /// FIFO with no peer, or run a device driver's `open`.
+    #[tokio::test]
+    async fn xattrs_outside_files_and_directories_are_unsupported() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::os::unix::fs::symlink("target", dir.path().join("l")).unwrap();
+        let l = fs.lookup(ROOT_NODE, b"l").await.unwrap();
+
+        assert_eq!(
+            fs.getxattr(l.node, b"user.k", 64).await.unwrap_err(),
+            EOPNOTSUPP
+        );
+        assert_eq!(fs.listxattr(l.node, 64).await.unwrap_err(), EOPNOTSUPP);
+        assert_eq!(
+            fs.setxattr(l.node, b"user.k", b"v", 0).await.unwrap_err(),
+            EOPNOTSUPP
+        );
+        assert_eq!(
+            fs.removexattr(l.node, b"user.k").await.unwrap_err(),
+            EOPNOTSUPP
+        );
+
+        // A directory is in scope, so its xattr ops reach the filesystem.
+        assert!(!matches!(fs.listxattr(ROOT_NODE, 0).await, Err(e) if e == EOPNOTSUPP));
     }
 }
