@@ -1,9 +1,21 @@
 //! The node table: FUSE node ids to `O_PATH` descriptors.
 //!
 //! Every filesystem operation the server executes resolves its target through
-//! this table. A node owns an `O_PATH` descriptor, which pins the inode for as
-//! long as the kernel holds a lookup count on the id, so `(st_dev, st_ino)`
-//! cannot be recycled underneath a live node.
+//! this table. A node owns an `O_PATH` descriptor, which on local Linux
+//! filesystems pins the inode for as long as the kernel holds a lookup count on
+//! the id, so `(st_dev, st_ino)` cannot come to name a different file
+//! underneath a live node. That is what the dedup in `register` rests on.
+//! Exporting a network or FUSE filesystem voids the argument: `st_ino` there is
+//! server-assigned and may be recycled or synthesized by hashing, so two
+//! distinct live files can collide on one key and `register` would merge them.
+//!
+//! Separately, `forget` drops a reverse-map entry without checking which node
+//! it names. A structural invariant, not the inode pin, is what makes that
+//! safe: for every live `(id, node)` in `nodes`, `by_key[node.key] == id`, and
+//! `register` can never create a second live node for one key, because the
+//! dedup hit returns first and every mutation runs under a single lock. The
+//! invariant needs ids to stay unrecycled; a `debug_assert!` in `forget` trips
+//! if that ever changes.
 
 use lbfs_proto::types::{NodeId, ROOT_NODE};
 use std::collections::HashMap;
@@ -111,9 +123,19 @@ impl NodeTable {
         if !exhausted {
             return;
         }
-        if let Some(n) = g.nodes.remove(&node) {
+        // Constraint: the final `close(2)` must not run under the table lock.
+        // Dropping the last `Arc<OwnedFd>` for an unlinked file frees the inode
+        // and its blocks inside `close(2)` (journal work on ext4, tens of
+        // milliseconds for a large file), and FORGETs arrive batched, so every
+        // other operation on the connection would queue behind the whole batch.
+        // Bind the removed node so it outlives the guard, unlock, then drop it.
+        let dead = g.nodes.remove(&node);
+        if let Some(n) = &dead {
+            debug_assert_eq!(g.by_key.get(&n.key), Some(&node));
             g.by_key.remove(&n.key);
         }
+        drop(g);
+        drop(dead);
     }
 }
 
@@ -191,6 +213,30 @@ mod tests {
         let key2 = key_of(&fd2);
         let (_, gen2, _) = table.register(fd2, key2);
         assert_ne!(gen1, gen2);
+    }
+
+    /// Deterministic counterpart to the test above, which cannot fail on tmpfs:
+    /// tmpfs draws inode numbers from a monotonic counter, so a real
+    /// create/delete/create cycle never hands the same `FileKey` back and the
+    /// recycle path goes unexercised. `register` takes the key from its caller,
+    /// so fabricate one and present it twice.
+    #[test]
+    fn a_recycled_key_after_full_forget_gets_a_fresh_id_and_generation() {
+        let (dir, table) = table_over_tempdir();
+        let recycled: FileKey = (0, 12345);
+
+        std::fs::write(dir.path().join("first"), b"x").unwrap();
+        let fd1 = open_path(&dir.path().join("first"));
+        let (id1, gen1, _) = table.register(fd1, recycled);
+        table.forget(id1, 1);
+        assert!(table.get(id1).is_none());
+
+        std::fs::write(dir.path().join("second"), b"y").unwrap();
+        let fd2 = open_path(&dir.path().join("second"));
+        let (id2, gen2, _) = table.register(fd2, recycled);
+
+        assert_ne!(id1, id2, "a forgotten id must never be re-issued");
+        assert_ne!(gen1, gen2, "a recycled key must get a fresh generation");
     }
 
     #[test]
