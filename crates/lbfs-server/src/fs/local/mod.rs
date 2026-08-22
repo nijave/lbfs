@@ -30,6 +30,7 @@
 //!   below would never fire. [`make_key`] is the only constructor.
 
 pub mod buffers;
+pub mod killpriv;
 pub mod nodes;
 
 // The io_uring bridge is the single sanctioned home for `unsafe` in this

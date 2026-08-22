@@ -16,7 +16,10 @@ postcard = { version = "1.1", features = ["alloc"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 io-uring = "0.7"
-rustix = { version = "1", features = ["event", "fs", "net", "process"] }
+# `thread` is here for `capabilities()`: the server reads its own CAP_FSETID
+# once at startup to learn whether the backing kernel will strip set-user-ID
+# on its behalf. See `fs::local::killpriv`.
+rustix = { version = "1", features = ["event", "fs", "net", "process", "thread"] }
 libc = "0.2"
 globset = "0.4"
 toml = "0.8"
