@@ -510,6 +510,8 @@ dependencies = [
 name = "lbfs-tests"
 version = "0.1.0"
 dependencies = [
+ "fuser",
+ "lbfs-client",
  "lbfs-proto",
  "lbfs-server",
  "libc",

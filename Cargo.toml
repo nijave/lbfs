@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 lbfs-proto = { path = "crates/lbfs-proto" }
 lbfs-server = { path = "crates/lbfs-server" }
+lbfs-client = { path = "crates/lbfs-client" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 postcard = { version = "1.1", features = ["alloc"] }
