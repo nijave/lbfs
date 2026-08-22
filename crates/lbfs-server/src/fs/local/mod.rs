@@ -1,4 +1,5 @@
 pub mod buffers;
+pub mod nodes;
 
 // The io_uring bridge is the single sanctioned home for `unsafe` in this
 // workspace: raw SQE submission and raw pointers into slab-owned payloads

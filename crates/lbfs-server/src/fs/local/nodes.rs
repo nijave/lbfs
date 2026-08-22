@@ -1,0 +1,202 @@
+//! The node table: FUSE node ids to `O_PATH` descriptors.
+//!
+//! Every filesystem operation the server executes resolves its target through
+//! this table. A node owns an `O_PATH` descriptor, which pins the inode for as
+//! long as the kernel holds a lookup count on the id, so `(st_dev, st_ino)`
+//! cannot be recycled underneath a live node.
+
+use lbfs_proto::types::{NodeId, ROOT_NODE};
+use std::collections::HashMap;
+use std::os::fd::OwnedFd;
+use std::sync::{Arc, Mutex};
+
+/// `(st_dev, st_ino)` — identifies one inode, so hard links to the same file
+/// collapse onto a single node.
+pub type FileKey = (u64, u64);
+
+struct Node {
+    fd: Arc<OwnedFd>,
+    key: FileKey,
+    generation: u64,
+    /// The kernel's lookup count for this id, decremented by `FUSE_FORGET`.
+    nlookup: u64,
+}
+
+struct Inner {
+    nodes: HashMap<NodeId, Node>,
+    by_key: HashMap<FileKey, NodeId>,
+    next_id: NodeId,
+    next_generation: u64,
+}
+
+pub struct NodeTable(Mutex<Inner>);
+
+impl NodeTable {
+    /// Installs `root_fd` as `ROOT_NODE` with an immortal lookup count.
+    pub fn new(root_fd: OwnedFd, root_key: FileKey) -> NodeTable {
+        let mut nodes = HashMap::new();
+        let mut by_key = HashMap::new();
+        nodes.insert(
+            ROOT_NODE,
+            Node {
+                fd: Arc::new(root_fd),
+                key: root_key,
+                generation: 0,
+                nlookup: u64::MAX,
+            },
+        );
+        by_key.insert(root_key, ROOT_NODE);
+        NodeTable(Mutex::new(Inner {
+            nodes,
+            by_key,
+            next_id: ROOT_NODE + 1,
+            next_generation: 1,
+        }))
+    }
+
+    /// Returns the node for `key`, creating it if this is the first lookup.
+    ///
+    /// When `key` is already present the existing node is returned with its
+    /// lookup count bumped and `fd` closed — the table already owns a
+    /// descriptor for that inode.
+    pub fn register(&self, fd: OwnedFd, key: FileKey) -> (NodeId, u64, Arc<OwnedFd>) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(&id) = g.by_key.get(&key) {
+            let node = g.nodes.get_mut(&id).expect("by_key points at a live node");
+            node.nlookup = node.nlookup.saturating_add(1);
+            return (id, node.generation, Arc::clone(&node.fd));
+            // `fd` drops here: the table already owns an fd for this file.
+        }
+        let id = g.next_id;
+        g.next_id += 1;
+        let generation = g.next_generation;
+        g.next_generation += 1;
+        let fd = Arc::new(fd);
+        g.nodes.insert(
+            id,
+            Node {
+                fd: Arc::clone(&fd),
+                key,
+                generation,
+                nlookup: 1,
+            },
+        );
+        g.by_key.insert(key, id);
+        (id, generation, fd)
+    }
+
+    /// Resolves a node id to its descriptor and generation. `None` means the
+    /// id is unknown, which the caller reports as `ESTALE`.
+    pub fn get(&self, node: NodeId) -> Option<(Arc<OwnedFd>, u64)> {
+        let g = self.0.lock().unwrap();
+        g.nodes
+            .get(&node)
+            .map(|n| (Arc::clone(&n.fd), n.generation))
+    }
+
+    /// Drops `nlookup` references, releasing the node (and its descriptor) at
+    /// zero. The root is immortal; unknown ids are ignored.
+    pub fn forget(&self, node: NodeId, nlookup: u64) {
+        if node == ROOT_NODE {
+            return;
+        }
+        let mut g = self.0.lock().unwrap();
+        let exhausted = match g.nodes.get_mut(&node) {
+            Some(n) => {
+                n.nlookup = n.nlookup.saturating_sub(nlookup);
+                n.nlookup == 0
+            }
+            None => false,
+        };
+        if !exhausted {
+            return;
+        }
+        if let Some(n) = g.nodes.remove(&node) {
+            g.by_key.remove(&n.key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::OwnedFd;
+
+    fn open_path(p: &std::path::Path) -> OwnedFd {
+        rustix::fs::open(p, rustix::fs::OFlags::PATH, rustix::fs::Mode::empty()).unwrap()
+    }
+
+    fn key_of(fd: &OwnedFd) -> FileKey {
+        let st = rustix::fs::fstat(fd).unwrap();
+        (st.st_dev as u64, st.st_ino as u64)
+    }
+
+    fn table_over_tempdir() -> (tempfile::TempDir, NodeTable) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = open_path(dir.path());
+        let key = key_of(&root);
+        (dir, NodeTable::new(root, key))
+    }
+
+    #[test]
+    fn register_get_forget_lifecycle() {
+        let (dir, table) = table_over_tempdir();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let fd = open_path(&dir.path().join("f"));
+        let key = key_of(&fd);
+
+        let (id, generation, _) = table.register(fd, key);
+        assert!(id > 1);
+        assert!(table.get(id).is_some());
+
+        table.forget(id, 1);
+        assert!(table.get(id).is_none()); // => ESTALE upstream
+        let _ = generation;
+    }
+
+    #[test]
+    fn hardlinks_dedup_to_one_node_with_bumped_refcount() {
+        let (dir, table) = table_over_tempdir();
+        std::fs::write(dir.path().join("a"), b"x").unwrap();
+        std::fs::hard_link(dir.path().join("a"), dir.path().join("b")).unwrap();
+
+        let fd_a = open_path(&dir.path().join("a"));
+        let key_a = key_of(&fd_a);
+        let fd_b = open_path(&dir.path().join("b"));
+        let key_b = key_of(&fd_b);
+        assert_eq!(key_a, key_b);
+
+        let (id_a, _, _) = table.register(fd_a, key_a);
+        let (id_b, _, _) = table.register(fd_b, key_b);
+        assert_eq!(id_a, id_b);
+
+        table.forget(id_a, 1);
+        assert!(table.get(id_a).is_some()); // second ref still holds it
+        table.forget(id_a, 1);
+        assert!(table.get(id_a).is_none());
+    }
+
+    #[test]
+    fn generations_differ_when_id_slot_recycles_a_key() {
+        let (dir, table) = table_over_tempdir();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let fd1 = open_path(&dir.path().join("f"));
+        let key1 = key_of(&fd1);
+        let (_, gen1, _) = table.register(fd1, key1);
+        table.forget(ROOT_NODE + 1, 1);
+
+        std::fs::remove_file(dir.path().join("f")).unwrap();
+        std::fs::write(dir.path().join("f"), b"y").unwrap();
+        let fd2 = open_path(&dir.path().join("f"));
+        let key2 = key_of(&fd2);
+        let (_, gen2, _) = table.register(fd2, key2);
+        assert_ne!(gen1, gen2);
+    }
+
+    #[test]
+    fn root_survives_forget() {
+        let (_dir, table) = table_over_tempdir();
+        table.forget(ROOT_NODE, u64::MAX);
+        assert!(table.get(ROOT_NODE).is_some());
+    }
+}
