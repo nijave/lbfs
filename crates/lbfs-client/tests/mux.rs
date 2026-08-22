@@ -82,7 +82,25 @@ impl Frame {
 
 impl Fake {
     async fn bind() -> Fake {
+        Fake::bind_inner(None).await
+    }
+
+    /// The same, with a deliberately tiny receive buffer.
+    ///
+    /// Set on the listener so the accepted socket inherits it. With a receive
+    /// window of a couple of kilobytes the client's own send buffer cannot grow,
+    /// so a large frame written to a server that has stopped reading parks the
+    /// writer task instead of vanishing into kernel memory. That stall is the
+    /// only way to reach a full outbound queue from a test.
+    async fn bind_stalled() -> Fake {
+        Fake::bind_inner(Some(2048)).await
+    }
+
+    async fn bind_inner(recv_buffer: Option<usize>) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if let Some(bytes) = recv_buffer {
+            rustix::net::sockopt::set_socket_recv_buffer_size(&listener, bytes).unwrap();
+        }
         let addr = listener.local_addr().unwrap();
         Fake { listener, addr }
     }
@@ -247,7 +265,7 @@ async fn connect_negotiates_attaches_and_reports_the_root() {
     let proposal = Proposal {
         max_inflight: 64,
         max_io_size: 1 << 20,
-        writeback: true,
+        ..Proposal::default()
     };
     let client =
         tokio::spawn(async move { Connection::connect_with(addr, EXPORT, proposal).await });
@@ -375,6 +393,57 @@ async fn settled_limits_the_client_cannot_honour_are_refused() {
     match client.await.unwrap().expect_err("the handshake is refused") {
         ConnectError::Protocol(_) => {}
         other => panic!("wanted a protocol error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_server_that_accepts_and_says_nothing_times_the_handshake_out() {
+    // The failure this closes is a mount attempt that hangs for ever with no
+    // diagnostic: TCP succeeds, the client sends HELLO, and the peer simply
+    // never answers.
+    let fake = Fake::bind().await;
+    let addr = fake.addr;
+    let proposal = Proposal {
+        handshake_timeout: Duration::from_millis(200),
+        ..Proposal::default()
+    };
+    let client =
+        tokio::spawn(async move { Connection::connect_with(addr, EXPORT, proposal).await });
+
+    let (sock, _) = fake.listener.accept().await.unwrap();
+    let mut sess = Session { sock };
+    let hello = sess.recv().await;
+    assert_eq!(hello.op, Opcode::Hello as u16, "the client did speak first");
+    // ... and now the server says nothing at all.
+
+    match client.await.unwrap().expect_err("connect must give up") {
+        ConnectError::TimedOut => {}
+        other => panic!("wanted TimedOut, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_server_that_stalls_after_hello_also_times_out() {
+    // The second half of the handshake has the same exposure as the first.
+    let fake = Fake::bind().await;
+    let addr = fake.addr;
+    let proposal = Proposal {
+        handshake_timeout: Duration::from_millis(200),
+        ..Proposal::default()
+    };
+    let client =
+        tokio::spawn(async move { Connection::connect_with(addr, EXPORT, proposal).await });
+
+    let (sock, _) = fake.listener.accept().await.unwrap();
+    let mut sess = Session { sock };
+    let hello = sess.recv().await;
+    sess.reply_ok(hello.id, &settled(128, 1 << 20)).await;
+    let attach = sess.recv().await;
+    assert_eq!(attach.op, Opcode::Attach as u16);
+
+    match client.await.unwrap().expect_err("connect must give up") {
+        ConnectError::TimedOut => {}
+        other => panic!("wanted TimedOut, got {other:?}"),
     }
 }
 
@@ -633,6 +702,122 @@ async fn a_call_waiting_for_a_permit_wakes_with_eio_when_the_server_dies() {
     assert!(conn.is_dead());
 }
 
+/// The review's probe, as a regression test.
+///
+/// A caller cancelled while parked on the outbound queue used to leak its
+/// window permit: the correlation entry that held the permit was already in the
+/// table, the frame it was waiting to queue was discarded with the future, and
+/// no reply would ever arrive to take the entry back out. Seven cancellations
+/// left one of eight permits, on a connection that never noticed — and a window
+/// with no permits left does not fail a call, it parks it for ever.
+///
+/// Reaching the outbound queue's bound needs a stalled writer, which needs a
+/// server that stops reading and a receive buffer small enough that the
+/// client's send buffer cannot swallow a megabyte.
+#[tokio::test]
+async fn cancelling_a_call_parked_on_a_full_queue_gives_its_permit_back() {
+    let fake = Fake::bind_stalled().await;
+    let (conn, mut sess) = stalled_session(&fake).await;
+
+    // 1. Park the writer on a frame nobody is reading. It holds one permit.
+    let stuck = {
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move { conn.write(2, 7, 0, vec![0xCD; STALL_BYTES]).await })
+    };
+
+    // 2. Fill the outbound queue behind it. Forgets are the only frames that
+    //    can, since everything else is bounded by the eight-wide window and the
+    //    queue is eight slots wider than that.
+    for node in 0..(FILL_BATCHES * 64) {
+        conn.send_forget(node, 1);
+    }
+    tokio::time::sleep(NEVER).await;
+
+    // 3. Seven callers take the rest of the window and park on the full queue.
+    let mut parked = Vec::new();
+    for _ in 0..7 {
+        let conn = Arc::clone(&conn);
+        parked.push(tokio::spawn(async move { conn.lookup(1, b"f").await }));
+    }
+    tokio::time::sleep(NEVER).await;
+    assert!(!conn.is_dead(), "a stalled writer is not a dead connection");
+
+    // 4. Cancel every one of them.
+    for task in &parked {
+        task.abort();
+    }
+    for task in parked {
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    // 5. Clear the stall: the write is at the head of the queue, so reading it
+    //    is what lets the writer move again. Answer it so its permit comes back
+    //    the ordinary way, then drain the forgets behind it.
+    let frame = sess.recv().await;
+    assert_eq!(frame.op, Opcode::Write as u16, "the write is queued first");
+    assert_eq!(frame.data.len(), STALL_BYTES);
+    let written = u32::try_from(STALL_BYTES).unwrap();
+    let body = postcard::to_allocvec(&WriteReply { written }).unwrap();
+    sess.reply(frame.id, STATUS_OK, &body, &[]).await;
+    assert_eq!(stuck.await.unwrap().unwrap(), written);
+    while let Some(frame) = sess.recv_within(NEVER).await {
+        assert_eq!(
+            frame.op,
+            Opcode::Forget as u16,
+            "opcode {} reached the wire after its caller was cancelled. Either a \
+             cancelled caller queued its frame anyway, or the writer never \
+             stalled and this test proved nothing",
+            frame.op
+        );
+    }
+
+    // 6. The whole window must be usable again. With the leak, one permit came
+    //    back and the other seven calls would park on the semaphore for ever.
+    let mut calls = Vec::new();
+    for i in 0..8u64 {
+        let conn = Arc::clone(&conn);
+        calls.push(tokio::spawn(async move {
+            conn.lookup(1, format!("g{i}").as_bytes()).await
+        }));
+    }
+    let mut reqs = Vec::new();
+    for _ in 0..8 {
+        reqs.push(sess.recv().await);
+    }
+    for req in &reqs {
+        sess.reply_ok(req.id, &an_entry(20, 0)).await;
+    }
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    assert!(!conn.is_dead());
+}
+
+/// Enough forget batches to fill an outbound queue of `window + OUT_SLACK`
+/// slots several times over, so the batcher is certainly parked on it.
+const FILL_BATCHES: u64 = 32;
+
+/// A frame no pair of kernel socket buffers can swallow.
+///
+/// Loopback autotunes both ends into the megabytes, so a 1 MiB frame written to
+/// a server that never reads still completes — the writer never parks and the
+/// stall the two tests below depend on never happens. Sixteen mebibytes is past
+/// any default `tcp_wmem`/`tcp_rmem` ceiling, and the tiny receive buffer on the
+/// listener makes it park far sooner than that.
+const STALL_BYTES: usize = 16 << 20;
+
+/// A session whose negotiated I/O size is large enough to carry [`STALL_BYTES`]
+/// in one frame, with the narrowest legal window so the boundary is cheap to
+/// reach.
+async fn stalled_session(fake: &Fake) -> (Arc<Connection>, Session) {
+    let io = u32::try_from(STALL_BYTES).unwrap();
+    let proposal = Proposal {
+        max_io_size: io,
+        ..Proposal::default()
+    };
+    connected(fake, proposal, settled(8, io)).await
+}
+
 // ---------------------------------------------------------------------------
 // Forget batching
 // ---------------------------------------------------------------------------
@@ -672,6 +857,54 @@ async fn a_full_batch_flushes_without_waiting_for_the_timer() {
     assert_eq!(req.items.len(), 64);
     assert_eq!(req.items[0], (0, 1));
     assert_eq!(req.items[63], (63, 1));
+}
+
+#[tokio::test]
+async fn a_stalled_writer_makes_the_forget_queue_lossy_not_unbounded() {
+    // The queue in front of the batcher is bounded, and reaching the bound
+    // costs forgets rather than memory. `send_forget` runs on the FUSE dispatch
+    // thread and cannot wait, so the only two choices while the batcher is
+    // parked behind an unwritable socket are "drop" and "grow for ever".
+    let fake = Fake::bind_stalled().await;
+    let (conn, mut sess) = stalled_session(&fake).await;
+
+    let stuck = {
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move { conn.write(2, 7, 0, vec![0xCD; STALL_BYTES]).await })
+    };
+    tokio::time::sleep(NEVER).await;
+
+    // Far more than any bound the client could reasonably hold, from a caller
+    // that must never block. Every one of these returns.
+    for node in 0..100_000u64 {
+        conn.send_forget(node, 1);
+    }
+    assert!(
+        conn.dropped_forgets() > 0,
+        "an unbounded queue would have swallowed all 100,000"
+    );
+    assert!(!conn.is_dead(), "losing a forget is not losing the session");
+
+    // And the connection still works once the stall clears.
+    let frame = sess.recv().await;
+    assert_eq!(frame.op, Opcode::Write as u16);
+    let written = u32::try_from(STALL_BYTES).unwrap();
+    let body = postcard::to_allocvec(&WriteReply { written }).unwrap();
+    sess.reply(frame.id, STATUS_OK, &body, &[]).await;
+    assert_eq!(stuck.await.unwrap().unwrap(), written);
+    let call = {
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move { conn.lookup(1, b"f").await })
+    };
+    loop {
+        let frame = sess.recv().await;
+        if frame.op == Opcode::Lookup as u16 {
+            sess.reply_ok(frame.id, &an_entry(2, 3)).await;
+            break;
+        }
+        assert_eq!(frame.op, Opcode::Forget as u16);
+    }
+    assert_eq!(call.await.unwrap().unwrap().node, 2);
 }
 
 #[tokio::test]

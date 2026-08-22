@@ -24,7 +24,12 @@
 //!   put one more request on the wire than the server admitted, and the server
 //!   answers an overrun by closing the connection. Parking the permit next to
 //!   the oneshot means it is released exactly when the reply is taken off the
-//!   table, whether or not anybody is still waiting for it.
+//!   table, whether or not anybody is still waiting for it. The corollary is
+//!   the ordering in `call_raw`: room on the outbound queue is *reserved*
+//!   before the table learns the id, so no await sits between registering a
+//!   waiter and queueing the frame it is waiting for. A cancellation that
+//!   landed in such a gap would strand both the entry and its permit for the
+//!   life of the connection.
 //! * **`FORGET` spends no permit.** It carries `FLAG_NO_REPLY`, so no reply
 //!   ever comes back to return the permit — a client that charged one would
 //!   leak a window slot per forgotten node until the window was gone. The
@@ -100,6 +105,17 @@ const KEEPALIVE_COUNT: u32 = 3;
 const FORGET_BATCH: usize = 64;
 const FORGET_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How many forgets may be waiting on the batcher before the client starts
+/// dropping them — 64 full frames' worth.
+///
+/// It has to be bounded by something. `send_forget` is called straight from the
+/// kernel's `forget` callback, which has no reply object and no way to wait, so
+/// it cannot block; and the batcher can be parked for as long as the socket is
+/// unwritable. An unbounded queue in front of a blockable consumer is a leak
+/// waiting for a slow network. See [`Connection::send_forget`] for what is lost
+/// when the bound is reached.
+const FORGET_QUEUE: usize = 64 * FORGET_BATCH;
+
 /// Slack above the window on the outbound queue.
 ///
 /// The queue is bounded by the window because that is what bounds requests in
@@ -107,6 +123,16 @@ const FORGET_INTERVAL: Duration = Duration::from_millis(500);
 /// window. Past that the batcher waits, which is the correct backpressure: a
 /// client that cannot write cannot usefully keep queueing.
 const OUT_SLACK: usize = 8;
+
+/// How long `connect` gives the whole approach — TCP, `HELLO`, `ATTACH` — before
+/// it gives up.
+///
+/// Without it a peer that completes the TCP handshake and then says nothing
+/// hangs the mount attempt for as long as the process lives, with no
+/// diagnostic. Ten seconds is far longer than a handshake over any link this is
+/// meant for, and far shorter than "forever". Overridable per connection
+/// through [`Proposal::handshake_timeout`].
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -130,6 +156,8 @@ pub enum ConnectError {
     AttachDenied,
     #[error("the server could not open that export: errno {0}")]
     Attach(u16),
+    #[error("the server did not finish the handshake in time")]
+    TimedOut,
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
 }
@@ -159,6 +187,14 @@ pub struct Proposal {
     /// page cache and the file size, which changes how the server reads an
     /// `OPEN`'s flags. Only the client knows it, so it travels in `HELLO`.
     pub writeback: bool,
+    /// How long [`Connection::connect_with`] waits for the whole approach —
+    /// TCP, `HELLO`, `ATTACH` — before giving up with
+    /// [`ConnectError::TimedOut`].
+    ///
+    /// Not negotiated, and carried here rather than as a fourth argument
+    /// because it belongs to the same bundle: what this client is asking for
+    /// before there is a session to ask on.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for Proposal {
@@ -169,6 +205,7 @@ impl Default for Proposal {
             // Spec §7: on by default, because letting the kernel aggregate
             // small writes is the largest single win for build workloads.
             writeback: true,
+            handshake_timeout: CONNECT_TIMEOUT,
         }
     }
 }
@@ -229,6 +266,10 @@ struct Shared {
     /// Shared with the forget batcher so no two frames can carry one id.
     next_id: AtomicU64,
     window: Arc<Semaphore>,
+    /// How many forgets the client has thrown away because the queue in front
+    /// of the batcher was full. Only the first is worth a warning; the rest
+    /// would be a log flood at exactly the moment the connection is in trouble.
+    dropped_forgets: AtomicU64,
 }
 
 impl Shared {
@@ -256,13 +297,6 @@ impl Shared {
                 true
             }
             Table::Dead => false,
-        }
-    }
-
-    /// Give up a slot whose request never reached the socket.
-    fn drop_waiter(&self, id: u64) {
-        if let Table::Live(pending) = &mut *self.lock() {
-            pending.remove(&id);
         }
     }
 
@@ -323,7 +357,7 @@ impl Shared {
 pub struct Connection {
     shared: Arc<Shared>,
     out_tx: mpsc::Sender<Outbound>,
-    forget_tx: mpsc::UnboundedSender<(NodeId, u64)>,
+    forget_tx: mpsc::Sender<(NodeId, u64)>,
     /// Aborted on drop. The writer and the batcher stop on their own when
     /// their channels close, and they must, so that queued frames still reach
     /// the socket; the reader has nothing to finish and would otherwise sit on
@@ -379,13 +413,22 @@ impl Connection {
         export_path: &[u8],
         proposal: Proposal,
     ) -> Result<(Arc<Connection>, HelloReply, FileAttr), ConnectError> {
-        let mut sock = TcpStream::connect(addr).await?;
-        configure_socket(&sock)?;
-
-        // Ids 1 and 2 belong to the handshake; the session's counter starts
-        // after them so no id is ever reused on this connection.
-        let settled = hello(&mut sock, &proposal).await?;
-        let root_attr = attach(&mut sock, export_path).await?;
+        // Bounded end to end. A peer that completes the TCP handshake and then
+        // says nothing is indistinguishable from a slow one until the clock
+        // runs out, and a mount attempt that hangs for ever with no diagnostic
+        // is the one outcome a CLI must not have.
+        let dialled = tokio::time::timeout(
+            proposal.handshake_timeout,
+            dial(addr, export_path, &proposal),
+        )
+        .await;
+        let (sock, settled, root_attr) = match dialled {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::error!(%addr, timeout = ?proposal.handshake_timeout, "handshake timed out");
+                return Err(ConnectError::TimedOut);
+            }
+        };
 
         let (read_half, write_half) = sock.into_split();
         let shared = Arc::new(Shared {
@@ -393,9 +436,10 @@ impl Connection {
             dead: AtomicBool::new(false),
             next_id: AtomicU64::new(3),
             window: Arc::new(Semaphore::new(settled.max_inflight as usize)),
+            dropped_forgets: AtomicU64::new(0),
         });
         let (out_tx, out_rx) = mpsc::channel(settled.max_inflight as usize + OUT_SLACK);
-        let (forget_tx, forget_rx) = mpsc::unbounded_channel();
+        let (forget_tx, forget_rx) = mpsc::channel(FORGET_QUEUE);
 
         let reader = tokio::spawn(reader_task(
             read_half,
@@ -498,6 +542,28 @@ impl Connection {
             .acquire_owned()
             .await
             .map_err(|_| Errno::EIO)?;
+
+        // Room on the outbound queue is reserved *before* the correlation table
+        // learns about this request, and this is the only order that survives
+        // cancellation. The queue fills whenever TCP backpressure stalls the
+        // writer; a caller that registered first and then awaited a send would,
+        // if its future were dropped while parked there, leave a waiter holding
+        // a window permit for a frame that never went out and a reply that can
+        // never arrive. Permits lost that way never come back, and a window
+        // that has lost them all does not fail — it hangs, which is the worst
+        // shape a filesystem can fail in. Reserving first means the only await
+        // between taking the slot and filling it is this one, where nothing has
+        // been registered yet; `Permit::send` below is synchronous and cannot
+        // be cancelled.
+        let slot = match self.out_tx.reserve().await {
+            Ok(slot) => slot,
+            Err(_) => {
+                // No writer left, so nothing on this connection can be
+                // answered again.
+                self.shared.kill("the writer task is gone");
+                return Err(Errno::EIO);
+            }
+        };
         let id = self.shared.next_id();
         let (tx, rx) = oneshot::channel();
         if !self.shared.try_register(
@@ -509,24 +575,13 @@ impl Connection {
         ) {
             return Err(Errno::EIO);
         }
-        let queued = self
-            .out_tx
-            .send(Outbound {
-                id,
-                op: op as u16,
-                flags: 0,
-                body,
-                data,
-            })
-            .await;
-        if queued.is_err() {
-            // No writer left, so this request will never be answered. Take the
-            // slot back rather than leaving a waiter — and its permit — parked
-            // for the life of the process.
-            self.shared.drop_waiter(id);
-            self.shared.kill("the writer task is gone");
-            return Err(Errno::EIO);
-        }
+        slot.send(Outbound {
+            id,
+            op: op as u16,
+            flags: 0,
+            body,
+            data,
+        });
 
         // A dropped sender is the drain in `Shared::kill`, which is `EIO` by
         // construction: it only runs when the connection is over.
@@ -546,15 +601,48 @@ impl Connection {
 
     /// Drop a lookup count, fire and forget.
     ///
-    /// Synchronous on purpose: the kernel's `forget` callback has no reply
-    /// object and no way to wait, so this only queues. The batcher turns a
-    /// burst of evictions into one frame.
+    /// Synchronous and never blocking, on purpose: the kernel's `forget`
+    /// callback has no reply object and no way to wait, and it runs on the FUSE
+    /// dispatch thread, so an enqueue that waited would stall every other
+    /// callback behind it. The batcher turns a burst of evictions into one
+    /// frame.
+    ///
+    /// Which means the queue must be allowed to lose one. When the socket is
+    /// unwritable the batcher parks, and a large eviction burst behind it would
+    /// otherwise grow without limit; past [`FORGET_QUEUE`] items the client
+    /// drops the forget and says so. The cost is one node's lookup count
+    /// stranded on the server until the session ends — and the session's whole
+    /// node table dies with the connection anyway (spec §8), which is the same
+    /// bound. The alternatives were worse: blocking stalls the mount, and an
+    /// unbounded queue turns a slow network into unbounded memory.
     pub fn send_forget(&self, node: NodeId, nlookup: u64) {
-        if self.forget_tx.send((node, nlookup)).is_err() {
-            // The connection is gone, and with it the whole node table: there
-            // is nothing left to decrement (spec §8).
-            tracing::debug!(node, nlookup, "connection is gone; dropping FORGET");
+        match self.forget_tx.try_send((node, nlookup)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let dropped = self.shared.dropped_forgets.fetch_add(1, Ordering::Relaxed);
+                if dropped == 0 {
+                    tracing::warn!(
+                        node,
+                        queued = FORGET_QUEUE,
+                        "the FORGET queue is full; lookup counts will be stranded \
+                         on the server until this session ends"
+                    );
+                } else {
+                    tracing::debug!(node, nlookup, dropped, "dropping a FORGET");
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // The connection is gone, and with it the whole node table:
+                // there is nothing left to decrement (spec §8).
+                tracing::debug!(node, nlookup, "connection is gone; dropping FORGET");
+            }
         }
+    }
+
+    /// How many forgets this connection has thrown away. Zero on a healthy
+    /// mount; anything else means the socket stalled behind a burst.
+    pub fn dropped_forgets(&self) -> u64 {
+        self.shared.dropped_forgets.load(Ordering::Relaxed)
     }
 
     // -----------------------------------------------------------------------
@@ -975,6 +1063,25 @@ impl Connection {
 // Handshake, step by step
 // ---------------------------------------------------------------------------
 
+/// Everything between "nothing" and "a socket with an attached export on it".
+///
+/// Split out from [`Connection::connect_with`] so one timeout covers the whole
+/// approach: the TCP handshake, `HELLO` and `ATTACH` are three different ways
+/// for the same silent peer to hang a mount.
+async fn dial(
+    addr: SocketAddr,
+    export_path: &[u8],
+    proposal: &Proposal,
+) -> Result<(TcpStream, HelloReply, FileAttr), ConnectError> {
+    let mut sock = TcpStream::connect(addr).await?;
+    configure_socket(&sock)?;
+    // Ids 1 and 2 belong to the handshake; the session's counter starts after
+    // them so no id is ever reused on this connection.
+    let settled = hello(&mut sock, proposal).await?;
+    let root_attr = attach(&mut sock, export_path).await?;
+    Ok((sock, settled, root_attr))
+}
+
 async fn hello(sock: &mut TcpStream, proposal: &Proposal) -> Result<HelloReply, ConnectError> {
     let req = HelloRequest {
         magic: MAGIC,
@@ -1213,7 +1320,7 @@ async fn writer_task(
 /// or when that clock runs out, whichever comes first. There is no idle timer,
 /// so a mount that is forgetting nothing costs nothing.
 async fn forget_task(
-    mut rx: mpsc::UnboundedReceiver<(NodeId, u64)>,
+    mut rx: mpsc::Receiver<(NodeId, u64)>,
     out: mpsc::Sender<Outbound>,
     shared: Arc<Shared>,
 ) {
@@ -1395,7 +1502,7 @@ mod tests {
         let tiny = Proposal {
             max_inflight: 1,
             max_io_size: 1,
-            writeback: false,
+            ..Proposal::default()
         };
         let answer = HelloReply {
             version: PROTOCOL_VERSION,
