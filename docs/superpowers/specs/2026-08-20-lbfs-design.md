@@ -112,8 +112,11 @@ protocol has no in-band error recovery.
    matches FUSE `max_write`), max body size (64 KiB — bounds xattr values
    and readdir batches).
 3. `ATTACH` (client → server): desired absolute server path as bytes. Server
-   canonicalizes, matches the allowlist, opens the export root
-   `O_PATH | O_DIRECTORY`, replies with root attributes. Root `NodeId` is 1
+   opens the path `O_PATH | O_DIRECTORY`, reads the descriptor's true
+   resolved path from `/proc/self/fd/N`, matches that resolved path against
+   the allowlist, and replies with root attributes. Open-then-verify, never
+   match-then-open: matching before opening leaves a window where a
+   component swapped to a symlink exports the wrong root. Root `NodeId` is 1
    (`FUSE_ROOT_ID`).
 4. Only after a successful `ATTACH` does the client complete the FUSE mount.
 
@@ -186,9 +189,10 @@ max_io_size = "1MiB"
 fsync = "honor"        # or "ignore" — see §6
 ```
 
-Allowlist: `globset` patterns matched against the **canonicalized** attach
-path (canonicalize first, then match, then open) so symlinks cannot smuggle
-a path past the check.
+Allowlist: `globset` patterns matched against the **descriptor's resolved
+path** — open `O_PATH | O_DIRECTORY` first, read `/proc/self/fd/N`, then
+match — so a symlink swapped between check and open cannot smuggle a
+path past the allowlist. The fd the server verified is the fd it exports.
 
 ## 5. Server: Filesystem Layer (`lbfs-server::fs`)
 
