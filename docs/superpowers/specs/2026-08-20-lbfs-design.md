@@ -99,9 +99,12 @@ Every message is one frame:
   serializer: senders emit it with vectored writes directly from the source
   buffer; receivers read it directly into a pooled buffer.
 
-Protocol violations (lengths exceeding negotiated maxima, unknown opcodes,
-window overflow, malformed body) are connection-fatal: log and close. The
-protocol has no in-band error recovery.
+Protocol violations that desynchronize the stream (lengths exceeding
+negotiated maxima, unknown opcodes, window overflow, malformed
+HELLO/ATTACH/FORGET bodies) are connection-fatal: log and close. A
+malformed body on a filesystem opcode inside a frame with honest lengths
+keeps the stream in sync, so the server answers `EINVAL` and the session
+survives. The protocol has no in-band error recovery.
 
 ### 3.2 Handshake and attach
 
@@ -276,9 +279,15 @@ A future control message will force a real sync regardless of this setting;
   **writeback cache** on (kernel aggregates small writes — the biggest win
   for build workloads); `keep_cache` so re-reads stay local; `readdirplus`
   on; `max_write`/`max_readahead` = negotiated max I/O size.
-- **Identity:** attributes reported exactly as the server sees them
-  (NFS-without-idmapping); kernel enforces permissions locally via
-  `default_permissions` (hence server-side `ACCESS` is `ENOSYS`).
+- **Identity:** ownership, mode, and times pass through exactly as the
+  server sees them (NFS-without-idmapping). `st_ino` inside the mount is
+  the server's `NodeId`, not the backing inode — fuser derives the FUSE
+  nodeid from `attr.ino`, and a wrong nodeid means ESTALE, so the node id
+  wins. Hardlink identity survives because the server dedups nodes on
+  `(st_dev, st_ino)`. Plain `READDIR` `d_ino` still carries the backing
+  inode, so `ls -i` can disagree with `stat`. The kernel enforces
+  permissions locally via `default_permissions` (hence server-side
+  `ACCESS` is `ENOSYS`).
   `chown`/`chmod` pass through and succeed or fail by the server process's
   privilege. This is what mTLS-derived identity later replaces.
 - **Lifecycle:** `connect → HELLO → ATTACH → mount`; pre-mount failures are
