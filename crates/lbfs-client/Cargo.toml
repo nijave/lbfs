@@ -15,8 +15,13 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
+# The multiplexer's live suite runs a real server in process: `lbfs-server` is
+# a dev-dependency rather than a dependency because nothing the client ships
+# links it. Task 16's loopback test needs the same pair.
+lbfs-server = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
