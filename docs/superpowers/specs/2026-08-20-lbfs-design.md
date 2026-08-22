@@ -110,13 +110,14 @@ survives. The protocol has no in-band error recovery.
 
 ### 3.2 Handshake and attach
 
-1. `HELLO` (client → server): magic `LBFS`, protocol version — now `2`, and
-   still an exact match, which is the whole point. Version `2` adds
-   `kill_suidgid` to the `WRITE` body. postcard ignores trailing bytes, so a
-   version-`1` server decoding a version-`2` `WRITE` would drop the flag and
-   silently keep a set-user-ID bit the mount promised to clear. Refusing the
-   handshake turns that into a startup failure an operator can see. Both ends
-   deploy together, so the refusal costs nothing.
+1. `HELLO` (client → server): magic `LBFS`, proposed limits, and a protocol
+   version — now `2`, and still an exact match, which is the whole point.
+   Version `2` adds `kill_suidgid` to the `WRITE` body. postcard ignores
+   trailing bytes, so a version-`1` server decoding a version-`2` `WRITE`
+   would drop the flag and silently keep a set-user-ID bit the mount
+   promised to clear. Refusing the handshake turns that into a startup
+   failure an operator can see. Both ends deploy together, so the refusal
+   costs nothing.
 2. `HELLO` reply: settled protocol version, **max in-flight window**
    (default 128, clamped to [8, 1024]), **max I/O size** (default 1 MiB,
    matches FUSE `max_write`), max body size (64 KiB — bounds xattr values
@@ -333,16 +334,16 @@ A future control message will force a real sync regardless of this setting;
   `entry_timeout`/`attr_timeout` default 1 s, CLI-tunable (0 disables);
   **writeback cache** on (kernel aggregates small writes — the biggest win
   for build workloads); `keep_cache` so re-reads stay local; `readdirplus`
-  on; `max_write`/`max_readahead` = negotiated max I/O size. Beside those
-  cache flags the client requests one more capability at `INIT`:
-  `FUSE_HANDLE_KILLPRIV_V2` (§5.3).
+  on; `max_write`/`max_readahead` = negotiated max I/O size.
+- **Kill-priv capability:** beside those cache flags the client requests one
+  more capability at FUSE `INIT`: `FUSE_HANDLE_KILLPRIV_V2` (§5.3).
 
   `FUSE_HANDLE_KILLPRIV_V2` is optional, not required. A kernel that refuses
-  it keeps today's behaviour: the kernel probes `security.capability` before
+  it keeps today's behavior: the kernel probes `security.capability` before
   each write and performs its own strip through `SETATTR`
   (`fs/fuse/dir.c:2335`). The mount stays correct and stays slow. Note that
   the kernel sets `FUSE_WRITE_KILL_SUIDGID` on direct-I/O writes regardless
-  of whether it granted the capability, so a server honouring the flag on a
+  of whether it granted the capability, so a server honoring the flag on a
   mount that lost it strips more often than the contract demands — never
   less.
 - **Identity:** ownership, mode, and times pass through exactly as the
