@@ -1338,6 +1338,29 @@ impl FileSystem for LocalFs {
             .map_err(join_errno)?
     }
 
+    /// Copies bytes, and strips the destination's privileged bits with no flag
+    /// to ask it to.
+    ///
+    /// `WRITE` takes `kill_suidgid` off the wire; `COPY_FILE_RANGE` has no such
+    /// field, in this protocol or in FUSE's own (`fuse_copy_file_range_in`,
+    /// `include/uapi/linux/fuse.h`), so there is nothing to condition on. Nor
+    /// could a field be added and believed: once `FUSE_HANDLE_KILLPRIV_V2` is
+    /// negotiated the client's kernel latches `S_NOSEC` on the destination
+    /// inode, and `file_modified` then short-circuits before it could compute a
+    /// kill mask to send. The signal does not exist to be forwarded.
+    ///
+    /// So the server decides alone, and decides to strip whenever it is the
+    /// actor at all. Under [`KillPrivPolicy::Kernel`] the `copy_file_range(2)`
+    /// below does it — the server holds no `CAP_FSETID`, so the backing kernel
+    /// clears the bits inside the syscall, exactly as it does for `write(2)`.
+    /// Under [`KillPrivPolicy::Explicit`] the backing kernel stands aside and
+    /// only this call keeps the promise. Stripping a mode the caller could have
+    /// kept is the direction spec §7 permits — "more often than the contract
+    /// demands, never less" — and the alternative is set-user-ID surviving new
+    /// bytes.
+    ///
+    /// Before the copy, as in `LocalFs::write`: a failure between the two steps
+    /// leaves the old bytes under a safe mode.
     async fn copy_file_range(
         &self,
         node_in: NodeId,
@@ -1350,6 +1373,9 @@ impl FileSystem for LocalFs {
     ) -> FsResult<u64> {
         let fd_in = self.file_fd(node_in, fh_in)?;
         let fd_out = self.file_fd(node_out, fh_out)?;
+        if self.killpriv == KillPrivPolicy::Explicit {
+            self.strip_privileged_bits(&fd_out).await?;
+        }
         // No io_uring opcode either, and this is the op most worth having: the
         // bytes never leave the server, so a reflink-capable filesystem can
         // make the whole copy metadata.
@@ -2275,6 +2301,93 @@ mod tests {
 
         assert_eq!(attr.mode & 0o7777, 0o4755);
         assert_eq!(mode_bits(&path), 0o4755, "a sizeless SETATTR over-stripped");
+    }
+
+    /// The copy fixture: [`explicit_fs_with_a_suid_file`]'s forced-`Explicit`
+    /// backend and 0o4755 destination, plus a second 0o4755 file holding `new`
+    /// to copy from. Both carry the bit so a strip on the wrong descriptor is
+    /// visible as the source losing it.
+    async fn explicit_fs_with_a_suid_copy_pair() -> (
+        tempfile::TempDir,
+        LocalFs,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (dir, fs, dst) = explicit_fs_with_a_suid_file("dst").await;
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::set_permissions(&src, std::os::unix::fs::PermissionsExt::from_mode(0o4755))
+            .unwrap();
+        (dir, fs, src, dst)
+    }
+
+    /// The copy path strips its destination with no flag asking it to.
+    ///
+    /// `COPY_FILE_RANGE` carries no `kill_suidgid` — there is no such field to
+    /// carry — so the server strips whenever it is on the `Explicit` branch.
+    ///
+    /// What this pins is the outcome: a set-user-ID destination does not
+    /// survive a copy into it, the bytes still land, and the source keeps its
+    /// own bits because only the destination is stripped. It does not pin the
+    /// actor. The copy succeeds here, and a successful `copy_file_range(2)`
+    /// makes the unprivileged backing kernel clear the bit on its own, so this
+    /// one would still pass with the server's strip deleted;
+    /// [`the_explicit_copy_strip_lands_before_the_bytes`] is the test that
+    /// fails then.
+    #[tokio::test]
+    async fn a_copy_strips_the_destination_under_a_forced_explicit_policy() {
+        let (_dir, fs, src_path, dst_path) = explicit_fs_with_a_suid_copy_pair().await;
+        let src = fs.lookup(ROOT_NODE, b"src").await.unwrap();
+        let dst = fs.lookup(ROOT_NODE, b"dst").await.unwrap();
+        let fh_in = fs.open(src.node, libc::O_RDONLY as u32).await.unwrap();
+        let fh_out = fs.open(dst.node, libc::O_WRONLY as u32).await.unwrap();
+
+        assert_eq!(
+            fs.copy_file_range(src.node, fh_in, 0, dst.node, fh_out, 0, 3)
+                .await
+                .unwrap(),
+            3
+        );
+
+        assert_eq!(mode_bits(&dst_path), 0o0755, "set-user-ID survived a copy");
+        assert_eq!(std::fs::read(&dst_path).unwrap(), b"new");
+        assert_eq!(
+            mode_bits(&src_path),
+            0o4755,
+            "the strip landed on the source"
+        );
+    }
+
+    /// The copy strip lands before the bytes, with the server pinned as the
+    /// only possible actor.
+    ///
+    /// `vfs_copy_file_range` refuses a destination that is not open for writing
+    /// with `EBADF` (`fs/read_write.c`), before it copies a page and before any
+    /// `file_remove_privs` — so the backing kernel never runs its own strip and
+    /// a cleared bit can only be this server's. The same reasoning, and the
+    /// same shape, as [`the_explicit_truncate_strip_lands_before_the_resize`].
+    #[tokio::test]
+    async fn the_explicit_copy_strip_lands_before_the_bytes() {
+        let (_dir, fs, _src_path, dst_path) = explicit_fs_with_a_suid_copy_pair().await;
+        let src = fs.lookup(ROOT_NODE, b"src").await.unwrap();
+        let dst = fs.lookup(ROOT_NODE, b"dst").await.unwrap();
+        let fh_in = fs.open(src.node, libc::O_RDONLY as u32).await.unwrap();
+        let fh_out = fs.open(dst.node, libc::O_RDONLY as u32).await.unwrap();
+
+        fs.copy_file_range(src.node, fh_in, 0, dst.node, fh_out, 0, 3)
+            .await
+            .expect_err("a copy into a read-only handle is refused");
+
+        assert_eq!(
+            mode_bits(&dst_path),
+            0o0755,
+            "the strip waited for the copy"
+        );
+        assert_eq!(
+            std::fs::read(&dst_path).unwrap(),
+            b"old",
+            "a refused copy wrote bytes anyway"
+        );
     }
 
     /// `CREATE` owes the client exactly one `FORGET` for the entry it returns,
