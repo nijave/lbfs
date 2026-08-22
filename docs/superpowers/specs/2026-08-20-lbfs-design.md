@@ -572,6 +572,13 @@ Future work:
   `CAP_FSETID` clears set-user-ID and set-group-ID but leaves the capability
   attribute; picking it up means either a per-write probe or a per-node cache
   invalidated by `SETXATTR`.
+- **`fallocate` kill-priv under a privileged server.** Punch-hole and
+  zero-range change file data, yet the server's `Explicit` policy strips
+  only on write, truncate, and `copy_file_range`. Under the shipped
+  unprivileged default the backing kernel covers it; a `CAP_FSETID` server
+  using `fallocate` keeps suid bits it promised to clear. Same shape as the
+  `copy_file_range` fix on the kill-priv branch — the strip call and a
+  forced-policy test.
 
 Noted and deferred:
 
