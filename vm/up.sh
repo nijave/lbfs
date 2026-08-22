@@ -43,6 +43,12 @@ for vm in "${VMS[@]}"; do
 done
 
 mkdir -p "$IMAGES" "$GEN"
+# uid `qemu` opens the disks, so the directory holding them has to be
+# traversable whatever umask the caller runs under. A umask of 077 would leave
+# it 0700 and reintroduce the exact permission failure that putting the disks
+# here avoided. (The XDG chain above it is 0755 by convention; this fixes the
+# one directory the harness creates.)
+chmod a+rx "$IMAGES"
 
 if [ ! -f "$BASE_IMG" ]; then
   echo "fetching $UBUNTU_IMG_URL"
@@ -103,10 +109,34 @@ done
 # sshd answers well before cloud-init has finished installing packages, and
 # every one of those packages is something Task 18 or the client needs. Waiting
 # here is what makes `make vm-up && make vm-deploy` safe to type as one line.
+#
+# Bounded, because `--wait` is not: an unreachable archive mirror would
+# otherwise hang vm-up with no output and no ceiling. Fifteen minutes is far
+# past a healthy run — this pair converges in about twenty seconds — and far
+# short of a wasted afternoon.
 echo "waiting for cloud-init..."
 for ip in "$SERVER_IP" "$CLIENT_IP"; do
-  vm_ssh "$ip" 'cloud-init status --wait >/dev/null' ||
+  if ! vm_ssh "$ip" 'timeout 900 cloud-init status --wait >/dev/null'; then
     echo "warning: cloud-init on $ip did not finish cleanly" >&2
+    vm_ssh "$ip" 'cloud-init status --long' >&2 || true
+  fi
+
+  # The verdict comes from dpkg, not from cloud-init's own opinion of itself.
+  # `done` says nothing about whether a package landed, and `degraded` covers
+  # plenty that Task 18 would never notice — so ask directly about the six the
+  # suite and the client's libfuse3 link depend on, and refuse to report a
+  # working pair without them. `db:Status-Status` reads `installed` only for a
+  # package that is really there, and dpkg-query complains on stderr about one
+  # it has never heard of, which is worth keeping in the diagnostic.
+  missing="$(vm_ssh "$ip" \
+    "dpkg-query -W -f='\${db:Status-Status} \${Package}\n' $GUEST_PACKAGES 2>&1 |
+       grep -v '^installed ' || true")"
+  if [ -n "$missing" ]; then
+    echo "cloud-init left $ip without packages this harness promises:" >&2
+    echo "$missing" >&2
+    exit 1
+  fi
+
   # SC2016: single-quoted so the guest, not this shell, answers.
   # shellcheck disable=SC2016
   vm_ssh "$ip" 'echo "$(hostname): $(uname -r)"'

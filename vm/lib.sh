@@ -42,6 +42,11 @@ SERVER_EXPORT="/srv/exports/data"
 CLIENT_MOUNT="/mnt/lbfs"
 SERVER_PORT="9423"
 
+# What cloud-init must have installed before a guest counts as ready. Kept
+# beside the addresses because it is the same kind of promise: up.sh asserts it,
+# and the template in cloud-init/user-data.tmpl.yaml has to match.
+GUEST_PACKAGES="fuse3 attr fio gcc curl make"
+
 VIRSH=(virsh --connect qemu:///system)
 
 SSH_OPTS=(
