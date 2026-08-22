@@ -263,6 +263,25 @@ impl LocalFs {
             rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )?;
+        LocalFs::from_root_fd(root, fsync, writeback, uring, pool)
+    }
+
+    /// The same, for a root descriptor the caller already holds.
+    ///
+    /// This is the constructor `ATTACH` uses. The allowlist check opens the
+    /// client's path itself so it can match against the name that descriptor
+    /// resolves to (spec §3.2 step 3); handing the fd over rather than the
+    /// path is the other half of that guarantee. Re-opening by name here would
+    /// give a racing symlink swap a second chance and export a root the
+    /// allowlist never approved — the fd that was verified must be the fd that
+    /// is exported.
+    pub fn from_root_fd(
+        root: OwnedFd,
+        fsync: FsyncPolicy,
+        writeback: bool,
+        uring: UringExecutor,
+        pool: BufferPool,
+    ) -> io::Result<LocalFs> {
         let st = rustix::fs::statx(
             &root,
             "",

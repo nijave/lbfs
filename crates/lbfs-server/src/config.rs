@@ -1,6 +1,7 @@
 use lbfs_proto::frame::{DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE, WINDOW_CLAMP};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -73,9 +74,11 @@ pub fn parse_size(s: &str) -> Result<u32, ConfigError> {
     u32::try_from(v.checked_mul(mult).ok_or_else(bad)?).map_err(|_| bad())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AttachError {
+    #[error("path cannot be opened as a directory")]
     NotExported,
+    #[error("resolved path is not on the allowlist")]
     Denied,
 }
 
@@ -96,12 +99,50 @@ impl Allowlist {
         Ok(Allowlist { set: b.build()? })
     }
 
-    /// Canonicalize FIRST, then match — symlinks cannot smuggle a path
-    /// past the allowlist (spec §4).
-    pub fn check(&self, requested: &Path) -> Result<PathBuf, AttachError> {
-        let canon = std::fs::canonicalize(requested).map_err(|_| AttachError::NotExported)?;
-        if self.set.is_match(&canon) {
-            Ok(canon)
+    /// Open the client's requested path and hand back the descriptor, but only
+    /// if the allowlist matches the path that descriptor actually names.
+    ///
+    /// Open first, verify second, and export the very descriptor that was
+    /// verified (spec §3.2 step 3, §4). The other order — canonicalize, match,
+    /// then open — leaves a window: between the `canonicalize` and the `open`
+    /// a component can be swapped for a symlink, and the server then exports a
+    /// tree the allowlist never approved. Reading the resolved name back from
+    /// `/proc/self/fd/N` closes that window because the kernel is reporting
+    /// where the *already pinned* inode lives, not re-walking a path.
+    ///
+    /// For the same reason the resolved path is matched as-is and never
+    /// canonicalized again: a second walk is a second chance to be raced.
+    ///
+    /// `O_PATH | O_DIRECTORY` pins the inode without read access and without
+    /// running any device's `open`; the final component is deliberately
+    /// followed, since a client naming a symlinked export directory is asking
+    /// for the target and the target is what gets matched.
+    pub fn open_export(&self, requested: &Path) -> Result<OwnedFd, AttachError> {
+        let fd = rustix::fs::open(
+            requested,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|_| AttachError::NotExported)?;
+        // A `/proc` that is missing or unreadable means the resolved path
+        // cannot be established, and an unverifiable path is refused rather
+        // than trusted. `Server::new` probes for this at startup so it
+        // surfaces as a refusal to serve instead of a puzzling attach denial.
+        let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .map_err(|_| AttachError::Denied)?;
+        self.check_resolved(&resolved)?;
+        Ok(fd)
+    }
+
+    /// Match a path that is already resolved, with no filesystem access.
+    ///
+    /// Split out from [`Allowlist::open_export`] so the matching rule can be
+    /// tested on its own, and so a caller that resolved a path some other way
+    /// does not have to re-derive it. Callers holding a *client-supplied* path
+    /// want `open_export` instead: this function trusts what it is given.
+    pub fn check_resolved(&self, resolved: &Path) -> Result<(), AttachError> {
+        if self.set.is_match(resolved) {
+            Ok(())
         } else {
             Err(AttachError::Denied)
         }
@@ -154,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_matches_canonical_path_not_requested_path() {
+    fn allowlist_matches_resolved_descriptor_not_requested_path() {
         let tmp = tempfile::tempdir().unwrap();
         let exports = tmp.path().join("exports");
         let outside = tmp.path().join("secret");
@@ -166,15 +207,37 @@ mod tests {
         let pattern = format!("{}/exports/*", tmp.path().canonicalize().unwrap().display());
         let allow = Allowlist::new(&[pattern]).unwrap();
 
-        assert!(allow.check(&exports.join("data")).is_ok());
-        // Canonicalizes to .../secret which no glob matches.
+        assert!(allow.open_export(&exports.join("data")).is_ok());
+        // The descriptor names .../secret, which no glob matches - the
+        // requested path being inside the exported tree buys nothing.
         assert!(matches!(
-            allow.check(&exports.join("leak")),
+            allow.open_export(&exports.join("leak")),
             Err(AttachError::Denied)
         ));
         assert!(matches!(
-            allow.check(&exports.join("missing")),
+            allow.open_export(&exports.join("missing")),
             Err(AttachError::NotExported)
+        ));
+        // A non-directory is refused by the open, not by the match.
+        std::fs::write(exports.join("file"), b"x").unwrap();
+        assert!(matches!(
+            allow.open_export(&exports.join("file")),
+            Err(AttachError::NotExported)
+        ));
+    }
+
+    #[test]
+    fn resolved_check_does_not_touch_the_filesystem() {
+        let allow = Allowlist::new(&["/srv/exports/*".to_string()]).unwrap();
+        assert!(allow.check_resolved(Path::new("/srv/exports/a")).is_ok());
+        // `literal_separator` keeps a single `*` from spanning components.
+        assert!(matches!(
+            allow.check_resolved(Path::new("/srv/exports/a/b")),
+            Err(AttachError::Denied)
+        ));
+        assert!(matches!(
+            allow.check_resolved(Path::new("/etc")),
+            Err(AttachError::Denied)
         ));
     }
 }
