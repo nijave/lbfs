@@ -135,6 +135,13 @@ sustain 1 GiB/s; 128 leaves ample depth for metadata bursts.
   `OPENDIR`.
 - The client batches `FORGET` frames; they carry `NO_REPLY` and decrement
   server-side node refcounts.
+- **Directory listings snapshot at `OPENDIR`.** The server reads the whole
+  directory once and the handle keeps that list, so `READDIR` and
+  `READDIRPLUS` page through a listing that no later create or unlink
+  disturbs. `rewinddir` replays the snapshot: offset 0 restarts the same
+  list. Every other offset must be a cookie this handle handed out, and one
+  the server never issued answers `EINVAL` rather than truncating the
+  listing in silence.
 
 ### 3.4 Opcodes
 
@@ -234,15 +241,17 @@ trait FileSystem: Send + Sync {
   The server never follows symlinks — `READLINK` returns the target and the
   client kernel resolves it. Escapes are structurally impossible, not
   filtered.
-- **io_uring:** a `UringExecutor` — N dedicated threads (default 1,
-  configurable) each owning a ring; async callers submit an op descriptor
-  and await a oneshot.
+- **io_uring:** a `UringExecutor` — N dedicated threads, each owning a ring;
+  async callers submit an op descriptor and await a oneshot. In v1 N is a
+  constant in the source and no config key reaches it.
   Ring-routed: read, write, fsync, fallocate, openat2, statx, unlinkat,
   mkdirat, renameat, linkat, symlinkat, xattr ops. `spawn_blocking`-routed
   (no uring opcode exists): getdents, readlinkat, copy_file_range, lseek.
   Either way every trait method is async and never blocks the runtime; uring
   coverage grows as kernels add opcodes.
-- **Buffers:** a pool of aligned buffers sized to `max_io_size`. WRITE
+- **Buffers:** a pool of boxed slices sized to `max_io_size` — plain heap
+  buffers, since dropping `O_DIRECT` from v1 removed the alignment
+  constraint that would have called for anything else. WRITE
   payloads: socket → pooled buffer → ring → pool. READs: pool → ring →
   vectored socket write → pool. No allocation on the data path (groundwork
   for registered buffers later).
@@ -293,7 +302,7 @@ A future control message will force a real sync regardless of this setting;
 - **Lifecycle:** `connect → HELLO → ATTACH → mount`; pre-mount failures are
   clean CLI errors. SIGINT/SIGTERM: unmount, drain, exit. CLI:
   `lbfs-client <server:port> <remote-path> <mountpoint> [--attr-timeout N]
-  [--fuse-opt ...]`.
+  [--allow-other] [--auto-unmount] [--no-writeback]`.
 - **Connection loss:** all in-flight and later ops fail `EIO`; the mount
   stays present and cleanly unmountable. No transparent reconnect in v1
   (node/handle state is session-scoped server-side; honest reconnection
@@ -375,10 +384,13 @@ TDD throughout. Layers:
    connection-fatal violations. This layer pins the wire contract.
 3. **Full-stack loopback (host, needs `/dev/fuse`):** real client mounting
    from a real server over localhost; std::fs operations through the mount.
-4. **E2e in VMs:** smoke suite covering every v1 op; **fsx** for
-   data-integrity torture; **fio** throughput/latency sanity against the
-   1 GiB/s ambition; disconnect test (kill server mid-I/O, assert clean
-   `EIO` + unmountability); **pjdfstest** as an optional long-running gate.
+4. **E2e in VMs:** smoke suite covering every v1 op; **fio** for both
+   throughput/latency sanity against the 1 GiB/s ambition and, with its
+   `crc32c` verify, the packaged data-integrity gate; disconnect test (kill
+   server mid-I/O, assert clean `EIO` + unmountability). **fsx** stays an
+   optional extra torture run. **pjdfstest** ships with neither: it wants an
+   autotools build the guest contract does not carry, and root on the mount,
+   which this design does not grant.
 
 Layers 1–2 need no FUSE or root, so they can run in any future CI. `make
 check` (fmt + clippy `-D warnings` + tests) is the standard local gate.
