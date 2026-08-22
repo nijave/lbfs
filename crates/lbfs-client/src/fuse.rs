@@ -67,21 +67,25 @@ use crate::conn::Connection;
 
 /// How many bytes of directory page to ask the server for per round trip.
 ///
-/// One page, to match the buffer the kernel hands `READDIR` and `READDIRPLUS`.
-/// Over-fetching is *not* free on the `READDIRPLUS` side, whatever the shape of
-/// the snapshot the server pages out of: every entry in a `READDIRPLUS` reply
-/// has already cost the server an `openat`, a `statx` and a lookup count, and a
-/// lookup count the kernel never sees is one the bridge has to hand back itself
-/// (see [`consume_readdirplus_page`]). At 8 KiB against a 4 KiB kernel buffer
-/// roughly half of every page was over-fetched; the two cost models are close
-/// enough — the server charges `namelen + 160` per entry, the kernel
-/// `align8(152 + namelen)` — that a matched ask leaves a residue of about one
-/// entry.
+/// One page, which is the smallest buffer the kernel hands `READDIR` and
+/// `READDIRPLUS`; a wider one simply takes more pages to fill. Over-fetching is
+/// *not* free on the `READDIRPLUS` side, whatever the shape of the snapshot the
+/// server pages out of: every entry in a `READDIRPLUS` reply has already cost
+/// the server an `openat`, a `statx` and a lookup count, and a lookup count the
+/// kernel never sees is one the bridge has to hand back itself (see
+/// [`consume_readdirplus_page`]). At 8 KiB against a 4 KiB kernel buffer
+/// roughly half of every page was over-fetched.
 ///
-/// Plain `READDIR` packs looser on the server than in the kernel (`namelen +
-/// 32` against `align8(24 + namelen)`), so a page occasionally under-fills the
-/// kernel's buffer and the loop asks again. One extra round trip per hundred
-/// names is the cheaper mistake.
+/// A matched ask leaves no residue at all. The kernel prices an entry *below*
+/// the server's budget for it — `align8(152 + namelen)` against `namelen + 160`
+/// for `READDIRPLUS`, `align8(24 + namelen)` against `namelen + 32` for plain
+/// `READDIR` — so a page that fills the server's budget always fits the
+/// kernel's buffer whole, with one to eight bytes to spare per entry. What that
+/// slack does instead is add up. Enough pages into one reply and it exceeds the
+/// price of a single entry, at which point the kernel starts refusing entries
+/// the server's budget said would fit, wherever in a page they happen to sit.
+/// Counting the whole reply rather than the page is what
+/// [`first_entry_overflow`] exists to do.
 ///
 /// The server clamps the ask to what a reply frame can legally carry, so this
 /// number needs no relationship to the negotiated limits.
@@ -264,8 +268,13 @@ enum PageOutcome {
 ///
 /// `emit` returns `true` when the entry did not fit, matching
 /// [`fuser::ReplyDirectoryPlus::add`].
+///
+/// `already_emitted` is how many entries earlier pages of the *same* reply put
+/// in the kernel's buffer, which is the only number that says whether a
+/// refusal here leaves the reply empty. See [`first_entry_overflow`].
 fn consume_readdirplus_page(
     entries: &[DirEntryPlus],
+    already_emitted: usize,
     mut emit: impl FnMut(&DirEntryPlus, u64) -> bool,
     mut forget: impl FnMut(NodeId),
 ) -> PageOutcome {
@@ -280,27 +289,35 @@ fn consume_readdirplus_page(
                 forget(unseen.entry.node);
             }
         }
-        first_entry_overflow(i, &e.name);
+        first_entry_overflow(already_emitted + i, &e.name);
         return PageOutcome::Full;
     }
     PageOutcome::Consumed
 }
 
-/// A page whose *first* entry does not fit leaves the reply empty, and an empty
+/// A reply whose *first* entry does not fit is an empty reply, and an empty
 /// reply is how a filesystem says "end of directory" — so the listing would
 /// look complete when it is not, and the cursor could never advance.
 ///
+/// `emitted` counts the whole reply and not the page that hit the wall, because
+/// only the reply answers the question. One reply drains as many server pages
+/// as the kernel's buffer will take, and the kernel prices an entry below the
+/// server's page budget for it, so the buffer runs out at a spot the server's
+/// arithmetic never predicted — a page's opening entry included. That is an
+/// ordinary full buffer: the kernel keeps every entry it did take and resumes
+/// the listing from the last one. Only an empty reply loses names.
+///
 /// Unreachable at any size the kernel and this protocol use together: a
 /// `fuse_direntplus` costs 152 bytes plus a name of at most `FUSE_NAME_MAX`
-/// against a buffer of one page. Said out loud anyway, because the failure is
-/// silent data loss rather than an error, and because "unreachable" is a claim
-/// about two numbers neither side of this code owns.
-fn first_entry_overflow(index: usize, name: &[u8]) {
+/// against a buffer of at least one page. Said out loud anyway, because the
+/// failure is silent data loss rather than an error, and because "unreachable"
+/// is a claim about two numbers neither side of this code owns.
+fn first_entry_overflow(emitted: usize, name: &[u8]) {
     debug_assert!(
-        index > 0,
+        emitted > 0,
         "the kernel's directory buffer could not hold a single entry"
     );
-    if index == 0 {
+    if emitted == 0 {
         tracing::error!(
             name = %String::from_utf8_lossy(name),
             "the kernel's directory buffer could not hold one entry; \
@@ -916,6 +933,9 @@ impl fuser::Filesystem for LbfsFuse {
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
             let mut cursor = offset as u64;
+            // Across pages, not within one: the kernel's buffer holds the whole
+            // reply, so this is what says whether a refusal leaves it empty.
+            let mut emitted = 0usize;
             loop {
                 let page = match conn.readdir(ino, fh, cursor, READDIR_PAGE_BYTES).await {
                     Ok(page) => page,
@@ -926,7 +946,7 @@ impl fuser::Filesystem for LbfsFuse {
                 // check is what keeps a server that did from hanging the mount
                 // rather than merely truncating a listing.
                 let done = page.end || page.entries.is_empty();
-                for (i, e) in page.entries.iter().enumerate() {
+                for e in page.entries.iter() {
                     cursor = e.offset;
                     // The real inode from the server's `getdents64`. Plain
                     // `READDIR` instantiates nothing, so this number is only
@@ -939,9 +959,10 @@ impl fuser::Filesystem for LbfsFuse {
                         kind_of_wire(e.kind),
                         OsStr::from_bytes(&e.name),
                     ) {
-                        first_entry_overflow(i, &e.name);
+                        first_entry_overflow(emitted, &e.name);
                         return reply.ok();
                     }
+                    emitted += 1;
                 }
                 if done {
                     return reply.ok();
@@ -961,6 +982,9 @@ impl fuser::Filesystem for LbfsFuse {
         let (conn, ttl) = self.ctx();
         self.rt.spawn(async move {
             let mut cursor = offset as u64;
+            // As in `readdir`: the count that decides whether a refused entry
+            // leaves an empty reply spans the pages, not one of them.
+            let mut emitted = 0usize;
             loop {
                 let page = match conn.readdirplus(ino, fh, cursor, READDIR_PAGE_BYTES).await {
                     Ok(page) => page,
@@ -975,6 +999,7 @@ impl fuser::Filesystem for LbfsFuse {
                 // there — see `consume_readdirplus_page`.
                 let outcome = consume_readdirplus_page(
                     &page.entries,
+                    emitted,
                     |e, node| {
                         let attr = to_fuse_attr(node, &e.entry.attr);
                         reply.add(
@@ -991,6 +1016,7 @@ impl fuser::Filesystem for LbfsFuse {
                 if outcome == PageOutcome::Full {
                     return reply.ok();
                 }
+                emitted += page.entries.len();
                 if let Some(last) = page.entries.last() {
                     cursor = last.offset;
                 }
@@ -1350,12 +1376,23 @@ mod tests {
         }
     }
 
-    /// One page, a buffer with room for `room` of it, and what came back.
+    /// One page, a buffer with room for `room` more of it, and what came back.
     fn consume(page: &[DirEntryPlus], room: usize) -> (PageOutcome, Vec<Vec<u8>>, Vec<NodeId>) {
+        consume_after(page, 0, room)
+    }
+
+    /// The same, for a page arriving into a reply that already holds
+    /// `already_emitted` entries from earlier pages.
+    fn consume_after(
+        page: &[DirEntryPlus],
+        already_emitted: usize,
+        room: usize,
+    ) -> (PageOutcome, Vec<Vec<u8>>, Vec<NodeId>) {
         let mut emitted: Vec<Vec<u8>> = Vec::new();
         let mut forgotten = Vec::new();
         let outcome = consume_readdirplus_page(
             page,
+            already_emitted,
             |e, _| {
                 if emitted.len() == room {
                     return true; // full: this entry did not go in
@@ -1428,10 +1465,43 @@ mod tests {
         assert!(forgotten.is_empty());
     }
 
-    /// The residue this leaves behind is the reason the page ask matches the
-    /// kernel's buffer instead of doubling it: every over-fetched entry is a
-    /// round trip's worth of server work thrown away, plus a `FORGET` to undo
-    /// it.
+    /// Two pages into one reply, where the kernel refuses the entry that opens
+    /// the second one.
+    ///
+    /// The reply is not empty — the first page is in it — so nothing was lost
+    /// and nothing is wrong: the kernel keeps what it took and asks again from
+    /// the last offset. The page-relative index cannot see that, and reading
+    /// it as an empty reply trips the `debug_assert` in
+    /// [`first_entry_overflow`], which `cargo test` compiles in. So this case
+    /// running to its assertions at all is half of what it checks; the other
+    /// half is that the refused page still pays its lookup counts back.
+    #[test]
+    fn a_later_pages_first_entry_may_be_refused() {
+        let first = [plus(b"a", 5), plus(b"b", 6)];
+        let (outcome, emitted, forgotten) = consume_after(&first, 0, first.len());
+        assert_eq!(outcome, PageOutcome::Consumed);
+        assert_eq!(emitted.len(), 2);
+        assert!(forgotten.is_empty());
+
+        // The same reply, one page later, against a buffer with nothing left.
+        let second = [plus(b"c", 7), plus(b"d", 8)];
+        let (outcome, emitted, forgotten) = consume_after(&second, first.len(), 0);
+        assert_eq!(outcome, PageOutcome::Full);
+        assert!(emitted.is_empty(), "the buffer filled on the page before");
+        assert_eq!(forgotten, vec![7, 8], "the whole page goes back");
+    }
+
+    /// The guard's argument counts the reply. Zero is the one value that means
+    /// an empty one, and the only one that may complain.
+    #[test]
+    fn the_overflow_guard_only_fires_on_an_empty_reply() {
+        first_entry_overflow(1, b"the first name of a later page");
+        first_entry_overflow(usize::MAX, b"a reply the kernel filled");
+    }
+
+    /// Why the ask matches the kernel's page instead of doubling it: an entry
+    /// the kernel never takes is a round trip's worth of server work thrown
+    /// away, plus a `FORGET` to undo it.
     #[test]
     fn the_page_ask_matches_the_kernels_buffer() {
         assert_eq!(READDIR_PAGE_BYTES, 4096);

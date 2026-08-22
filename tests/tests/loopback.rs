@@ -911,6 +911,75 @@ fn a_large_directory_lists_every_name_across_many_pages() {
     lb.unmount();
 }
 
+/// Names sized so that the kernel refuses the *first* entry of a server page
+/// with entries from earlier pages already in the reply.
+///
+/// This is the case a page-relative index cannot tell apart from "the buffer
+/// could not hold one entry". The client asks the server for 4 KiB of listing
+/// per round trip and pours as many pages as that takes into the one buffer the
+/// kernel handed it. The two sides price an entry differently — the server
+/// charges `namelen + 160`, the kernel `align8(152 + namelen)` — so a page that
+/// exactly fills the server's budget leaves the kernel's buffer a few bytes
+/// short. Those few bytes add up until one page's opening entry is the one that
+/// does not fit, and a bridge that reads "first of this page" as "first of this
+/// reply" answers with `EIO` in a debug build and a false error log in a
+/// release one.
+///
+/// The lengths below tune the residue rather than leaving it to luck. Ten
+/// names — nine of 249 bytes and one of 243 — cost the server 4084 of its 4088
+/// usable bytes and the kernel 4072 of a 4096-byte page, a shortfall of 24
+/// bytes per page against an entry that costs 400. The kernel's readdir buffer
+/// is a whole number of pages, so the two accountings stay in step until the
+/// buffer runs out, and the entry it runs out on opens its page for every
+/// buffer from 4 KiB to 52 KiB. Every window of ten names holds exactly one
+/// short one, so the packing survives whatever order the export's own
+/// filesystem lists them in.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn a_page_boundary_inside_one_reply_does_not_fail_the_listing() {
+    // Enough names to outlast the largest buffer the arithmetic above covers,
+    // with room to spare.
+    const NAMES: usize = 600;
+    // Same descriptor arithmetic as the case above: one server-side `O_PATH`
+    // per name the listing resolves.
+    require_open_files(NAMES as u64 + 256);
+
+    let mut lb = Loopback::start(Opts::default());
+    let mnt = lb.mnt().to_path_buf();
+
+    let wide = lb.export().join("wide");
+    std::fs::create_dir(&wide).unwrap();
+    let mut want = BTreeSet::new();
+    for i in 0..NAMES {
+        let name = tuned_name(i);
+        std::fs::write(wide.join(&name), "").unwrap();
+        want.insert(name);
+    }
+
+    assert_eq!(names_in(&mnt.join("wide")), want);
+    // A fresh `OPENDIR`, so the second pass pages the listing again rather
+    // than reading the kernel's cache of the first.
+    assert_eq!(names_in(&mnt.join("wide")), want);
+
+    // `READDIRPLUS` carries attributes and `READDIR` does not, and the kernel
+    // picks one form per call. Statting every name exercises the other loop
+    // over the same boundary.
+    let files = std::fs::read_dir(mnt.join("wide"))
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().metadata().unwrap().is_file())
+        .count();
+    assert_eq!(files, NAMES);
+
+    lb.unmount();
+}
+
+/// One unique name of the length its position in the block calls for.
+fn tuned_name(i: usize) -> String {
+    let len = if i.is_multiple_of(10) { 243 } else { 249 };
+    let prefix = format!("{i:05}-");
+    format!("{prefix}{}", "n".repeat(len - prefix.len()))
+}
+
 // ---------------------------------------------------------------------------
 // Attributes
 // ---------------------------------------------------------------------------
