@@ -876,8 +876,10 @@ fn timespec(t: TimeSet) -> FsResult<rustix::fs::Timespec> {
 ///
 /// 1. **owner** first, because `chown` clears set-user-ID and set-group-ID;
 /// 2. **mode** second, so a caller asking for both gets the mode it asked for;
-/// 3. **size**, which is the only step needing write access;
-/// 4. **times** last, so an explicit timestamp beats the implicit `mtime`
+/// 3. **the truncate strip**, when this process must perform it, positioned
+///    exactly where `do_truncate` performs the kernel's;
+/// 4. **size**, which is the only step needing write access;
+/// 5. **times** last, so an explicit timestamp beats the implicit `mtime`
 ///    bump a truncate just caused.
 ///
 /// The one thing that happens out of order is validating the timestamps, which
@@ -887,6 +889,7 @@ fn apply_setattr(
     fd: &OwnedFd,
     write_fd: Option<&OwnedFd>,
     args: &SetattrArgs,
+    killpriv: KillPrivPolicy,
 ) -> Result<(), Errno> {
     let times = match (args.atime, args.mtime) {
         (TimeSet::Omit, TimeSet::Omit) => None,
@@ -914,6 +917,30 @@ fn apply_setattr(
             rustix::fs::Mode::from_bits_truncate(mode & 0o7777),
         )
         .map_err(rustix_errno)?;
+    }
+    // Truncate carries the same set-user-ID obligation as write
+    // (`include/uapi/linux/fuse.h:429-433`). Under `Kernel` the server's own
+    // `ftruncate` already does it, because `do_truncate` folds
+    // `dentry_needs_remove_privs` into the `iattr` and that predicate turns on
+    // the caller lacking `CAP_FSETID`. Under `Explicit` the kernel steps aside
+    // and this is the strip.
+    if killpriv == KillPrivPolicy::Explicit && args.size.is_some() {
+        let st = rustix::fs::statx(
+            fd,
+            "",
+            rustix::fs::AtFlags::EMPTY_PATH,
+            rustix::fs::StatxFlags::MODE,
+        )
+        .map_err(rustix_errno)?;
+        if let Some(mode) = stripped_mode(u32::from(st.stx_mode)) {
+            // The node descriptor is `O_PATH`, which `fchmod` refuses, so this
+            // one goes through `/proc` like the explicit chmod above.
+            rustix::fs::chmod(
+                proc_path(fd),
+                rustix::fs::Mode::from_bits_truncate(mode & 0o7777),
+            )
+            .map_err(rustix_errno)?;
+        }
     }
     if let Some(size) = args.size {
         match write_fd {
@@ -977,9 +1004,12 @@ impl FileSystem for LocalFs {
             None => None,
         };
         let owned = Arc::clone(&fd);
-        tokio::task::spawn_blocking(move || apply_setattr(&owned, write_fd.as_deref(), &args))
-            .await
-            .map_err(join_errno)??;
+        let killpriv = self.killpriv;
+        tokio::task::spawn_blocking(move || {
+            apply_setattr(&owned, write_fd.as_deref(), &args, killpriv)
+        })
+        .await
+        .map_err(join_errno)??;
         let st = self.statx_fd(&fd).await.map_err(errno)?;
         Ok(attr_from_statx(&st))
     }
@@ -1993,6 +2023,68 @@ mod tests {
         assert_eq!(mode & 0o7777, 0o2644);
     }
 
+    /// Truncate carries the same obligation as write
+    /// (`include/uapi/linux/fuse.h:429-433`), and fuser exposes no
+    /// `FATTR_KILL_SUIDGID` on its `setattr` callback, so the server decides
+    /// this one on its own rather than reading a wire flag.
+    #[tokio::test]
+    async fn a_truncate_clears_set_user_id() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let path = dir.path().join("suid");
+        std::fs::write(&path, b"0123456789").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o4755))
+            .unwrap();
+
+        let e = fs.lookup(ROOT_NODE, b"suid").await.unwrap();
+        let attr = fs
+            .setattr(
+                e.node,
+                SetattrArgs {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: Some(4),
+                    atime: TimeSet::Omit,
+                    mtime: TimeSet::Omit,
+                    fh: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attr.size, 4);
+        assert_eq!(attr.mode & 0o7777, 0o0755);
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&path).unwrap());
+        assert_eq!(mode & 0o7777, 0o0755, "set-user-ID survived a truncate");
+    }
+
+    /// A `SETATTR` that sets a mode and no size keeps what the caller asked
+    /// for. Only write and truncate carry the strip obligation; `chmod u+s` is
+    /// a legitimate request and must survive.
+    #[tokio::test]
+    async fn a_chmod_without_a_truncate_keeps_set_user_id() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+
+        let attr = fs
+            .setattr(
+                e.node,
+                SetattrArgs {
+                    mode: Some(0o4755),
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime: TimeSet::Omit,
+                    mtime: TimeSet::Omit,
+                    fh: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attr.mode & 0o7777, 0o4755);
+    }
+
     /// An offset no filesystem will accept, so the write is refused before it
     /// can touch a page. `s_maxbytes` tops out at `MAX_LFS_FILESIZE`, and the
     /// kernel range-checks the position in `generic_write_checks` ahead of any
@@ -2093,6 +2185,43 @@ mod tests {
             std::fs::read(&path).unwrap(),
             b"old",
             "a refused write left bytes behind"
+        );
+    }
+
+    /// The truncate strip, with the server pinned as the only possible actor.
+    ///
+    /// `ftruncate` on a descriptor that is not open for writing is refused with
+    /// `EINVAL` in `do_sys_ftruncate`, ahead of the `do_truncate` that folds
+    /// `dentry_needs_remove_privs` into its `iattr` — so the backing kernel
+    /// never gets as far as its own strip and a cleared bit can only be this
+    /// server's. A succeeding truncate would prove nothing here, because an
+    /// unprivileged runner makes the kernel strip either way.
+    #[tokio::test]
+    async fn the_explicit_truncate_strip_lands_before_the_resize() {
+        let (_dir, fs, path) = explicit_fs_with_a_suid_file("suid").await;
+        let e = fs.lookup(ROOT_NODE, b"suid").await.unwrap();
+        let fh = fs.open(e.node, libc::O_RDONLY as u32).await.unwrap();
+
+        fs.setattr(
+            e.node,
+            SetattrArgs {
+                mode: None,
+                uid: None,
+                gid: None,
+                size: Some(1),
+                atime: TimeSet::Omit,
+                mtime: TimeSet::Omit,
+                fh: Some(fh),
+            },
+        )
+        .await
+        .expect_err("a resize through a read-only handle is refused");
+
+        assert_eq!(mode_bits(&path), 0o0755, "the strip waited for the resize");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old",
+            "a refused resize truncated the file anyway"
         );
     }
 
