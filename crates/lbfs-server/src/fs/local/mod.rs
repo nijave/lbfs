@@ -1993,6 +1993,109 @@ mod tests {
         assert_eq!(mode & 0o7777, 0o2644);
     }
 
+    /// An offset no filesystem will accept, so the write is refused before it
+    /// can touch a page. `s_maxbytes` tops out at `MAX_LFS_FILESIZE`, and the
+    /// kernel range-checks the position in `generic_write_checks` ahead of any
+    /// copy.
+    const UNWRITABLE_OFFSET: u64 = u64::MAX - 1;
+
+    /// A backend forced onto the `Explicit` branch, holding one 0o4755 file.
+    ///
+    /// [`KillPrivPolicy::detect`] answers `Kernel` for every unprivileged run,
+    /// which is every run this suite gets, so
+    /// [`LocalFs::strip_privileged_bits`] is unreachable unless the field is
+    /// set by hand — the two tests above would pass with the call deleted.
+    /// Forcing it is what puts the root-deployment branch under test without a
+    /// root runner.
+    async fn explicit_fs_with_a_suid_file(
+        name: &str,
+    ) -> (tempfile::TempDir, LocalFs, std::path::PathBuf) {
+        let (dir, mut fs) = test_fs(FsyncPolicy::Honor).await;
+        fs.killpriv = KillPrivPolicy::Explicit;
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o4755))
+            .unwrap();
+        (dir, fs, path)
+    }
+
+    /// The permission bits, which is all these tests read.
+    fn mode_bits(path: &std::path::Path) -> u32 {
+        std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(path).unwrap()) & 0o7777
+    }
+
+    /// A three-byte buffer holding `new`.
+    fn three_new_bytes(fs: &LocalFs) -> PooledBuf {
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..3].copy_from_slice(b"new");
+        buf.set_len(3);
+        buf
+    }
+
+    /// The server's own strip, with the policy forced rather than detected.
+    #[tokio::test]
+    async fn a_flagged_write_strips_under_a_forced_explicit_policy() {
+        let (_dir, fs, path) = explicit_fs_with_a_suid_file("suid").await;
+        let e = fs.lookup(ROOT_NODE, b"suid").await.unwrap();
+        let fh = fs.open(e.node, libc::O_WRONLY as u32).await.unwrap();
+
+        let buf = three_new_bytes(&fs);
+        assert_eq!(fs.write(e.node, fh, 0, buf, 3, true).await.unwrap(), 3);
+
+        assert_eq!(mode_bits(&path), 0o0755);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// No flag, no strip — even on the branch that does the stripping.
+    ///
+    /// The write has to fail for this to mean anything. A successful one would
+    /// pass whatever the server did, because an unprivileged writer makes the
+    /// backing kernel clear set-user-ID on its own; a refused one leaves the
+    /// server as the only thing that could have touched the mode.
+    #[tokio::test]
+    async fn an_unflagged_write_strips_nothing_under_explicit() {
+        let (_dir, fs, path) = explicit_fs_with_a_suid_file("suid").await;
+        let e = fs.lookup(ROOT_NODE, b"suid").await.unwrap();
+        let fh = fs.open(e.node, libc::O_WRONLY as u32).await.unwrap();
+
+        let buf = three_new_bytes(&fs);
+        fs.write(e.node, fh, UNWRITABLE_OFFSET, buf, 3, false)
+            .await
+            .expect_err("an offset past s_maxbytes is refused");
+
+        assert_eq!(mode_bits(&path), 0o4755, "an unflagged write over-stripped");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    }
+
+    /// The strip lands before the bytes, so a write that fails still strips.
+    ///
+    /// This is the order `file_remove_privs_flags` uses (`fs/inode.c`), and the
+    /// reason for it is the state this test names: old bytes under a safe mode.
+    /// Reversing the two steps would leave a crashed write's new bytes sitting
+    /// under set-user-ID.
+    ///
+    /// It also pins the actor. The file is refused before any page is copied,
+    /// so the backing kernel never runs its own strip and the cleared bit can
+    /// only be [`LocalFs::strip_privileged_bits`].
+    #[tokio::test]
+    async fn the_explicit_strip_lands_before_the_bytes() {
+        let (_dir, fs, path) = explicit_fs_with_a_suid_file("suid").await;
+        let e = fs.lookup(ROOT_NODE, b"suid").await.unwrap();
+        let fh = fs.open(e.node, libc::O_WRONLY as u32).await.unwrap();
+
+        let buf = three_new_bytes(&fs);
+        fs.write(e.node, fh, UNWRITABLE_OFFSET, buf, 3, true)
+            .await
+            .expect_err("an offset past s_maxbytes is refused");
+
+        assert_eq!(mode_bits(&path), 0o0755, "the strip waited for the write");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old",
+            "a refused write left bytes behind"
+        );
+    }
+
     /// `CREATE` owes the client exactly one `FORGET` for the entry it returns,
     /// which only holds while it registers through `lookup_impl`.
     #[tokio::test]
