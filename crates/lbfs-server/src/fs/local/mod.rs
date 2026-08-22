@@ -61,6 +61,10 @@ use uring::UringExecutor;
 /// resolves back to the export root is a directory loop.
 const ELOOP: Errno = Errno(libc::ELOOP as u16);
 
+/// Also absent from [`Errno`]'s list: a handle the client never opened, one it
+/// already released, or one it is presenting against the wrong node.
+const EBADF: Errno = Errno(libc::EBADF as u16);
+
 // ---------------------------------------------------------------------------
 // Handles
 // ---------------------------------------------------------------------------
@@ -108,6 +112,21 @@ impl<T> HandleTable<T> {
     }
 }
 
+/// One open file: the descriptor `OPEN`/`CREATE` produced, plus the node it
+/// was opened on.
+///
+/// The node id is not bookkeeping. Nothing stops a client pairing any `Fh`
+/// with any `NodeId`, and every operation here is descriptor-relative, so a
+/// handle onto one file would otherwise read, truncate, or `copy_file_range`
+/// into another — a handle the client legitimately owns becoming a key to a
+/// file it never opened. [`LocalFs::file_fd`] is the only route to the
+/// descriptor and it checks the pair.
+#[derive(Clone)]
+pub struct FileHandle {
+    node: NodeId,
+    fd: Arc<OwnedFd>,
+}
+
 /// Snapshot of one open directory.
 ///
 /// Task 11 fills this in with the entry list taken at `OPENDIR` and the
@@ -121,18 +140,15 @@ pub struct DirHandle;
 pub struct LocalFs {
     uring: UringExecutor,
     nodes: NodeTable,
-    /// Task 10: the read/write data path draws its buffers from here.
-    #[allow(dead_code)]
+    /// The read/write data path draws its buffers from here.
     pool: BufferPool,
-    /// Task 10: `OPEN`/`CREATE` park their data descriptors here. `setattr`
-    /// already reads it, so a truncate against an open handle is correct the
-    /// moment the handles exist.
-    files: HandleTable<Arc<OwnedFd>>,
+    /// `OPEN`/`CREATE` park their data descriptors here, and `SETATTR` reads
+    /// it so a truncate against an open handle uses that handle's descriptor.
+    files: HandleTable<FileHandle>,
     /// Task 11: `OPENDIR` parks its directory snapshots here.
     #[allow(dead_code)]
     dirs: HandleTable<Arc<DirHandle>>,
-    /// Task 10: masks `O_SYNC`/`O_DSYNC` and short-circuits `FSYNC`.
-    #[allow(dead_code)]
+    /// Masks `O_SYNC`/`O_DSYNC` and short-circuits `FSYNC` (spec §6).
     fsync_policy: FsyncPolicy,
     /// `(dev, ino)` of the export root, kept only for the loop guard in
     /// [`LocalFs::lookup_impl`].
@@ -240,10 +256,90 @@ impl LocalFs {
         })
     }
 
+    /// Resolves `(node, fh)` to the descriptor that handle owns.
+    ///
+    /// The pairing check is the whole point (see [`FileHandle`]): an `Fh` that
+    /// is unknown, already released, or presented against a different node is
+    /// `EBADF`, never somebody else's file.
+    fn file_fd(&self, node: NodeId, fh: Fh) -> FsResult<Arc<OwnedFd>> {
+        match self.files.get(fh) {
+            Some(handle) if handle.node == node => Ok(handle.fd),
+            _ => Err(EBADF),
+        }
+    }
+
+    /// Reduces a client's `open` flags to the ones this server will honor.
+    ///
+    /// An allowlist, not a denylist. `flags` is a raw `u32` the client copied
+    /// out of its own kernel's `f_flags`, and the bits that matter here are the
+    /// ones nobody thought to name: `O_TMPFILE` (which carries `O_DIRECTORY`),
+    /// `O_PATH`, `O_CREAT`. Enumerating what is safe is the only form of this
+    /// function that stays correct as flags are added.
+    ///
+    /// What survives, and why:
+    ///
+    /// * the access mode, which is the request;
+    /// * `O_APPEND`, `O_NOATIME`, `O_NONBLOCK`, which describe how the client
+    ///   wants its own descriptor to behave and cost the server nothing;
+    /// * `O_SYNC`/`O_DSYNC`, unless the durability policy is `ignore`, whose
+    ///   whole purpose is to not pay for them (spec §6).
+    ///
+    /// What does not, beyond the unnamed rest: `O_CREAT`, `O_EXCL` and
+    /// `O_TRUNC` (FUSE has `CREATE` and `SETATTR` for those, and honoring them
+    /// on `OPEN` would let a plain open create or destroy data), `O_NOFOLLOW`
+    /// and `O_DIRECTORY` (meaningless — the node is already resolved and
+    /// reopened through `/proc`), and `O_DIRECT`, which v1 does not support:
+    /// pooled buffers carry no alignment guarantee, so every read and write
+    /// against such a descriptor would fail `EINVAL`.
+    fn mask_open_flags(&self, flags: u32) -> i32 {
+        const ALLOWED: i32 = libc::O_ACCMODE
+            | libc::O_APPEND
+            | libc::O_NOATIME
+            | libc::O_NONBLOCK
+            // O_SYNC's value already contains O_DSYNC's bit; both are named so
+            // the intent survives someone reading only one line.
+            | libc::O_SYNC
+            | libc::O_DSYNC;
+
+        let mut flags = (flags as i32) & ALLOWED;
+        if self.fsync_policy == FsyncPolicy::Ignore {
+            flags &= !(libc::O_SYNC | libc::O_DSYNC);
+        }
+        // Descriptors are the server's, never a child's.
+        flags | libc::O_CLOEXEC
+    }
+
+    /// The durability policy in one place (spec §6).
+    ///
+    /// `honor` runs the real `fsync`/`fdatasync`; `ignore` acknowledges without
+    /// touching disk, the same trade an NFS `async` export makes — latency for
+    /// crash durability. Task 11's `FSYNCDIR` joins here once a directory
+    /// handle owns a descriptor.
+    async fn maybe_fsync(&self, fd: &Arc<OwnedFd>, datasync: bool) -> FsResult<()> {
+        match self.fsync_policy {
+            FsyncPolicy::Honor => self.uring.fsync(fd, datasync).await.map_err(errno),
+            FsyncPolicy::Ignore => Ok(()),
+        }
+    }
+
     #[cfg(test)]
     async fn key_of_node_for_test(&self, node: NodeId) -> FileKey {
         let fd = self.node_fd(node).unwrap();
         file_key(&self.statx_fd(&fd).await.unwrap())
+    }
+
+    #[cfg(test)]
+    fn pool_for_test(&self) -> &BufferPool {
+        &self.pool
+    }
+
+    /// The flags the stored descriptor was actually opened with, straight from
+    /// the kernel — the only honest witness that [`LocalFs::mask_open_flags`]
+    /// did what it claims.
+    #[cfg(test)]
+    fn file_flags_for_test(&self, fh: Fh) -> i32 {
+        let handle = self.files.get(fh).expect("handle is open");
+        rustix::fs::fcntl_getfl(&*handle.fd).unwrap().bits() as i32
     }
 }
 
@@ -337,6 +433,19 @@ fn into_owned(fd: Arc<OwnedFd>) -> io::Result<OwnedFd> {
     }
 }
 
+/// Move the tail a short write did not consume to the front of the buffer.
+///
+/// The executor writes from the start of the buffer and takes no offset into
+/// it, so this is what lets the next attempt continue where the last one
+/// stopped. `done` bytes of the leading `len` went out; what is left is
+/// `buf[done..len]`, and afterwards it is `buf[..len - done]`.
+///
+/// The alternative is a wider executor API carrying a buffer offset into the
+/// slab; a memmove on the rare short write is the cheaper half of that trade.
+fn slide_unwritten(buf: &mut PooledBuf, done: usize, len: usize) {
+    buf.as_mut_slice().copy_within(done..len, 0);
+}
+
 fn errno(e: io::Error) -> Errno {
     Errno::from_io(&e)
 }
@@ -351,8 +460,14 @@ fn join_errno(_e: tokio::task::JoinError) -> Errno {
     Errno::EIO
 }
 
-fn timespec(t: TimeSet) -> rustix::fs::Timespec {
-    match t {
+/// One [`TimeSet`] as the kernel wants it.
+///
+/// `Set` is range-checked because `UTIME_NOW` and `UTIME_OMIT` are themselves
+/// nanosecond values just below 2^30: an out-of-range `nsec` off the wire would
+/// not be rejected by `utimensat`, it would quietly mean "now" or "leave it
+/// alone" instead of the timestamp the client asked for.
+fn timespec(t: TimeSet) -> FsResult<rustix::fs::Timespec> {
+    Ok(match t {
         TimeSet::Omit => rustix::fs::Timespec {
             tv_sec: 0,
             tv_nsec: rustix::fs::UTIME_OMIT,
@@ -361,11 +476,16 @@ fn timespec(t: TimeSet) -> rustix::fs::Timespec {
             tv_sec: 0,
             tv_nsec: rustix::fs::UTIME_NOW,
         },
-        TimeSet::Set { sec, nsec } => rustix::fs::Timespec {
-            tv_sec: sec,
-            tv_nsec: nsec.into(),
-        },
-    }
+        TimeSet::Set { sec, nsec } => {
+            if nsec >= 1_000_000_000 {
+                return Err(Errno::EINVAL);
+            }
+            rustix::fs::Timespec {
+                tv_sec: sec,
+                tv_nsec: nsec.into(),
+            }
+        }
+    })
 }
 
 /// The blocking half of `SETATTR`.
@@ -378,11 +498,22 @@ fn timespec(t: TimeSet) -> rustix::fs::Timespec {
 /// 3. **size**, which is the only step needing write access;
 /// 4. **times** last, so an explicit timestamp beats the implicit `mtime`
 ///    bump a truncate just caused.
+///
+/// The one thing that happens out of order is validating the timestamps, which
+/// runs before the first mutation: `SETATTR` is not atomic, so a request that
+/// is going to be refused should be refused before it has half-applied.
 fn apply_setattr(
     fd: &OwnedFd,
     write_fd: Option<&OwnedFd>,
     args: &SetattrArgs,
 ) -> Result<(), Errno> {
+    let times = match (args.atime, args.mtime) {
+        (TimeSet::Omit, TimeSet::Omit) => None,
+        (atime, mtime) => Some(rustix::fs::Timestamps {
+            last_access: timespec(atime)?,
+            last_modification: timespec(mtime)?,
+        }),
+    };
     if args.uid.is_some() || args.gid.is_some() {
         rustix::fs::chownat(
             fd,
@@ -412,11 +543,7 @@ fn apply_setattr(
             }
         }
     }
-    if !matches!((args.atime, args.mtime), (TimeSet::Omit, TimeSet::Omit)) {
-        let times = rustix::fs::Timestamps {
-            last_access: timespec(args.atime),
-            last_modification: timespec(args.mtime),
-        };
+    if let Some(times) = times {
         // `futimens` rejects an O_PATH descriptor and `AT_EMPTY_PATH` is a
         // recent addition to `utimensat`; the /proc path works everywhere and
         // still lands on the symlink itself for a symlink node.
@@ -459,8 +586,15 @@ impl FileSystem for LocalFs {
         let fd = self.node_fd(node)?;
         // A truncate against an open handle must use that handle's descriptor:
         // the file may have been unlinked, or opened with rights the node's
-        // O_PATH reopen would not get back. Empty until Task 10 fills `files`.
-        let write_fd = args.fh.and_then(|fh| self.files.get(fh));
+        // O_PATH reopen would not get back. An `fh` that does not belong to
+        // `node` is refused rather than ignored - silently falling back to the
+        // node's own descriptor would truncate the right file for the wrong
+        // reason, and hide the client's bug until it aims at a file it cannot
+        // otherwise reach.
+        let write_fd = match args.fh {
+            Some(fh) => Some(self.file_fd(node, fh)?),
+            None => None,
+        };
         let owned = Arc::clone(&fd);
         tokio::task::spawn_blocking(move || apply_setattr(&owned, write_fd.as_deref(), &args))
             .await
@@ -567,75 +701,247 @@ impl FileSystem for LocalFs {
         self.lookup_impl(&newparent_fd, &newname).await
     }
 
-    // --- Task 10: file I/O -------------------------------------------------
+    // --- File I/O ----------------------------------------------------------
 
-    async fn open(&self, _node: NodeId, _flags: u32) -> FsResult<Fh> {
-        Err(Errno::ENOSYS) // Task 10
+    async fn open(&self, node: NodeId, flags: u32) -> FsResult<Fh> {
+        let fd = self.node_fd(node)?;
+        let flags = self.mask_open_flags(flags);
+        // `reopen` is a blocking `open(2)`. On a regular file that is a fast
+        // path, but a node can be a FIFO, where an open without O_NONBLOCK
+        // waits for a peer - unbounded, on a runtime worker.
+        let opened = tokio::task::spawn_blocking(move || {
+            // Lossless: every bit `mask_open_flags` can return is one rustix
+            // knows, so nothing is silently dropped here.
+            reopen(&fd, rustix::fs::OFlags::from_bits_truncate(flags as u32))
+        })
+        .await
+        .map_err(join_errno)?
+        .map_err(errno)?;
+        Ok(self.files.insert(FileHandle {
+            node,
+            fd: Arc::new(opened),
+        }))
     }
 
     async fn create(
         &self,
-        _parent: NodeId,
-        _name: &[u8],
-        _mode: u32,
-        _flags: u32,
+        parent: NodeId,
+        name: &[u8],
+        mode: u32,
+        flags: u32,
     ) -> FsResult<(Entry, Fh)> {
-        Err(Errno::ENOSYS) // Task 10
+        let name = valid_name(name)?;
+        let parent_fd = self.node_fd(parent)?;
+        // O_CREAT is ours to add; O_EXCL and O_TRUNC are the client's to ask
+        // for and are the two creation flags that mean something here - drop
+        // O_EXCL and an exclusive create silently opens somebody else's file.
+        // O_NOFOLLOW because the client's own kernel resolved the path: it only
+        // asks to create a name it believes is negative, so a symlink in that
+        // position is a race, and failing it is better than writing through it.
+        let creation =
+            libc::O_CREAT | libc::O_NOFOLLOW | ((flags as i32) & (libc::O_EXCL | libc::O_TRUNC));
+        let how = io_uring::types::OpenHow::new()
+            .flags((self.mask_open_flags(flags) | creation) as u64)
+            .mode(u64::from(mode & 0o7777))
+            .resolve(libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS);
+        let data = Arc::new(
+            self.uring
+                .openat2(&parent_fd, name.clone(), how)
+                .await
+                .map_err(errno)?,
+        );
+        // Through `lookup_impl`, so `CREATE` inherits the loop guard and the
+        // single `register` that pairs this entry with exactly one FORGET. The
+        // cost is that the node is resolved by name a second time, so a rename
+        // racing between the two steps yields an entry for a different file
+        // than the handle - the same window `libfuse`'s passthrough has, and
+        // one RESOLVE_BENEATH still confines to the export.
+        let entry = self.lookup_impl(&parent_fd, &name).await?;
+        let fh = self.files.insert(FileHandle {
+            node: entry.node,
+            fd: data,
+        });
+        Ok((entry, fh))
     }
 
-    async fn read(&self, _node: NodeId, _fh: Fh, _offset: u64, _size: u32) -> FsResult<PooledBuf> {
-        Err(Errno::ENOSYS) // Task 10
+    async fn read(&self, node: NodeId, fh: Fh, offset: u64, size: u32) -> FsResult<PooledBuf> {
+        let fd = self.file_fd(node, fh)?;
+        let buf = self.pool.get();
+        // Pool buffers are sized to the negotiated max_io_size, so an
+        // over-large ask is clamped rather than allocated for. The executor
+        // asserts on a length past capacity, which would be a panic on the
+        // ring thread.
+        let cap = u32::try_from(buf.capacity()).unwrap_or(u32::MAX);
+        let (buf, res) = self.uring.read(&fd, offset, buf, size.min(cap)).await;
+        match res {
+            // A short read at EOF is not an error, and the executor has already
+            // published the transferred count as the buffer's length - the
+            // recycled tail beyond it is not readable.
+            Ok(_) => Ok(buf),
+            Err(e) => Err(errno(e)),
+        }
     }
 
     async fn write(
         &self,
-        _node: NodeId,
-        _fh: Fh,
-        _offset: u64,
-        _data: PooledBuf,
-        _len: u32,
+        node: NodeId,
+        fh: Fh,
+        offset: u64,
+        data: PooledBuf,
+        len: u32,
     ) -> FsResult<u32> {
-        Err(Errno::ENOSYS) // Task 10
+        let fd = self.file_fd(node, fh)?;
+        // `len` is the caller's claim about how much of `data` is real; the
+        // buffer's capacity is the only bound this layer can enforce.
+        let len = len.min(u32::try_from(data.capacity()).unwrap_or(u32::MAX));
+        let mut buf = data;
+        let mut written = 0u32;
+        while written < len {
+            let remaining = len - written;
+            // Saturating because the alternative is a debug-build panic on a
+            // client-supplied number: an offset that far out fails in the
+            // kernel either way, and a panic here would take the connection.
+            let at = offset.saturating_add(u64::from(written));
+            let (mut returned, res) = self.uring.write(&fd, at, buf, remaining).await;
+            let n = match res {
+                Ok(n) => n,
+                // POSIX write semantics: bytes already on the file happened, so
+                // report them. The client retries the tail and gets the real
+                // errno then.
+                Err(_) if written > 0 => return Ok(written),
+                Err(e) => return Err(errno(e)),
+            };
+            written += n;
+            if n == 0 {
+                // No progress and no error. Nothing here can make the next
+                // attempt differ, so stop rather than spin.
+                break;
+            }
+            if written < len {
+                slide_unwritten(&mut returned, n as usize, remaining as usize);
+            }
+            buf = returned;
+        }
+        Ok(written)
     }
 
-    async fn flush(&self, _node: NodeId, _fh: Fh) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 10
+    async fn flush(&self, node: NodeId, fh: Fh) -> FsResult<()> {
+        // Nothing is buffered server-side - a WRITE reply already means the
+        // bytes reached the page cache - so FLUSH only has to answer for the
+        // handle. Durability is FSYNC's job, and stays FSYNC's job even when a
+        // client closes a file it never synced.
+        self.file_fd(node, fh)?;
+        Ok(())
     }
 
-    async fn release(&self, _node: NodeId, _fh: Fh) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 10
+    async fn release(&self, node: NodeId, fh: Fh) -> FsResult<()> {
+        match self.files.get(fh) {
+            Some(handle) if handle.node != node => return Err(EBADF),
+            // A RELEASE whose reply was lost gets retried; the second one has
+            // nothing to close and is not an error.
+            None => return Ok(()),
+            Some(_) => {}
+        }
+        if let Some(handle) = self.files.remove(fh) {
+            // The last `close(2)` on an unlinked file frees its blocks inline -
+            // journal work on ext4, tens of milliseconds for a large file - so
+            // it does not run on a runtime worker. In-flight ring operations
+            // hold their own reference, so this closes when they are done, not
+            // under them.
+            tokio::task::spawn_blocking(move || drop(handle))
+                .await
+                .map_err(join_errno)?;
+        }
+        Ok(())
     }
 
-    async fn fsync(&self, _node: NodeId, _fh: Fh, _datasync: bool) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 10
+    async fn fsync(&self, node: NodeId, fh: Fh, datasync: bool) -> FsResult<()> {
+        let fd = self.file_fd(node, fh)?;
+        self.maybe_fsync(&fd, datasync).await
     }
 
     async fn fallocate(
         &self,
-        _node: NodeId,
-        _fh: Fh,
-        _offset: u64,
-        _length: u64,
-        _mode: u32,
+        node: NodeId,
+        fh: Fh,
+        offset: u64,
+        length: u64,
+        mode: u32,
     ) -> FsResult<()> {
-        Err(Errno::ENOSYS) // Task 10
+        let fd = self.file_fd(node, fh)?;
+        // `mode` (FALLOC_FL_KEEP_SIZE, PUNCH_HOLE, ...) goes to the kernel as
+        // it arrived: it validates the combinations, and a filesystem that does
+        // not support one answers EOPNOTSUPP, which is the client's answer too.
+        self.uring
+            .fallocate(&fd, mode as i32, offset, length)
+            .await
+            .map_err(errno)
     }
 
-    async fn lseek(&self, _node: NodeId, _fh: Fh, _offset: u64, _whence: u32) -> FsResult<u64> {
-        Err(Errno::ENOSYS) // Task 10
+    async fn lseek(&self, node: NodeId, fh: Fh, offset: u64, whence: u32) -> FsResult<u64> {
+        let fd = self.file_fd(node, fh)?;
+        // The wire carries the offset unsigned; for the whences that take a
+        // relative displacement it is an `off_t` that was cast, so cast it back
+        // rather than rejecting the top half of the range.
+        let pos = match whence as i32 {
+            libc::SEEK_SET => rustix::fs::SeekFrom::Start(offset),
+            libc::SEEK_CUR => rustix::fs::SeekFrom::Current(offset as i64),
+            libc::SEEK_END => rustix::fs::SeekFrom::End(offset as i64),
+            libc::SEEK_DATA => rustix::fs::SeekFrom::Data(offset),
+            libc::SEEK_HOLE => rustix::fs::SeekFrom::Hole(offset),
+            _ => return Err(Errno::EINVAL),
+        };
+        // No io_uring opcode for lseek (spec §5.3). Each handle owns its own
+        // open file description, so moving this one's offset cannot disturb
+        // another client's reads.
+        tokio::task::spawn_blocking(move || rustix::fs::seek(&*fd, pos).map_err(rustix_errno))
+            .await
+            .map_err(join_errno)?
     }
 
     async fn copy_file_range(
         &self,
-        _node_in: NodeId,
-        _fh_in: Fh,
-        _off_in: u64,
-        _node_out: NodeId,
-        _fh_out: Fh,
-        _off_out: u64,
-        _len: u64,
+        node_in: NodeId,
+        fh_in: Fh,
+        off_in: u64,
+        node_out: NodeId,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
     ) -> FsResult<u64> {
-        Err(Errno::ENOSYS) // Task 10
+        let fd_in = self.file_fd(node_in, fh_in)?;
+        let fd_out = self.file_fd(node_out, fh_out)?;
+        // No io_uring opcode either, and this is the op most worth having: the
+        // bytes never leave the server, so a reflink-capable filesystem can
+        // make the whole copy metadata.
+        tokio::task::spawn_blocking(move || {
+            let (mut off_in, mut off_out) = (off_in, off_out);
+            let mut copied = 0u64;
+            while copied < len {
+                // A single call is capped so the length is a `usize` on any
+                // target and the kernel's own clamp never surprises us.
+                let want = (len - copied).min(1 << 30) as usize;
+                match rustix::fs::copy_file_range(
+                    &*fd_in,
+                    Some(&mut off_in),
+                    &*fd_out,
+                    Some(&mut off_out),
+                    want,
+                ) {
+                    // Source EOF. The short count is the answer, not an error.
+                    Ok(0) => break,
+                    Ok(n) => copied += n as u64,
+                    Err(rustix::io::Errno::INTR) => continue,
+                    // Same rule as `write`: progress already made is reported,
+                    // and the client learns the errno when it retries the tail.
+                    Err(_) if copied > 0 => break,
+                    Err(e) => return Err(rustix_errno(e)),
+                }
+            }
+            Ok(copied)
+        })
+        .await
+        .map_err(join_errno)?
     }
 
     // --- Task 11: directories, statfs, xattrs ------------------------------
@@ -913,11 +1219,469 @@ mod tests {
         );
     }
 
+    // --- Task 10: file I/O -------------------------------------------------
+
+    /// The process umask, read rather than probed by setting it: `umask(2)` is
+    /// process-wide and these tests run as parallel threads of one process, so
+    /// a set-and-restore probe would corrupt whatever the neighbours are doing.
+    /// The server clears its own umask at startup (Task 12); a test process
+    /// keeps whatever it inherited, so an expected mode has to be masked.
+    fn process_umask() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let field = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Umask:"))
+            .expect("/proc/self/status reports Umask");
+        u32::from_str_radix(field.trim(), 8).unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_write_read_release() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (entry, fh) = fs
+            .create(ROOT_NODE, b"f", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..5].copy_from_slice(b"hello");
+        assert_eq!(fs.write(entry.node, fh, 0, buf, 5).await.unwrap(), 5);
+
+        let out = fs.read(entry.node, fh, 1, 3).await.unwrap();
+        assert_eq!(out.as_slice(), b"ell");
+
+        // Short read at EOF, not an error.
+        let out = fs.read(entry.node, fh, 3, 100).await.unwrap();
+        assert_eq!(out.as_slice(), b"lo");
+
+        fs.flush(entry.node, fh).await.unwrap();
+        fs.fsync(entry.node, fh, true).await.unwrap();
+        fs.release(entry.node, fh).await.unwrap();
+        assert_eq!(fs.read(entry.node, fh, 0, 1).await.err(), Some(EBADF));
+    }
+
+    /// `CREATE` owes the client exactly one `FORGET` for the entry it returns,
+    /// which only holds while it registers through `lookup_impl`.
+    #[tokio::test]
+    async fn create_registers_exactly_one_lookup_count() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (entry, fh) = fs
+            .create(ROOT_NODE, b"f", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        assert!(fs.getattr(entry.node, None).await.is_ok());
+        fs.forget(entry.node, 1).await;
+        assert_eq!(
+            fs.getattr(entry.node, None).await.unwrap_err(),
+            Errno::ESTALE
+        );
+        // The handle outlives the node, which is safe only because node ids are
+        // never reused: the handle's own descriptor keeps the file open, and
+        // the id it remembers can never come to mean a different file.
+        assert!(fs.read(entry.node, fh, 0, 1).await.is_ok());
+        fs.release(entry.node, fh).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_applies_the_mode_through_the_process_umask() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (entry, _fh) = fs
+            .create(ROOT_NODE, b"f", 0o666, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        assert_eq!(entry.attr.mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(entry.attr.mode & 0o7777, 0o666 & !process_umask());
+    }
+
+    /// The two creation flags that do mean something on `CREATE` are the
+    /// client's to set. Dropping `O_EXCL` would turn an exclusive create into
+    /// an ordinary open of a file somebody else owns — the failure mode every
+    /// lock file rests on not happening.
+    #[tokio::test]
+    async fn create_honors_o_excl_o_trunc_and_refuses_a_symlink() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"hello").unwrap();
+
+        assert_eq!(
+            fs.create(ROOT_NODE, b"f", 0o644, (libc::O_RDWR | libc::O_EXCL) as u32)
+                .await
+                .unwrap_err(),
+            Errno::EEXIST
+        );
+
+        // Without O_TRUNC the contents survive; with it they do not.
+        let (e, _) = fs
+            .create(ROOT_NODE, b"f", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        assert_eq!(e.attr.size, 5);
+        let (e, _) = fs
+            .create(
+                ROOT_NODE,
+                b"f",
+                0o644,
+                (libc::O_RDWR | libc::O_TRUNC) as u32,
+            )
+            .await
+            .unwrap();
+        assert_eq!(e.attr.size, 0);
+
+        // A name that turned into a symlink between the client's lookup and
+        // this create is a race, and O_NOFOLLOW makes it fail rather than
+        // write through the link.
+        std::os::unix::fs::symlink("target", dir.path().join("l")).unwrap();
+        assert_eq!(
+            fs.create(ROOT_NODE, b"l", 0o644, libc::O_RDWR as u32)
+                .await
+                .unwrap_err(),
+            ELOOP
+        );
+    }
+
+    /// `CREATE` is the only op that may create; `OPEN` never does, and never
+    /// truncates either — FUSE sends `SETATTR` for that.
+    #[tokio::test]
+    async fn open_strips_creation_and_direct_flags() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"hello").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+
+        let fh = fs
+            .open(
+                e.node,
+                (libc::O_WRONLY | libc::O_TRUNC | libc::O_CREAT | libc::O_DIRECT) as u32,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.getattr(e.node, Some(fh)).await.unwrap().size,
+            5,
+            "O_TRUNC from OPEN must not truncate"
+        );
+        let flags = fs.file_flags_for_test(fh);
+        assert_eq!(flags & libc::O_DIRECT, 0, "O_DIRECT is not supported in v1");
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_WRONLY);
+
+        // A missing name still cannot be conjured: OPEN takes a node, and an
+        // unknown one is ESTALE rather than a fresh file.
+        assert_eq!(
+            fs.open(9999, libc::O_CREAT as u32).await.unwrap_err(),
+            Errno::ESTALE
+        );
+    }
+
+    #[tokio::test]
+    async fn fsync_ignore_masks_osync_open_flags() {
+        let (dir, fs) = test_fs(FsyncPolicy::Ignore).await;
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        let fh = fs
+            .open(e.node, (libc::O_WRONLY | libc::O_SYNC) as u32)
+            .await
+            .unwrap();
+        let real = fs.file_flags_for_test(fh); // fcntl(F_GETFL) on the stored fd
+        assert_eq!(
+            real & libc::O_SYNC,
+            0,
+            "O_SYNC must be masked under fsync=ignore"
+        );
+        fs.fsync(e.node, fh, false).await.unwrap(); // acked without touching disk
+    }
+
+    /// The counterpart: `honor` is the default and must leave a sync-opened
+    /// file sync.
+    #[tokio::test]
+    async fn fsync_honor_keeps_osync_open_flags() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        let fh = fs
+            .open(e.node, (libc::O_WRONLY | libc::O_SYNC) as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.file_flags_for_test(fh) & libc::O_SYNC,
+            libc::O_SYNC,
+            "fsync=honor must keep the client's O_SYNC"
+        );
+        fs.fsync(e.node, fh, false).await.unwrap();
+    }
+
+    /// Whether `honor` really reaches the kernel is otherwise invisible from
+    /// userspace — a successful `fsync` and a skipped one look identical. A
+    /// FIFO is the witness: it is the file type that answers `fsync` with
+    /// `EINVAL`, so the two policies give visibly different answers on it.
+    #[tokio::test]
+    async fn the_fsync_policy_decides_whether_the_syscall_happens() {
+        for (policy, expected) in [
+            (FsyncPolicy::Honor, Err(Errno(libc::EINVAL as u16))),
+            (FsyncPolicy::Ignore, Ok(())),
+        ] {
+            let (dir, fs) = test_fs(policy).await;
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                dir.path().join("p"),
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                0,
+            )
+            .unwrap();
+            let e = fs.lookup(ROOT_NODE, b"p").await.unwrap();
+            // O_NONBLOCK, or opening the read end waits for a writer.
+            let fh = fs
+                .open(e.node, (libc::O_RDONLY | libc::O_NONBLOCK) as u32)
+                .await
+                .unwrap();
+            assert_eq!(fs.fsync(e.node, fh, false).await, expected, "{policy:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lseek_finds_data_and_holes() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (e, fh) = fs
+            .create(ROOT_NODE, b"sparse", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..1].copy_from_slice(b"x");
+        fs.write(e.node, fh, 1 << 20, buf, 1).await.unwrap(); // data at 1 MiB
+        let data_at = fs
+            .lseek(e.node, fh, 0, libc::SEEK_DATA as u32)
+            .await
+            .unwrap();
+        assert!(data_at >= 4096, "leading hole expected, got {data_at}");
+
+        assert_eq!(
+            fs.lseek(e.node, fh, 0, libc::SEEK_END as u32)
+                .await
+                .unwrap(),
+            (1 << 20) + 1
+        );
+        assert_eq!(
+            fs.lseek(e.node, fh, 0, 999).await.unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_file_range_copies_server_side() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (a, fha) = fs
+            .create(ROOT_NODE, b"a", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..4].copy_from_slice(b"data");
+        fs.write(a.node, fha, 0, buf, 4).await.unwrap();
+        let (b, fhb) = fs
+            .create(ROOT_NODE, b"b", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        let n = fs
+            .copy_file_range(a.node, fha, 0, b.node, fhb, 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(n, 4);
+        let out = fs.read(b.node, fhb, 0, 4).await.unwrap();
+        assert_eq!(out.as_slice(), b"data");
+    }
+
+    #[tokio::test]
+    async fn fallocate_extends_the_file() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (e, fh) = fs
+            .create(ROOT_NODE, b"f", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        fs.fallocate(e.node, fh, 0, 4096, 0).await.unwrap();
+        assert_eq!(fs.getattr(e.node, Some(fh)).await.unwrap().size, 4096);
+    }
+
+    /// A read larger than one pooled buffer is clamped, not allocated for and
+    /// not passed to the ring — the executor asserts on an over-long read.
+    #[tokio::test]
+    async fn read_clamps_the_request_to_the_pool_buffer() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (e, fh) = fs
+            .create(ROOT_NODE, b"f", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..2].copy_from_slice(b"hi");
+        fs.write(e.node, fh, 0, buf, 2).await.unwrap();
+        let out = fs.read(e.node, fh, 0, u32::MAX).await.unwrap();
+        assert_eq!(out.as_slice(), b"hi");
+    }
+
+    /// A handle is only usable against the node it was opened on. Nothing stops
+    /// a client sending any `Fh` with any `NodeId`, and every op here is
+    /// descriptor-relative, so without the pairing check a handle onto one file
+    /// would read, truncate, and `copy_file_range` into another.
+    #[tokio::test]
+    async fn a_handle_is_bound_to_the_node_it_was_opened_on() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (a, fha) = fs
+            .create(ROOT_NODE, b"a", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        let (b, fhb) = fs
+            .create(ROOT_NODE, b"b", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        assert_ne!(a.node, b.node);
+
+        assert_eq!(fs.read(b.node, fha, 0, 1).await.err(), Some(EBADF));
+        let buf = fs.pool_for_test().get();
+        assert_eq!(fs.write(b.node, fha, 0, buf, 1).await.unwrap_err(), EBADF);
+        assert_eq!(fs.flush(b.node, fha).await.unwrap_err(), EBADF);
+        assert_eq!(fs.fsync(b.node, fha, false).await.unwrap_err(), EBADF);
+        assert_eq!(fs.fallocate(b.node, fha, 0, 1, 0).await.unwrap_err(), EBADF);
+        assert_eq!(fs.lseek(b.node, fha, 0, 0).await.unwrap_err(), EBADF);
+        assert_eq!(
+            fs.copy_file_range(b.node, fha, 0, b.node, fhb, 0, 1)
+                .await
+                .unwrap_err(),
+            EBADF
+        );
+        assert_eq!(fs.release(b.node, fha).await.unwrap_err(), EBADF);
+        // Rejected, not consumed: the handle still works on its own node.
+        fs.release(a.node, fha).await.unwrap();
+        // Releasing twice is not an error - a client that retried a RELEASE
+        // whose reply it lost must not see a failure.
+        fs.release(a.node, fha).await.unwrap();
+    }
+
+    /// `SETATTR` takes an `fh` too, and a truncate through it writes to
+    /// whatever descriptor it names.
+    #[tokio::test]
+    async fn setattr_rejects_a_handle_from_another_node() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (a, fha) = fs
+            .create(ROOT_NODE, b"a", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        let (b, _fhb) = fs
+            .create(ROOT_NODE, b"b", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..4].copy_from_slice(b"keep");
+        fs.write(a.node, fha, 0, buf, 4).await.unwrap();
+
+        let truncate = |fh| SetattrArgs {
+            mode: None,
+            uid: None,
+            gid: None,
+            size: Some(0),
+            atime: TimeSet::Omit,
+            mtime: TimeSet::Omit,
+            fh,
+        };
+        assert_eq!(
+            fs.setattr(b.node, truncate(Some(fha))).await.unwrap_err(),
+            EBADF
+        );
+        assert_eq!(
+            fs.setattr(b.node, truncate(Some(9999))).await.unwrap_err(),
+            EBADF
+        );
+        assert_eq!(fs.getattr(a.node, None).await.unwrap().size, 4);
+        // The matching pair still truncates through the open handle.
+        fs.setattr(a.node, truncate(Some(fha))).await.unwrap();
+        assert_eq!(fs.getattr(a.node, None).await.unwrap().size, 0);
+    }
+
+    /// `UTIME_NOW` and `UTIME_OMIT` are themselves nanosecond values, just
+    /// under 2^30. An `nsec` off the wire landing on one of them is the case
+    /// that matters: `utimensat` would accept it and quietly do something other
+    /// than what the client asked, where an ordinary out-of-range value is
+    /// merely refused twice.
+    #[tokio::test]
+    async fn setattr_rejects_an_out_of_range_nsec() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        let stamp = |sec, nsec| SetattrArgs {
+            mode: None,
+            uid: None,
+            gid: None,
+            size: None,
+            atime: TimeSet::Omit,
+            mtime: TimeSet::Set { sec, nsec },
+            fh: None,
+        };
+        // A known-good timestamp first, so "nothing was applied" below is a
+        // statement about this call rather than about the file's history.
+        fs.setattr(e.node, stamp(1000, 0)).await.unwrap();
+
+        for sentinel in [
+            rustix::fs::UTIME_NOW as u32,
+            rustix::fs::UTIME_OMIT as u32,
+            1_000_000_000,
+        ] {
+            assert_eq!(
+                fs.setattr(e.node, stamp(1, sentinel)).await.unwrap_err(),
+                Errno::EINVAL,
+                "nsec {sentinel} must be refused"
+            );
+            assert_eq!(
+                fs.getattr(e.node, None).await.unwrap().mtime_sec,
+                1000,
+                "a refused SETATTR must not have stamped anything"
+            );
+        }
+    }
+
+    /// The one piece of `write`'s short-write loop that arithmetic can get
+    /// wrong. A real short write to a regular file needs a full disk or a
+    /// signal to provoke, so pin the slide directly instead.
+    #[test]
+    fn a_short_write_slides_its_unwritten_tail_to_the_front() {
+        let pool = BufferPool::new(16, 1);
+        let mut buf = pool.get();
+        buf.as_mut_slice()[..6].copy_from_slice(b"abcdef");
+
+        slide_unwritten(&mut buf, 2, 6); // "ab" went out, 4 left
+        assert_eq!(&buf.as_mut_ref_for_test()[..4], b"cdef");
+        slide_unwritten(&mut buf, 1, 4); // "c" went out, 3 left
+        assert_eq!(&buf.as_mut_ref_for_test()[..3], b"def");
+        slide_unwritten(&mut buf, 3, 3); // all of it, nothing to move
+        assert_eq!(&buf.as_mut_ref_for_test()[..3], b"def");
+    }
+
+    /// [`into_owned`]'s fallback: the ring thread sends its completion before
+    /// dropping its own clone, so a caller can find the refcount still at two.
+    /// The duplicate must name the same file.
+    #[test]
+    fn into_owned_duplicates_a_still_shared_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let fd = Arc::new(
+            rustix::fs::open(
+                dir.path().join("f"),
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap(),
+        );
+        let still_shared = Arc::clone(&fd);
+        let owned = into_owned(fd).unwrap();
+
+        assert_ne!(
+            owned.as_raw_fd(),
+            still_shared.as_raw_fd(),
+            "the shared case must dup, not steal"
+        );
+        let a = rustix::fs::fstat(&owned).unwrap();
+        let b = rustix::fs::fstat(&*still_shared).unwrap();
+        assert_eq!((a.st_dev, a.st_ino), (b.st_dev, b.st_ino));
+    }
+
     /// Unimplemented opcodes must say so rather than pretend to succeed.
     #[tokio::test]
     async fn unimplemented_opcodes_report_enosys() {
         let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
-        assert_eq!(fs.open(ROOT_NODE, 0).await.unwrap_err(), Errno::ENOSYS);
         assert_eq!(fs.opendir(ROOT_NODE).await.unwrap_err(), Errno::ENOSYS);
         assert_eq!(fs.statfs(ROOT_NODE).await.unwrap_err(), Errno::ENOSYS);
     }
