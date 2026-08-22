@@ -150,6 +150,10 @@ pub struct LocalFs {
     dirs: HandleTable<Arc<DirHandle>>,
     /// Masks `O_SYNC`/`O_DSYNC` and short-circuits `FSYNC` (spec §6).
     fsync_policy: FsyncPolicy,
+    /// Whether the client mounted with `FUSE_WRITEBACK_CACHE`, which changes
+    /// what an `OPEN` flag means. See [`LocalFs::mask_open_flags`]. Task 12
+    /// feeds it from the negotiated `HELLO`.
+    writeback: bool,
     /// `(dev, ino)` of the export root, kept only for the loop guard in
     /// [`LocalFs::lookup_impl`].
     root_key: FileKey,
@@ -161,9 +165,14 @@ impl LocalFs {
     /// The root `statx` runs synchronously rather than through the ring: this
     /// is attach time, once per connection, and the executor's async path buys
     /// nothing before the connection is even serving.
+    ///
+    /// `writeback` is the client's negotiated `FUSE_WRITEBACK_CACHE` state, not
+    /// a server option: it changes how `OPEN` flags are read, and only the
+    /// client knows whose kernel is computing append offsets.
     pub fn new(
         export_root: &Path,
         fsync: FsyncPolicy,
+        writeback: bool,
         uring: UringExecutor,
         pool: BufferPool,
     ) -> io::Result<LocalFs> {
@@ -186,6 +195,7 @@ impl LocalFs {
             files: HandleTable::new(),
             dirs: HandleTable::new(),
             fsync_policy: fsync,
+            writeback,
             root_key,
         })
     }
@@ -268,6 +278,21 @@ impl LocalFs {
         }
     }
 
+    /// The same check, minus the demand that the handle still exist.
+    ///
+    /// `FLUSH` and `RELEASE` are the two ops that retire a handle rather than
+    /// use it, and both can legitimately arrive for one that is already gone —
+    /// a `RELEASE` whose reply was lost gets retried, and a `FLUSH` can follow
+    /// it. Refusing those would surface `EBADF` from the application's
+    /// `close(2)`. A handle belonging to *another* node is still refused.
+    fn retiring_handle(&self, node: NodeId, fh: Fh) -> FsResult<Option<FileHandle>> {
+        match self.files.get(fh) {
+            Some(handle) if handle.node == node => Ok(Some(handle)),
+            Some(_) => Err(EBADF),
+            None => Ok(None),
+        }
+    }
+
     /// Reduces a client's `open` flags to the ones this server will honor.
     ///
     /// An allowlist, not a denylist. `flags` is a raw `u32` the client copied
@@ -279,8 +304,8 @@ impl LocalFs {
     /// What survives, and why:
     ///
     /// * the access mode, which is the request;
-    /// * `O_APPEND`, `O_NOATIME`, `O_NONBLOCK`, which describe how the client
-    ///   wants its own descriptor to behave and cost the server nothing;
+    /// * `O_APPEND` and `O_NONBLOCK`, which describe how the client wants its
+    ///   own descriptor to behave and cost the server nothing;
     /// * `O_SYNC`/`O_DSYNC`, unless the durability policy is `ignore`, whose
     ///   whole purpose is to not pay for them (spec §6).
     ///
@@ -288,13 +313,35 @@ impl LocalFs {
     /// `O_TRUNC` (FUSE has `CREATE` and `SETATTR` for those, and honoring them
     /// on `OPEN` would let a plain open create or destroy data), `O_NOFOLLOW`
     /// and `O_DIRECTORY` (meaningless — the node is already resolved and
-    /// reopened through `/proc`), and `O_DIRECT`, which v1 does not support:
-    /// pooled buffers carry no alignment guarantee, so every read and write
-    /// against such a descriptor would fail `EINVAL`.
+    /// reopened through `/proc`), `O_DIRECT`, which v1 does not support
+    /// (pooled buffers carry no alignment guarantee, so every read and write
+    /// against such a descriptor would fail `EINVAL`), and `O_NOATIME`, which
+    /// the kernel checks against the *server's* credentials: an unprivileged
+    /// server exporting another user's files would turn a legal client open
+    /// into `EPERM`. libfuse and virtiofsd keep it only because they run
+    /// privileged.
+    ///
+    /// # Writeback caching changes two of these
+    ///
+    /// With `FUSE_WRITEBACK_CACHE` the client's kernel owns the page cache and
+    /// the file size, and the server sees the flushes rather than the writes:
+    ///
+    /// * **`O_APPEND` is cleared.** The client computes append offsets itself
+    ///   and flushes dirty pages at explicit offsets, but a positioned write to
+    ///   an `O_APPEND` descriptor ignores its offset and appends. A page
+    ///   flushed twice would therefore be appended twice. With writeback *off*
+    ///   the opposite holds — server-side `O_APPEND` is what makes an append
+    ///   atomic against a stale client `i_size` — so this cannot be
+    ///   unconditional.
+    /// * **`O_WRONLY` becomes `O_RDWR`.** A partial-page write makes the client
+    ///   read the rest of the page back through the same handle, even for a
+    ///   file the application opened write-only; a write-only descriptor here
+    ///   answers that read with `EBADF`.
+    ///
+    /// Both are what libfuse's `lo_open` and virtiofsd's `open_inode` do.
     fn mask_open_flags(&self, flags: u32) -> i32 {
         const ALLOWED: i32 = libc::O_ACCMODE
             | libc::O_APPEND
-            | libc::O_NOATIME
             | libc::O_NONBLOCK
             // O_SYNC's value already contains O_DSYNC's bit; both are named so
             // the intent survives someone reading only one line.
@@ -304,6 +351,12 @@ impl LocalFs {
         let mut flags = (flags as i32) & ALLOWED;
         if self.fsync_policy == FsyncPolicy::Ignore {
             flags &= !(libc::O_SYNC | libc::O_DSYNC);
+        }
+        if self.writeback {
+            flags &= !libc::O_APPEND;
+            if flags & libc::O_ACCMODE == libc::O_WRONLY {
+                flags = (flags & !libc::O_ACCMODE) | libc::O_RDWR;
+            }
         }
         // Descriptors are the server's, never a child's.
         flags | libc::O_CLOEXEC
@@ -768,9 +821,11 @@ impl FileSystem for LocalFs {
         let fd = self.file_fd(node, fh)?;
         let buf = self.pool.get();
         // Pool buffers are sized to the negotiated max_io_size, so an
-        // over-large ask is clamped rather than allocated for. The executor
-        // asserts on a length past capacity, which would be a panic on the
-        // ring thread.
+        // over-large ask is clamped rather than allocated for. `UringExecutor`
+        // asserts on a length past capacity - in this task, before the request
+        // is ever submitted - so the clamp is what keeps a client's number from
+        // panicking its own request handler. Refusing `size > max_io_size`
+        // outright belongs to dispatch, where spec §3.1 makes it fatal.
         let cap = u32::try_from(buf.capacity()).unwrap_or(u32::MAX);
         let (buf, res) = self.uring.read(&fd, offset, buf, size.min(cap)).await;
         match res {
@@ -791,9 +846,13 @@ impl FileSystem for LocalFs {
         len: u32,
     ) -> FsResult<u32> {
         let fd = self.file_fd(node, fh)?;
-        // `len` is the caller's claim about how much of `data` is real; the
-        // buffer's capacity is the only bound this layer can enforce.
-        let len = len.min(u32::try_from(data.capacity()).unwrap_or(u32::MAX));
+        // Bounded by the buffer's *initialized prefix*, not its capacity.
+        // Pooled storage is recycled without zeroing, so a `len` larger than
+        // what the caller actually put there would write another request's
+        // bytes into a user's file. Dispatch sets the length to the count it
+        // read off the socket; anything past that is structurally unreachable
+        // rather than merely unlikely.
+        let len = len.min(u32::try_from(data.as_slice().len()).unwrap_or(u32::MAX));
         let mut buf = data;
         let mut written = 0u32;
         while written < len {
@@ -830,17 +889,13 @@ impl FileSystem for LocalFs {
         // bytes reached the page cache - so FLUSH only has to answer for the
         // handle. Durability is FSYNC's job, and stays FSYNC's job even when a
         // client closes a file it never synced.
-        self.file_fd(node, fh)?;
+        self.retiring_handle(node, fh)?;
         Ok(())
     }
 
     async fn release(&self, node: NodeId, fh: Fh) -> FsResult<()> {
-        match self.files.get(fh) {
-            Some(handle) if handle.node != node => return Err(EBADF),
-            // A RELEASE whose reply was lost gets retried; the second one has
-            // nothing to close and is not an error.
-            None => return Ok(()),
-            Some(_) => {}
+        if self.retiring_handle(node, fh)?.is_none() {
+            return Ok(());
         }
         if let Some(handle) = self.files.remove(fh) {
             // The last `close(2)` on an unlinked file frees its blocks inline -
@@ -1005,12 +1060,22 @@ impl FileSystem for LocalFs {
     }
 }
 
+/// A `LocalFs` over a fresh tempdir, with the writeback state a client that
+/// never negotiated the cache would produce.
 #[cfg(test)]
 pub(crate) async fn test_fs(policy: crate::config::FsyncPolicy) -> (tempfile::TempDir, LocalFs) {
+    test_fs_writeback(policy, false).await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_fs_writeback(
+    policy: crate::config::FsyncPolicy,
+    writeback: bool,
+) -> (tempfile::TempDir, LocalFs) {
     let dir = tempfile::tempdir().unwrap();
     let uring = uring::UringExecutor::new(1, 64).unwrap();
     let pool = buffers::BufferPool::new(1 << 20, 8);
-    let fs = LocalFs::new(dir.path(), policy, uring, pool).unwrap();
+    let fs = LocalFs::new(dir.path(), policy, writeback, uring, pool).unwrap();
     (dir, fs)
 }
 
@@ -1245,6 +1310,9 @@ mod tests {
 
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..5].copy_from_slice(b"hello");
+        // The length is the contract: `write` will not send bytes past it, so a
+        // caller that fills the buffer owes the count.
+        buf.set_len(5);
         assert_eq!(fs.write(entry.node, fh, 0, buf, 5).await.unwrap(), 5);
 
         let out = fs.read(entry.node, fh, 1, 3).await.unwrap();
@@ -1258,6 +1326,30 @@ mod tests {
         fs.fsync(entry.node, fh, true).await.unwrap();
         fs.release(entry.node, fh).await.unwrap();
         assert_eq!(fs.read(entry.node, fh, 0, 1).await.err(), Some(EBADF));
+        // A FLUSH can still arrive for a handle already retired - a RELEASE
+        // whose reply was lost gets retried, and refusing the FLUSH would
+        // surface EBADF from the application's close(2).
+        fs.flush(entry.node, fh).await.unwrap();
+    }
+
+    /// Pooled storage is recycled without zeroing, so the buffer's length is
+    /// the boundary between the client's bytes and the last request's. A `len`
+    /// larger than that must not reach the file.
+    #[tokio::test]
+    async fn write_never_sends_bytes_past_the_initialized_prefix() {
+        let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        let (e, fh) = fs
+            .create(ROOT_NODE, b"f", 0o644, libc::O_RDWR as u32)
+            .await
+            .unwrap();
+
+        let mut buf = fs.pool_for_test().get();
+        buf.as_mut_slice()[..5].copy_from_slice(b"hello");
+        buf.set_len(2); // only "he" is the caller's
+        assert_eq!(fs.write(e.node, fh, 0, buf, 5).await.unwrap(), 2);
+        assert_eq!(fs.getattr(e.node, None).await.unwrap().size, 2);
+        let out = fs.read(e.node, fh, 0, 5).await.unwrap();
+        assert_eq!(out.as_slice(), b"he");
     }
 
     /// `CREATE` owes the client exactly one `FORGET` for the entry it returns,
@@ -1349,7 +1441,8 @@ mod tests {
         let fh = fs
             .open(
                 e.node,
-                (libc::O_WRONLY | libc::O_TRUNC | libc::O_CREAT | libc::O_DIRECT) as u32,
+                (libc::O_WRONLY | libc::O_TRUNC | libc::O_CREAT | libc::O_DIRECT | libc::O_NOATIME)
+                    as u32,
             )
             .await
             .unwrap();
@@ -1360,6 +1453,11 @@ mod tests {
         );
         let flags = fs.file_flags_for_test(fh);
         assert_eq!(flags & libc::O_DIRECT, 0, "O_DIRECT is not supported in v1");
+        assert_eq!(
+            flags & libc::O_NOATIME,
+            0,
+            "O_NOATIME is checked against the server's credentials, not the client's"
+        );
         assert_eq!(flags & libc::O_ACCMODE, libc::O_WRONLY);
 
         // A missing name still cannot be conjured: OPEN takes a node, and an
@@ -1368,6 +1466,57 @@ mod tests {
             fs.open(9999, libc::O_CREAT as u32).await.unwrap_err(),
             Errno::ESTALE
         );
+    }
+
+    /// With `FUSE_WRITEBACK_CACHE` — the v1 client's default — the client's
+    /// kernel owns the file size and flushes dirty pages at explicit offsets.
+    /// A positioned write to an `O_APPEND` descriptor ignores its offset and
+    /// appends, so a page flushed twice would land twice; and a partial-page
+    /// write makes the client read the rest of the page back through a handle
+    /// the application opened write-only.
+    #[tokio::test]
+    async fn writeback_clears_o_append_and_promotes_o_wronly() {
+        let (dir, fs) = test_fs_writeback(FsyncPolicy::Honor, true).await;
+        std::fs::write(dir.path().join("f"), b"hello").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        let fh = fs
+            .open(e.node, (libc::O_WRONLY | libc::O_APPEND) as u32)
+            .await
+            .unwrap();
+
+        let flags = fs.file_flags_for_test(fh);
+        assert_eq!(
+            flags & libc::O_APPEND,
+            0,
+            "a positioned write to an O_APPEND fd would ignore the offset"
+        );
+        assert_eq!(
+            flags & libc::O_ACCMODE,
+            libc::O_RDWR,
+            "writeback reads back through the write handle"
+        );
+        // The promotion is not cosmetic: this read is the one a partial-page
+        // writeback issues, and an O_WRONLY descriptor answers it with EBADF.
+        let out = fs.read(e.node, fh, 0, 5).await.unwrap();
+        assert_eq!(out.as_slice(), b"hello");
+    }
+
+    /// Without writeback the opposite holds: server-side `O_APPEND` is what
+    /// makes an append atomic against a client's stale idea of the file size,
+    /// so stripping it unconditionally would be its own corruption.
+    #[tokio::test]
+    async fn without_writeback_o_append_and_the_access_mode_survive() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::write(dir.path().join("f"), b"hello").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        let fh = fs
+            .open(e.node, (libc::O_WRONLY | libc::O_APPEND) as u32)
+            .await
+            .unwrap();
+
+        let flags = fs.file_flags_for_test(fh);
+        assert_eq!(flags & libc::O_APPEND, libc::O_APPEND);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_WRONLY);
     }
 
     #[tokio::test]
@@ -1445,6 +1594,7 @@ mod tests {
             .unwrap();
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..1].copy_from_slice(b"x");
+        buf.set_len(1);
         fs.write(e.node, fh, 1 << 20, buf, 1).await.unwrap(); // data at 1 MiB
         let data_at = fs
             .lseek(e.node, fh, 0, libc::SEEK_DATA as u32)
@@ -1473,6 +1623,7 @@ mod tests {
             .unwrap();
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..4].copy_from_slice(b"data");
+        buf.set_len(4);
         fs.write(a.node, fha, 0, buf, 4).await.unwrap();
         let (b, fhb) = fs
             .create(ROOT_NODE, b"b", 0o644, libc::O_RDWR as u32)
@@ -1498,8 +1649,10 @@ mod tests {
         assert_eq!(fs.getattr(e.node, Some(fh)).await.unwrap().size, 4096);
     }
 
-    /// A read larger than one pooled buffer is clamped, not allocated for and
-    /// not passed to the ring — the executor asserts on an over-long read.
+    /// A read larger than one pooled buffer is clamped, not allocated for.
+    /// Without the clamp `UringExecutor::read`'s length assert fires in this
+    /// task, before any submission, so the failure is a panicked request
+    /// handler rather than anything the ring ever sees.
     #[tokio::test]
     async fn read_clamps_the_request_to_the_pool_buffer() {
         let (_dir, fs) = test_fs(FsyncPolicy::Honor).await;
@@ -1509,6 +1662,7 @@ mod tests {
             .unwrap();
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..2].copy_from_slice(b"hi");
+        buf.set_len(2);
         fs.write(e.node, fh, 0, buf, 2).await.unwrap();
         let out = fs.read(e.node, fh, 0, u32::MAX).await.unwrap();
         assert_eq!(out.as_slice(), b"hi");
@@ -1567,6 +1721,7 @@ mod tests {
             .unwrap();
         let mut buf = fs.pool_for_test().get();
         buf.as_mut_slice()[..4].copy_from_slice(b"keep");
+        buf.set_len(4);
         fs.write(a.node, fha, 0, buf, 4).await.unwrap();
 
         let truncate = |fh| SetattrArgs {
