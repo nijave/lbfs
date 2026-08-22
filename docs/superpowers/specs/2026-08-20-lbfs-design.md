@@ -437,7 +437,25 @@ Future work:
 - OCI layer sourcing on top of the layered backend: the server pulls
   Docker/OCI images and unpacks each image layer into a directory that
   the layered backend then stacks — CI hosts mount an image's filesystem
-  in real time without pulling the image themselves.
+  in real time without pulling the image themselves. Assess SOCI
+  (Seekable OCI, the lazy-loading successor to eStargz) so the server
+  can serve a layer's files on demand from an index instead of unpacking
+  whole layers up front.
+- Feasibility analysis — kernel-module client: a native lbfs kernel
+  driver speaking the wire protocol (the shape of the in-kernel NFS
+  client) instead of FUSE. The NFS comparison prices the userspace
+  round-trip tax at roughly 60 µs per 4k write: kernel NFS answers a
+  complete write in ~111 µs while lbfs's own RPC layer alone costs
+  146 µs. Weigh that win against cheaper routes to part of it (FUSE
+  passthrough, FUSE-over-io_uring via a fuser fork) and against the
+  maintenance cost of a kernel module; the VM harness with swappable
+  kernels exists for exactly this experiment.
+- Server-side kernel integration survey: find the ~54 µs write/read
+  asymmetry in the raw RPC path (4k write 146 µs vs read 92 µs with no
+  FUSE involved), then assess zero-copy sends from page cache to socket
+  (splice/sendfile, MSG_ZEROCOPY), io_uring SQPOLL and provided buffers,
+  and whether an in-kernel serving path (the knfsd shape) pays for
+  itself. Complements the io_uring registered-buffers item below.
 - mTLS (rustls stream wrap) and an authorization `FileSystem` decorator.
 - Performance test rig capturing detailed kernel-level metrics — eBPF
   (bpftrace/BCC) or similar: per-opcode latency histograms, io_uring

@@ -361,6 +361,14 @@ streaming read run confirms it at 30.7%.
 * `lbfs-bench` addresses one file directly under the export root. `LOOKUP`
   refuses a name containing a slash, so a path like `bench/rand.dat` returns
   `EINVAL`.
+* The raw RPC layer carries a write/read asymmetry that no current plan
+  targets: a 4k write costs 146.4 µs against the read's 92.2 µs over the
+  network, and 88.9 against 63.1 over loopback, so roughly 26-54 µs sits in
+  the server's write handling before FUSE enters the picture. The NFS
+  comparison sharpens the point — kernel NFS answers a complete 4k write in
+  ~104-111 µs, less than lbfs's bare RPC write. Spec §11 carries the
+  follow-up analysis items (kernel-module client feasibility, server-side
+  kernel integration survey).
 
 ## Cleanup performed
 
