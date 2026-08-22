@@ -466,6 +466,7 @@ mod tests {
         round_trip(&ReaddirReply {
             entries: vec![DirEntry {
                 name: b"x".to_vec(),
+                ino: 42,
                 kind: FileKind::Regular,
                 offset: 1,
             }],
