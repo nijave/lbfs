@@ -883,12 +883,20 @@ fn ring_thread(ring: IoUring, rx: Receiver<Task>, wake: OwnedFd, max_inflight: u
     match outcome {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            tracing::error!(error = %e, "io_uring lane aborted");
+            tracing::error!(error = %e, "io_uring lane died; aborting the process");
             state.abandon();
+            // A dead ring lane must not leave a live server answering EIO on
+            // every I/O op. Once this thread returns, the task receiver drops
+            // and `UringExecutor::submit` panics on every send for the life of
+            // the process. Abort so the supervisor restarts us.
+            std::process::abort();
         }
         Err(_) => {
-            tracing::error!("io_uring lane panicked");
+            tracing::error!("io_uring lane panicked; aborting the process");
             state.abandon();
+            // Same invariant as the error arm: no ring, no server. Abort rather
+            // than serve EIO forever.
+            std::process::abort();
         }
     }
 }
