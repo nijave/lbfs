@@ -8,3 +8,4 @@
 #![deny(unsafe_code)]
 
 pub mod conn;
+pub mod fuse;

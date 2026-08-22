@@ -23,7 +23,15 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-fuser = "0.15"
+# `abi-7-31` is not a nicety. fuser gates its FUSE features on the ABI level it
+# claims, and every kernel-cache knob spec §7 asks for lives above the 7.8
+# default: `FUSE_DO_READDIRPLUS`/`FUSE_READDIRPLUS_AUTO` are 7.21,
+# `FUSE_WRITEBACK_CACHE` is 7.23, `batch_forget` is 7.16, and `max_pages` (what
+# carries a negotiated `max_write` past 128 KiB) is 7.28. Without the feature
+# those constants and callbacks are not compiled at all. The kernel still
+# negotiates down to whatever it supports, so asking for 7.31 costs nothing on
+# an older one.
+fuser = { version = "0.15", features = ["abi-7-31"] }
 proptest = "1"
 tempfile = "3"
 futures = "0.3"
