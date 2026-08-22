@@ -640,11 +640,24 @@ fn resume_map(entries: &[SnapshotEntry]) -> HashMap<u64, usize> {
 /// that dropped every entry would leave the client nothing to advance to, and
 /// it would either re-send the same offset forever or read the empty page as
 /// the end of a listing that is not over.
-fn unresolved_entry() -> Entry {
+///
+/// The attributes are zeroed except for `ino`, which comes from the `OPENDIR`
+/// snapshot. Zeroing it too would be the one field a client cannot survive:
+/// `d_ino == 0` marks a deleted slot, and glibc's `readdir(3)` drops such a
+/// dirent — so a name preserved here would still vanish at the client's own
+/// libc boundary, undoing the point of reporting it. The snapshot's `d_ino`
+/// is the honest number: it is what `getdents64` said the name pointed at
+/// when the directory was read, and `READDIR` already reports exactly that
+/// for the same name. Nothing else in the zeroed [`FileAttr`] is read,
+/// because node 0 stops the client's kernel before it looks.
+fn unresolved_entry(ino: u64) -> Entry {
     Entry {
         node: 0,
         generation: 0,
-        attr: FileAttr::default(),
+        attr: FileAttr {
+            ino,
+            ..FileAttr::default()
+        },
     }
 }
 
@@ -1399,12 +1412,12 @@ impl FileSystem for LocalFs {
                             // See `unresolved_entry` for why the name still
                             // travels instead of vanishing from the page.
                             tracing::debug!(?err, "readdirplus could not resolve an entry");
-                            unresolved_entry()
+                            unresolved_entry(e.ino)
                         }
                     },
                     // Unreachable: `getdents64` names hold no NUL. Reported
                     // like any other unresolvable name rather than dropped.
-                    Err(_) => unresolved_entry(),
+                    Err(_) => unresolved_entry(e.ino),
                 }
             };
             entries.push(DirEntryPlus {
@@ -2557,28 +2570,45 @@ mod tests {
     /// rather than failing the page — failing would strand every lookup count
     /// already registered into it, and no `FORGET` would arrive to retire
     /// them. Its neighbours resolve normally in the same page.
+    ///
+    /// It still carries the snapshot's inode number. `d_ino == 0` is a
+    /// deleted slot to glibc's `readdir(3)`, which drops the dirent, so a
+    /// zeroed `ino` would make the name disappear at the client's libc after
+    /// all the trouble taken to keep it on the wire.
     #[tokio::test]
     async fn readdirplus_reports_a_vanished_name_beside_its_surviving_neighbours() {
+        use std::os::unix::fs::MetadataExt;
+
         let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
         for name in ["keep", "gone"] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
+        let gone_ino = std::fs::metadata(dir.path().join("gone")).unwrap().ino();
         let dh = fs.opendir(ROOT_NODE).await.unwrap();
         std::fs::remove_file(dir.path().join("gone")).unwrap();
 
         let page = fs.readdirplus(ROOT_NODE, dh, 0, 1 << 16).await.unwrap();
         assert!(page.end);
         assert_eq!(page.entries.len(), 4); // "." ".." keep gone
-        let node_of = |name: &[u8]| {
+        let entry_of = |name: &[u8]| {
             page.entries
                 .iter()
                 .find(|e| e.name == name)
                 .unwrap_or_else(|| panic!("{name:?} is missing from the page"))
                 .entry
-                .node
         };
-        assert!(node_of(b"keep") > ROOT_NODE);
-        assert_eq!(node_of(b"gone"), 0, "a vanished name owes no lookup count");
+        assert!(entry_of(b"keep").node > ROOT_NODE);
+        let gone = entry_of(b"gone");
+        assert_eq!(gone.node, 0, "a vanished name owes no lookup count");
+        assert_eq!(gone.generation, 0);
+        assert_eq!(
+            gone.attr.ino, gone_ino,
+            "the snapshot's d_ino travels, or glibc drops the name"
+        );
+        // Nothing else is populated: node 0 stops the client's kernel before
+        // it reads the attributes.
+        assert_eq!(gone.attr.mode, 0);
+        assert_eq!(gone.attr.size, 0);
         fs.releasedir(ROOT_NODE, dh).await.unwrap();
     }
 
