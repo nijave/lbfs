@@ -19,6 +19,12 @@ tempfile = { workspace = true }
 [dev-dependencies]
 libc = { workspace = true }
 rustix = { workspace = true }
+# The loopback suite mounts the real client over a real server. Both are
+# dev-dependencies rather than dependencies of the harness library: `src/lib.rs`
+# speaks frames and knows nothing about FUSE, and a test target sees a crate's
+# dev-dependencies, so nothing is gained by widening the library's own graph.
+lbfs-client = { workspace = true }
+fuser = { workspace = true }
 
 [lints]
 workspace = true
