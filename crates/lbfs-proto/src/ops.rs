@@ -254,6 +254,14 @@ pub struct WriteRequest {
     pub node: NodeId,
     pub fh: Fh,
     pub offset: u64,
+    /// The kernel's `FUSE_WRITE_KILL_SUIDGID`, forwarded verbatim.
+    ///
+    /// True means the writer holds no `CAP_FSETID`, so the file must lose
+    /// set-user-ID — and set-group-ID too when it carries group-execute —
+    /// before these bytes land. Under `FUSE_HANDLE_KILLPRIV_V2` this is the
+    /// only notice the server gets, because the kernel has stopped doing the
+    /// strip itself.
+    pub kill_suidgid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,5 +506,47 @@ mod tests {
             parent: 1,
             name: vec![0xff, 0xfe, b'/'],
         });
+    }
+
+    #[test]
+    fn write_request_wire_stability_golden() {
+        // Pins the postcard encoding: three u64 varints then a one-byte bool.
+        // A version-1 peer decoding this body stops after the third varint and
+        // drops the flag, which is why PROTOCOL_VERSION moved to 2.
+        let set = WriteRequest {
+            node: 1,
+            fh: 2,
+            offset: 3,
+            kill_suidgid: true,
+        };
+        assert_eq!(postcard::to_allocvec(&set).unwrap(), vec![1, 2, 3, 1]);
+
+        let clear = WriteRequest {
+            node: 1,
+            fh: 2,
+            offset: 3,
+            kill_suidgid: false,
+        };
+        assert_eq!(postcard::to_allocvec(&clear).unwrap(), vec![1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn write_request_round_trips_both_flag_states() {
+        for kill_suidgid in [false, true] {
+            round_trip(&WriteRequest {
+                node: 9,
+                fh: 4,
+                offset: 1 << 40,
+                kill_suidgid,
+            });
+        }
+    }
+
+    #[test]
+    fn protocol_version_is_two() {
+        // Version 1 bodies cannot carry the flag, and postcard ignores
+        // trailing bytes rather than refusing them, so the handshake is the
+        // only place that can catch a half-deployed pair.
+        assert_eq!(crate::frame::PROTOCOL_VERSION, 2);
     }
 }

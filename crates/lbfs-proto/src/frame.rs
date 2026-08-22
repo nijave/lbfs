@@ -1,6 +1,11 @@
 pub const HEADER_LEN: usize = 24;
 pub const MAGIC: [u8; 4] = *b"LBFS";
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version 2 added `WriteRequest.kill_suidgid`. postcard ignores trailing
+/// bytes instead of refusing them, so a version-1 peer would decode a
+/// version-2 `WRITE` body cleanly and drop the flag — losing a set-user-ID
+/// strip in silence. The exact-match handshake is what turns that into a
+/// visible startup failure.
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 9423;
 pub const DEFAULT_MAX_INFLIGHT: u32 = 128;
 pub const WINDOW_CLAMP: (u32, u32) = (8, 1024);
