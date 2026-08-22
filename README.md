@@ -8,6 +8,11 @@ client per export, and no authentication of any kind. Anyone who can reach the
 port and name a path the allowlist covers gets that export, so run the server
 only on a network you trust. mTLS is the next milestone.
 
+Long term, lbfs grows toward a single-writer, multi-reader, volatile overlay
+filesystem for CI and build systems: build hosts attach shared layers in real
+time instead of pulling data down locally before a job runs. The design spec's
+"Fast-Follows and Future Work" section holds the roadmap.
+
 ## Build
 
 The host build needs a stable Rust toolchain, `pkg-config`, and the libfuse3

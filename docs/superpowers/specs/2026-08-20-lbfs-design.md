@@ -410,6 +410,14 @@ Fast-follows (priority order):
    dedicated opcode) so the server honors the sync no matter its policy —
    e.g., before snapshots.
 
+Long-term direction: lbfs grows toward a single-writer, multi-reader,
+volatile overlay filesystem tuned for CI and build systems. Build hosts
+attach layers in real time rather than pulling data down locally before a
+job runs — roughly a three-tier, disaggregated architecture that
+side-steps the high transfer cost of sparsely changed or updated files.
+The layered backend, read-only layer sharing, and OCI layer sourcing
+below are the steps on that path.
+
 Future work:
 
 - Repeatable performance suite under `vm/`: one command that captures the
@@ -426,6 +434,10 @@ Future work:
   another server tries to mount that layer writable, the writable attach
   fails with a conflict error. Needs a coordination design for how
   servers detect the conflict across machines.
+- OCI layer sourcing on top of the layered backend: the server pulls
+  Docker/OCI images and unpacks each image layer into a directory that
+  the layered backend then stacks — CI hosts mount an image's filesystem
+  in real time without pulling the image themselves.
 - mTLS (rustls stream wrap) and an authorization `FileSystem` decorator.
 - Performance test rig capturing detailed kernel-level metrics — eBPF
   (bpftrace/BCC) or similar: per-opcode latency histograms, io_uring
