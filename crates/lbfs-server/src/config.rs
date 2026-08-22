@@ -20,7 +20,17 @@ pub enum FsyncPolicy {
     Ignore,
 }
 
+/// Every key this file may hold, and nothing else.
+///
+/// `deny_unknown_fields` because the alternative is silence. `listen` and
+/// `allowed_paths` are required, so a typo in either already stops the server.
+/// The other three have defaults, and a typo in one of those changes nothing:
+/// the server starts and runs on the default the operator was trying to
+/// override. `fsync_policy = "ignore"` for `fsync = "ignore"` leaves durability
+/// where the operator did not want it, and says so nowhere. A refusal at
+/// startup naming the key is the only outcome an operator can act on.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     listen: String,
     allowed_paths: Vec<String>,
@@ -192,6 +202,36 @@ mod tests {
         .unwrap();
         assert!(matches!(cfg.fsync, FsyncPolicy::Ignore));
         assert_eq!(cfg.max_inflight, 1024); // clamped
+    }
+
+    /// A misspelt key is refused, and the message names it.
+    ///
+    /// `fsync_policy` is the one that matters most: it looks right, it parses
+    /// as TOML, and accepting it would run the export at `Honor` while the
+    /// operator believed they had asked for `Ignore` — or the reverse, which
+    /// is a durability decision made by a typo.
+    #[test]
+    fn an_unknown_key_is_refused_and_named() {
+        let err = Config::from_toml(
+            r#"
+            listen = "0.0.0.0:9423"
+            allowed_paths = ["/a/*"]
+            fsync_policy = "ignore"
+        "#,
+        )
+        .expect_err("a key the server does not know is a refusal, not a default");
+        let msg = err.to_string();
+        assert!(msg.contains("fsync_policy"), "{msg}");
+        // The real key still parses, so the rule rejects the typo and not the
+        // option it was aiming at.
+        assert!(Config::from_toml(
+            r#"
+            listen = "0.0.0.0:9423"
+            allowed_paths = ["/a/*"]
+            fsync = "ignore"
+        "#,
+        )
+        .is_ok());
     }
 
     #[test]
