@@ -1,0 +1,11 @@
+[Unit]
+Description=lbfs server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/lbfs-server --config /etc/lbfs.toml
+Restart=no
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target

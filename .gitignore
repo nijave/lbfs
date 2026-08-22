@@ -1,4 +1,5 @@
 /target
 /vm/images/
-/vm/kernels/
+/vm/kernels/*
+!/vm/kernels/README.md
 *.qcow2

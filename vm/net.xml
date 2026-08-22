@@ -1,0 +1,11 @@
+<network>
+  <name>lbfs-net</name>
+  <forward mode="nat"/>
+  <ip address="192.168.77.1" netmask="255.255.255.0">
+    <dhcp>
+      <range start="192.168.77.10" end="192.168.77.99"/>
+      <host mac="52:54:00:77:00:10" ip="192.168.77.10"/>
+      <host mac="52:54:00:77:00:11" ip="192.168.77.11"/>
+    </dhcp>
+  </ip>
+</network>
