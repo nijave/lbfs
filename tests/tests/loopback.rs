@@ -125,6 +125,27 @@ fn which(prog: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Fail, by name, on a host whose descriptor limit this case would exhaust.
+///
+/// The server runs in this process and holds one `O_PATH` descriptor per node
+/// the kernel has looked up, so a case that stats every name in a large
+/// directory costs a descriptor per name — against a limit the test process
+/// shares with cargo's whole test binary. A box left at the traditional 1024
+/// soft limit would meet `EMFILE` somewhere in the middle of the listing and
+/// report it as a confusing I/O error a long way from the cause, so the check
+/// happens up front and names the number to raise it to.
+fn require_open_files(needed: u64) {
+    let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .unwrap_or(u64::MAX);
+    assert!(
+        soft >= needed,
+        "this case registers one server descriptor per directory entry and \
+         needs RLIMIT_NOFILE of at least {needed}; this process has a soft \
+         limit of {soft}. Raise it (`ulimit -n {needed}`) and run again."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Waiting
 // ---------------------------------------------------------------------------
@@ -841,15 +862,22 @@ fn hard_links_share_an_inode_and_move_the_link_count() {
 #[test]
 #[ignore = "mounts a real filesystem; run with `make test-loopback`"]
 fn a_large_directory_lists_every_name_across_many_pages() {
+    // Names are deliberately long: the client asks for a 4 KiB page and the
+    // server charges `namelen + 160` per `READDIRPLUS` entry, so ~20 names to
+    // a page and ~100 pages for the listing.
+    const NAMES: usize = 2_000;
+    // The stat pass at the end of this case looks every name up, and the
+    // server keeps a descriptor per looked-up node: measured peak is 2025
+    // descriptors for this process against `NAMES` of 2000. Checked before
+    // anything is mounted, so a host that cannot run the case says so instead
+    // of failing with `EMFILE` halfway through a listing.
+    require_open_files(NAMES as u64 + 256);
+
     let mut lb = Loopback::start(Opts::default());
     let mnt = lb.mnt().to_path_buf();
 
     // Built on the server side, and never looked at through the mount before
-    // it is complete, so no cached listing can flatter the result. Names are
-    // deliberately long: the client asks for a 4 KiB page and the server
-    // charges `namelen + 160` per `READDIRPLUS` entry, so ~20 names to a page
-    // and ~100 pages for the listing.
-    const NAMES: usize = 2_000;
+    // it is complete, so no cached listing can flatter the result.
     let big = lb.export().join("big");
     std::fs::create_dir(&big).unwrap();
     let mut want = BTreeSet::new();

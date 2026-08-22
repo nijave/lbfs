@@ -41,6 +41,18 @@ fn require_fuse() {
          host has no /dev/fuse. Load the `fuse` module, or run the suite in the \
          VM (`make vm-test`)."
     );
+    assert!(
+        which("fusermount3").is_some(),
+        "this test needs `fusermount3` on PATH: libfuse3 shells out to it for \
+         both the unprivileged mount and the unmount, so without it the client \
+         fails to mount and this case reports only an exit code. Install fuse3."
+    );
+}
+
+fn which(prog: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(prog))
+        .find(|candidate| candidate.is_file())
 }
 
 fn is_fuse_mount(mnt: &Path) -> bool {
@@ -143,13 +155,23 @@ impl ClientProcess {
     /// arrives, the mount comes down, dirty pages drain through a session and a
     /// socket that are both still open, and the process leaves with status 0.
     fn terminate(&mut self) -> std::process::ExitStatus {
-        let mut child = self.child.take().expect("still running");
         rustix::process::kill_process(
-            rustix::process::Pid::from_child(&child),
+            rustix::process::Pid::from_child(self.child.as_ref().expect("still running")),
             rustix::process::Signal::TERM,
         )
         .expect("the client is signalled");
+        self.wait_for_exit("exit after SIGTERM")
+    }
 
+    /// Wait for the child to leave, or kill it and fail saying what it never
+    /// did.
+    ///
+    /// Bounded rather than a plain `wait`, because every reason this child
+    /// might not exit — a handshake that never completes, a signal handler that
+    /// never fires — is a bug that would otherwise hang `make test-loopback`
+    /// with no diagnosis instead of failing it with one.
+    fn wait_for_exit(&mut self, what: &str) -> std::process::ExitStatus {
+        let mut child = self.child.take().expect("still running");
         let deadline = Instant::now() + EXIT_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -158,7 +180,7 @@ impl ClientProcess {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("the client did not exit within {EXIT_TIMEOUT:?} of SIGTERM");
+                panic!("the client did not {what} within {EXIT_TIMEOUT:?}");
             }
             std::thread::sleep(POLL);
         }
@@ -172,11 +194,23 @@ impl Drop for ClientProcess {
             let _ = child.wait();
         }
         force_unmount(&self.mnt);
-        assert!(
-            !is_fuse_mount(&self.mnt),
-            "{} is still mounted; unmount it before running the suite again",
-            self.mnt.display()
-        );
+        // Reported, never asserted. This runs on the panic path too, and a
+        // panic raised while unwinding aborts the whole test binary — the
+        // original failure's message with it. The surviving mount is worth
+        // shouting about; it is not worth losing the reason the test failed.
+        //
+        // Nothing leaks the tempdir here the way the in-process suite does,
+        // because the child is already dead by this line: a mount whose server
+        // process is gone answers `ENOTCONN`, so the `remove_dir_all` behind
+        // `TempDir` fails at the mountpoint rather than recursing through it
+        // and deleting the export.
+        if is_fuse_mount(&self.mnt) {
+            eprintln!(
+                "lbfs loopback: {} is STILL MOUNTED after every unmount \
+                 attempt; unmount it by hand before running the suite again.",
+                self.mnt.display()
+            );
+        }
     }
 }
 
@@ -272,12 +306,11 @@ fn the_binary_refuses_to_mount_an_export_the_server_does_not_offer() {
 
     let refused = root.path().join("not-exported");
     std::fs::create_dir(&refused).unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_lbfs-client"))
-        .arg(addr.to_string())
-        .arg(refused.canonicalize().unwrap())
-        .arg(&mnt)
-        .status()
-        .expect("the lbfs-client binary runs");
+    // Spawned through the same guard as the mounting case, and waited for with
+    // the same bound: a client that hung in `connect` would otherwise hang
+    // `make test-loopback` rather than failing it.
+    let mut client = ClientProcess::spawn(addr, &refused.canonicalize().unwrap(), &mnt);
+    let status = client.wait_for_exit("exit after a refused ATTACH");
 
     assert!(!status.success(), "a denied ATTACH must not exit 0");
     assert!(
