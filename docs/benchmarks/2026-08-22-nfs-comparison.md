@@ -170,12 +170,13 @@ so the server's flush owns roughly 925 µs of every small synchronous write.
 Read it as the bill lbfs would face if it grew a durability promise, not as a
 defect of NFS.
 
-## The per-write GETATTR gap
+## The per-write GETXATTR gap
 
-lbfs pays a `GETATTR` round trip behind every `WRITE`, worth about 90 µs on a
-296 µs operation. NFS pays nothing of the kind, and the operation counters say
-so directly. Deltas across one 15-second 4 KiB random write job on the `async`
-export:
+lbfs pays a second round trip behind every `WRITE` — a `GETXATTR` of
+`security.capability`, which its client's kernel repeats before each write —
+worth about 90 µs on a 296 µs operation. NFS pays nothing of the kind, and the
+operation counters say so directly. Deltas across one 15-second 4 KiB random
+write job on the `async` export:
 
 | op | count | mean RPC round trip |
 |---|---|---|
@@ -187,8 +188,9 @@ export:
 fio counted 140,178 write operations in that window. One RPC per write, one
 `GETATTR` for the whole job, no commit traffic. The matching read job shows
 150,426 READs against the same single `GETATTR`. The client's 3-second
-`acregmin` covers the attribute refresh, and NFSv4 write replies carry post-op
-attributes, so nothing invalidates the cache the way lbfs's write reply does.
+`acregmin` covers the attribute refresh, NFSv4 write replies carry post-op
+attributes, and no counter moves for an extended-attribute probe of the kind
+the FUSE write path makes for `security.capability`.
 
 What the NFS number implies about the lbfs gap:
 
@@ -204,7 +206,7 @@ Deleting the extra round trip would move lbfs from 296 µs to roughly 206 µs.
 That closes half the distance and leaves NFS still twice as fast. The rest
 sits below the FUSE layer: lbfs's own RPC path costs 146.4 µs per 4 KiB write
 with no kernel filesystem in the picture at all, which already exceeds NFS's
-complete mount-to-reply latency of ~104 µs. The `GETATTR` is worth removing,
+complete mount-to-reply latency of ~104 µs. The `GETXATTR` is worth removing,
 then, and will not on its own reach parity — the protocol path needs the same
 attention.
 
@@ -232,10 +234,10 @@ against 4963 for lbfs, a factor of 6.1, and even `sync` with its per-write
 flush manages 8107. lbfs gains only 47% from QD1 to QD16 on writes (3365 to
 4963) where NFS gains 240% (8935 to 30390). Two known lbfs behaviours explain
 the flat curve: the per-inode exclusive lock in the kernel write path pins
-concurrent writers to one file at the single-writer rate, and the `GETATTR`
-doubles the round trips that queue has to hide. NFS avoids both — its client
-issues WRITEs against a stateid without serialising on the inode, and it never
-asks for attributes.
+concurrent writers to one file at the single-writer rate, and the capability
+probe doubles the round trips that queue has to hide. NFS avoids both — its
+client issues WRITEs against a stateid without serialising on the inode, and it
+sends nothing behind the write at all.
 
 The `sync` QD16 write row deserves a note of its own: 8107 IOPS is 8.6 times
 the `sync` QD1 figure of 939, far more scaling than `async` shows. Depth lets

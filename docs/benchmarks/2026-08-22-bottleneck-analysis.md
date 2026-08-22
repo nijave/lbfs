@@ -8,6 +8,15 @@ Campaign on the two-VM pair: server 192.168.77.10 (`lbfs-server` exporting
 Three questions drove the day: what `FUSE_ASYNC_DIO` buys, where the time
 goes, and how much of the cost belongs to FUSE, to lbfs, and to the wire.
 
+> **Correction, 2026-08-22, after deeper kernel analysis.** The extra round
+> trip behind every write is a `GETXATTR` of `security.capability`, not a
+> `GETATTR`, and the `open`/`fstat`/`close` triple counted below comes from the
+> server's xattr handler rather than from its `GETATTR` handler. Every number
+> and every experiment here still holds; only the name of the mechanism was
+> wrong, and the text now carries the corrected one.
+> `docs/superpowers/plans/2026-08-22-per-write-getattr-elimination.md` walks
+> the Linux v7.0 sources behind the correction.
+
 ## Headline
 
 Asking the kernel for `FUSE_ASYNC_DIO` lifts every queued direct-I/O shape.
@@ -18,11 +27,12 @@ negotiated window of 128 had nothing to pipeline; fio's depth 16 reached the
 bridge as depth 1.
 
 Writes do not move, and the reason is separate: every `WRITE` through the
-mount drags a `GETATTR` behind it, so a write costs two round trips where a
-read costs one. Turning the writeback cache off does not change this, and
-neither does a 30-second attribute timeout. The kernel invalidates the
-attributes after each write, so the refresh always misses whatever the
-timeout says.
+mount drags a `GETXATTR` behind it, so a write costs two round trips where a
+read costs one. The kernel probes `security.capability` before each write to
+decide whether the file must lose its set-user-ID bit, and lbfs's honest
+`ENODATA` never persuades it to stop. Turning the writeback cache off does not
+change this, and neither does a 30-second attribute timeout, because no
+attribute cache covers an xattr probe.
 
 ## Method note: writeback backlog contaminates back-to-back jobs
 
@@ -154,7 +164,7 @@ go from 9086 IOPS at qd1 to 48766 at qd16, a 5.4 × gain on 16 × the depth.
 Streaming does not pipeline — 1 MiB reads sit at ~2.3 GB/s whether one or
 eight ride in flight, so something other than concurrency bounds that shape.
 
-## The per-write `GETATTR`
+## The per-write `GETXATTR`
 
 `strace -c -f` against `lbfs-server` for 10-12 s windows, one workload per
 window:
@@ -165,12 +175,21 @@ window:
 | randwrite 4k psync | 12872 | 6430 |
 | seq write 1M psync | 9832 | 4911 |
 
-The server answers a `GETATTR` by opening the node through `/proc`, calling
-`fstat` and closing. One triple per write, and twice as many reply frames as
-write operations, in both the 4 KiB and the 1 MiB case. Reads show neither.
+The triple belongs to the server's xattr handler
+(`crates/lbfs-server/src/fs/local/mod.rs:425-442`): it `fstat`s the node's
+`O_PATH` descriptor, reopens the node through `/proc` because `fgetxattr`
+refuses an `O_PATH` descriptor, and closes the reopened one afterwards. The
+`GETATTR` handler does none of that — it runs one `statx` on the descriptor it
+already holds, through the io_uring ring, where `strace` cannot see it. One
+triple per write, and twice as many reply frames as write operations, in both
+the 4 KiB and the 1 MiB case. Reads show neither, because the read path never
+calls `file_remove_privs`.
 
-A write through the mount thus costs a `WRITE` round trip plus a `GETATTR`
-round trip. The arithmetic lands almost exactly: 146 µs (RPC write) + 92 µs
+A write through the mount thus costs a `WRITE` round trip plus a `GETXATTR`
+round trip. Before every write to an inode without `S_NOSEC`, the kernel asks
+the filesystem for `security.capability`; lbfs answers `ENODATA`, and only
+`ENOSYS` makes FUSE stop asking, so the probe repeats for the life of the
+mount. The arithmetic lands almost exactly: 146 µs (RPC write) + 92 µs
 (a metadata round trip, priced at the RPC read) + ~58 µs of kernel write-path
 work = 296 µs, the measured mount latency.
 
@@ -238,11 +257,13 @@ before each:
 
 Sequential 1 MiB writes agree: 874 MB/s without writeback against 816 MB/s
 with it, inside the run-to-run spread of that job. The writeback cache is not
-the reason a write costs 2.4 × a read. The extra `GETATTR` per write survives
+the reason a write costs 2.4 × a read. The extra round trip per write survives
 both changes — the `--no-writeback` window still shows 10149 triples against
 20303 reply frames, and the 30-second attribute timeout still shows 9766
-against 19535. The kernel drops the cached attributes after every write, so a
-longer timeout has nothing to hold.
+against 19535. Neither knob touches it, because the kernel repeats an xattr
+probe rather than an attribute refresh: `--no-writeback` skips the pre-write
+refresh outright, and the attribute timeout governs a cache the probe never
+consults.
 
 ## Bottleneck attribution
 
@@ -261,11 +282,14 @@ passthrough spends. The wire itself is not the problem — iperf3 measured
 33-37 Gbit/s yesterday and the ping RTT is a fifth of a millisecond.
 
 **Small random writes pay for a second round trip, and that is the whole
-gap.** Reads take one RPC, writes take two, because the kernel refreshes size
-and mode before each write and lbfs invalidates those attributes as part of
-answering the write. Removing the refresh — by answering `WRITE` with fresh
-attributes, or by letting the client keep the size it already knows — would
-be worth about 90 µs on a 296 µs operation.
+gap.** Reads take one RPC, writes take two, because the kernel probes
+`security.capability` before each write and lbfs's `ENODATA` never stops it.
+The kernel's pre-write size and mode refresh is not the culprit: the writeback
+cache answers it locally, so it costs roughly one `GETATTR` per attribute
+timeout rather than one per write. Removing the probe — `FUSE_HANDLE_KILLPRIV_V2`
+lets the kernel latch `S_NOSEC` and stop asking, in exchange for the server
+clearing the privileged mode bits itself — would be worth about 90 µs on a
+296 µs operation.
 
 **Concurrent writers to one file gain nothing at all.** The per-inode
 exclusive lock in the kernel's write path pins throughput at the single-writer

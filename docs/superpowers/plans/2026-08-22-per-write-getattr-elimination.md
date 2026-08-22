@@ -1696,7 +1696,7 @@ the set-user-ID strip onto the server. Numbers, same drained single-job driver:
 Syscall counts over a 12 s randwrite window: [counts from Step 3].
 ```
 
-Correct the earlier "The per-write `GETATTR`" section's closing paragraph to point at the new section rather than leaving the mislabelled conclusion standing.
+A docs sweep on 2026-08-22 already renamed that section to "The per-write `GETXATTR`" and corrected its closing paragraph, so this step only appends the new Phase 8 section with the post-fix numbers.
 
 - [ ] **Step 6: Commit**
 

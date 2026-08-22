@@ -133,7 +133,7 @@ the server's cache state hits both columns equally.
 | mean latency | 16294 µs | 13252 µs | 15584 µs | 13260 µs |
 
 Every repetition agrees with its column mean. At `bs=4M` the smaller request
-takes writes up 43% and costs reads 14%. At `bs=16M` the smaller request wins
+takes writes up 43% and costs reads 13%. At `bs=16M` the smaller request wins
 both: writes up 23%, reads up 17%.
 
 ## Cost per megabyte
@@ -173,7 +173,7 @@ streaming shapes do not pipeline through the raw RPC path.
 Bigger requests did not lift streaming throughput, and the cost-per-megabyte
 table says why: the per-request fixed cost that the plan aimed at is a small
 part of what a megabyte costs. A 4 MiB read through the mount takes 3531 µs
-against 4 × 806 µs for the same bytes in 1 MiB pieces, and a 4 MiB write takes
+against 4 × 804 µs for the same bytes in 1 MiB pieces, and a 4 MiB write takes
 5436 µs against 4 × 1300 µs — four times the bytes, four times the wait, plus
 a little. The cost lives in the copies: `/dev/fuse` to buffer, buffer to
 socket, and the mirror image on the server.

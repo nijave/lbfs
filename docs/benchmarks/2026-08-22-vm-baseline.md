@@ -235,6 +235,12 @@ a 512 MB file may pull in the surrounding page first. The 4-thread probe rules
 out hard serialization: writes scale 2.7× from 3463 to 9469 IOPS, the same
 factor reads scale by.
 
+Later work ruled out both candidates and found a third cause: each write drags
+a second round trip behind it, a `GETXATTR` of `security.capability` that the
+client's kernel repeats before every write. See
+`docs/benchmarks/2026-08-22-bottleneck-analysis.md` and
+`docs/superpowers/plans/2026-08-22-per-write-getattr-elimination.md`.
+
 ### The QD16 collapse
 
 `libaio` at `iodepth=16` returns 7217 IOPS against 8263 at QD1, with mean
