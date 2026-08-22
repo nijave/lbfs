@@ -50,7 +50,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::consts::{
-    FOPEN_KEEP_CACHE, FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+    FOPEN_KEEP_CACHE, FUSE_ASYNC_DIO, FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO,
+    FUSE_WRITEBACK_CACHE,
 };
 use fuser::{
     KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -368,6 +369,16 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
         Capability {
             bit: FUSE_READDIRPLUS_AUTO,
             name: "FUSE_READDIRPLUS_AUTO",
+            required: false,
+        },
+        // The kernel flag `FUSE_ASYNC_DIO`: without it the kernel holds
+        // `i_rwsem` across a direct-I/O request and lets one O_DIRECT read or
+        // write per inode be outstanding, so a queue depth of 16 on one file
+        // arrives here as depth 1. Costs nothing when it is absent — the
+        // kernel simply keeps serialising, which is today's behaviour.
+        Capability {
+            bit: FUSE_ASYNC_DIO,
+            name: "FUSE_ASYNC_DIO",
             required: false,
         },
     ];
@@ -1531,6 +1542,16 @@ mod tests {
         }
         assert_eq!(requested(true) & FUSE_WRITEBACK_CACHE, FUSE_WRITEBACK_CACHE);
         assert_eq!(requested(false) & FUSE_WRITEBACK_CACHE, 0);
+    }
+
+    /// Asked for on every mount, cached or not. `O_DIRECT` skips the page
+    /// cache, so the writeback setting has no bearing on which of the two
+    /// paths the kernel serialises.
+    #[test]
+    fn async_dio_is_always_requested() {
+        for writeback in [true, false] {
+            assert_eq!(requested(writeback) & FUSE_ASYNC_DIO, FUSE_ASYNC_DIO);
+        }
     }
 
     /// Only the writeback cache is worth refusing to mount over, because only
