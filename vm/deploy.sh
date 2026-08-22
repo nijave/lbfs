@@ -24,13 +24,36 @@ vm_ssh "$SERVER_IP" 'sudo install -m755 /tmp/lbfs-server /usr/local/bin/ &&
   sudo systemctl enable lbfs-server >/dev/null &&
   sudo systemctl restart lbfs-server'
 
-# `restart` returns as soon as the unit is activating, and `Restart=no` means a
-# server that dies on a bad config dies silently. Ask, and print the journal if
-# the answer is no — a deploy that reports success over a dead server is the
-# one failure mode that would waste the most of Task 18's time.
-if ! vm_ssh "$SERVER_IP" 'systemctl is-active --quiet lbfs-server'; then
-  vm_ssh "$SERVER_IP" 'sudo journalctl -u lbfs-server -n 50 --no-pager' >&2 || true
-  echo "lbfs-server is not active on $SERVER_IP" >&2
+# `restart` returns as soon as the unit is activating, and the unit now carries
+# `Restart=on-failure`, so a server that dies on a bad config no longer dies
+# silently — it dies over and over, and a single `is-active` would sooner or
+# later catch it during one of those lives and call the deploy good. Watch it
+# for ten seconds instead, and demand two things at once: the unit stays active,
+# and systemd's restart counter stays at zero. The manual `systemctl restart`
+# above resets NRestarts, so any nonzero value inside this window is this
+# deploy's server crash-looping. Sampled throughout rather than once at the end,
+# because a server that dies at second three and is back by second four is
+# exactly what a single late look would miss.
+#
+# SC2016: the substitutions below are the guest's, evaluated over there against
+# the guest's own systemd.
+# shellcheck disable=SC2016
+if ! vm_ssh "$SERVER_IP" '
+  for _ in $(seq 1 20); do
+    restarts=$(systemctl show -p NRestarts --value lbfs-server)
+    state=$(systemctl is-active lbfs-server)
+    if [ "${restarts:-0}" -ne 0 ]; then
+      echo "lbfs-server has restarted ${restarts} time(s) since the deploy" >&2
+      exit 1
+    fi
+    if [ "$state" != active ]; then
+      echo "lbfs-server is ${state}" >&2
+      exit 1
+    fi
+    sleep 0.5
+  done'; then
+  vm_ssh "$SERVER_IP" 'sudo journalctl -u lbfs-server -n 20 --no-pager' >&2 || true
+  echo "lbfs-server did not stay up for ten seconds on $SERVER_IP" >&2
   exit 1
 fi
 

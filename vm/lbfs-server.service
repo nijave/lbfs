@@ -2,9 +2,22 @@
 Description=lbfs server
 After=network.target
 
+# The rate bound on Restart=on-failure. Since systemd 229 these two live in
+# [Unit], not [Service]. Five failures inside a minute is a server that cannot
+# start at all — a bad config, a taken port — and restarting it forever would
+# only bury the reason in the journal. Past the burst systemd gives up and
+# leaves the unit failed, which is what the deploy gate and the operator can
+# both see.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 ExecStart=/usr/local/bin/lbfs-server --config /etc/lbfs.toml
-Restart=no
+# A server that dies takes the export with it: an io_uring lane that loses its
+# ring now aborts the process rather than answer EIO forever, and that is only
+# the right trade if something puts the process back.
+Restart=on-failure
+RestartSec=1
 User=ubuntu
 
 # The server holds one O_PATH descriptor per node a client still remembers, so
