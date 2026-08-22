@@ -888,35 +888,63 @@ mod tests {
         }
     }
 
+    /// The raise itself, on a real process, whatever limits that process
+    /// started with.
+    ///
+    /// Waiting for a host that happens to boot with `soft < hard` would mean
+    /// the one assertion that matters never runs on the machine most likely to
+    /// run it — this developer's box starts at `soft == hard`, so the earlier
+    /// version of this test skipped every time. Lowering a soft limit needs no
+    /// privilege and neither does raising it back to the hard one, so the test
+    /// can simply create the condition it wants to observe.
+    ///
+    /// `hard - 1` rather than something small on purpose. These cases run as
+    /// parallel threads of one process and `RLIMIT_NOFILE` is process-wide, so
+    /// the lowered limit is briefly everyone's; one descriptor below the
+    /// ceiling is the largest value that is still strictly below it, and no
+    /// neighbour will notice.
+    ///
+    /// `init_process` deliberately goes untested here. It is behind a `Once`,
+    /// which makes it order-dependent, and its other half sets `umask(0)` —
+    /// process-wide again, and racing the `create` case that reads the umask
+    /// back. The wiring is covered on the VM pair instead, where the deployed
+    /// server logs the raise it performed at startup.
     #[test]
-    fn init_leaves_the_process_at_its_hard_descriptor_limit() {
-        use rustix::process::{getrlimit, Resource};
+    fn raise_nofile_moves_the_soft_limit_up_to_the_hard_one() {
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 
-        // This process shares one limit with every other case in the binary,
-        // and `init_process` is behind a `Once`, so by the time this runs the
-        // raise may already have happened — or the developer's shell may have
-        // handed cargo a soft limit that was the hard limit to begin with.
-        // Either way there is nothing left to observe, and saying so is more
-        // honest than asserting a tautology.
-        let before = getrlimit(Resource::Nofile);
-        if before.current == before.maximum {
-            eprintln!(
-                "skipped: this process already runs at its descriptor ceiling ({})",
-                nofile_label(before.current)
-            );
-            return;
-        }
+        let hard = getrlimit(Resource::Nofile).maximum;
+        // `RLIM_INFINITY` has no predecessor, so any finite number is below it.
+        let below = Some(hard.map_or(4096, |h| h.saturating_sub(1)));
+        assert_ne!(
+            below, hard,
+            "a process with a hard limit of 0 cannot run this"
+        );
 
-        init_process().unwrap();
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: below,
+                maximum: hard,
+            },
+        )
+        .expect("lowering one's own soft limit is always permitted");
+        assert_eq!(
+            getrlimit(Resource::Nofile).current,
+            below,
+            "the test failed to set up the condition it means to observe"
+        );
+
+        raise_nofile();
 
         let after = getrlimit(Resource::Nofile);
         assert_eq!(
-            after.current, before.maximum,
-            "init must leave the soft descriptor limit at the hard one"
+            after.current, hard,
+            "raise_nofile must leave the soft descriptor limit at the hard one"
         );
         assert_eq!(
-            after.maximum, before.maximum,
-            "init must not move the hard descriptor limit"
+            after.maximum, hard,
+            "raise_nofile must not move the hard descriptor limit"
         );
     }
 

@@ -8,7 +8,7 @@ users:
     ssh_authorized_keys:
       - __SSH_KEY__
 package_update: true
-packages: [fuse3, attr, fio, gcc, curl, make]
+packages: [fuse3, attr, fio, gcc, curl, make, jq]
 write_files:
   - path: /etc/fuse.conf
     content: "user_allow_other\n"
