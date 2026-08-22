@@ -84,10 +84,11 @@ const MAX_XATTR_SIZE: usize = 65536;
 const MAX_XATTR_LIST: usize = 65536;
 
 /// Bytes one [`DirEntry`] costs on the wire beyond its name: postcard writes a
-/// length prefix, a one-byte [`FileKind`] tag, and a varint cursor. An upper
-/// bound, deliberately — a page that overshoots the client's budget is a
-/// protocol violation, one that undershoots is only a wasted round trip.
-const READDIR_ENTRY_OVERHEAD: usize = 24;
+/// length prefix (2 bytes at `NAME_MAX`), a one-byte [`FileKind`] tag, and two
+/// varint u64s — the inode and the cursor — at 10 bytes each. An upper bound,
+/// deliberately: a page that overshoots the client's budget is a protocol
+/// violation, one that undershoots is only a wasted round trip.
+const READDIR_ENTRY_OVERHEAD: usize = 32;
 
 /// The same for [`DirEntryPlus`], which carries a whole [`Entry`]: two varint
 /// u64s plus fifteen [`FileAttr`] fields, none wider than a 10-byte varint.
@@ -161,6 +162,10 @@ pub struct FileHandle {
 /// One name from the `OPENDIR` snapshot.
 struct SnapshotEntry {
     name: Vec<u8>,
+    /// `getdents64`'s `d_ino`, kept because nothing downstream can reconstruct
+    /// it: `READDIR` returns no attributes, and glibc drops a dirent whose
+    /// inode is zero.
+    ino: u64,
     kind: FileKind,
     /// The `d_off` `getdents64` reported for this entry: the kernel's own
     /// cursor to the position *after* it. This is what a client passes back to
@@ -565,6 +570,7 @@ fn snapshot_dir(fd: &OwnedFd) -> FsResult<Vec<SnapshotEntry>> {
         };
         entries.push(SnapshotEntry {
             name: name.to_bytes().to_vec(),
+            ino: entry.ino(),
             kind,
             // `d_off` is signed in the kernel's struct and opaque on the wire;
             // the cast is a reinterpretation, not a range claim.
@@ -572,6 +578,55 @@ fn snapshot_dir(fd: &OwnedFd) -> FsResult<Vec<SnapshotEntry>> {
         });
     }
     Ok(entries)
+}
+
+/// How many bytes a directory page may spend.
+///
+/// The client's ask, clamped to the largest body the protocol can carry. Spec
+/// §3.1 makes a body over `MAX_BODY_SIZE` a *fatal* violation on receipt, so a
+/// client that asked for a megabyte of entries and got an honest megabyte back
+/// would kill its own mount. Dispatch should refuse the oversized ask too, but
+/// the clamp belongs here as well: it is the backend that decides how much it
+/// writes, and it stays correct however the wire layer is later rewired.
+fn reply_budget(max_bytes: u32) -> usize {
+    max_bytes.min(lbfs_proto::frame::MAX_BODY_SIZE) as usize
+}
+
+/// `cookie -> index of the entry that follows it`, for [`DirHandle::resume_at`].
+///
+/// Reverse order, so the *lowest* index wins a duplicate cookie. `d_off` is
+/// unique in every filesystem this server has met, but ext4 packs an htree
+/// hash into it and colliding names come back consecutively, so a collision is
+/// structurally possible rather than merely unlikely. Lowest-index-wins turns
+/// what would be a silently skipped name into a replayed one — which is what
+/// a native `seekdir` onto a shared cookie does anyway.
+fn resume_map(entries: &[SnapshotEntry]) -> HashMap<u64, usize> {
+    entries
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, e)| (e.cookie, i + 1))
+        .collect()
+}
+
+/// The entry a name gets when the server can list it but cannot resolve it.
+///
+/// Node 0 is FUSE's "no dentry, no lookup count": the client's kernel leaves
+/// `fuse_direntplus_link` before it reads the attributes, so the zeroed
+/// [`FileAttr`] never reaches anybody and no `FORGET` is owed. Reporting the
+/// name this way rather than dropping it does two things. It keeps `READDIR`
+/// and `READDIRPLUS` agreeing on which names a directory holds — the same
+/// directory listed two ways should not give two answers. And it keeps a page
+/// non-empty: [`ReaddirplusReply`] carries no cursor of its own, so a page
+/// that dropped every entry would leave the client nothing to advance to, and
+/// it would either re-send the same offset forever or read the empty page as
+/// the end of a listing that is not over.
+fn unresolved_entry() -> Entry {
+    Entry {
+        node: 0,
+        generation: 0,
+        attr: FileAttr::default(),
+    }
 }
 
 /// `d_type` to the wire's [`FileKind`]; `None` for `DT_UNKNOWN`.
@@ -1224,11 +1279,7 @@ impl FileSystem for LocalFs {
         .await
         .map_err(join_errno)??;
 
-        let resume = entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.cookie, i + 1))
-            .collect();
+        let resume = resume_map(&entries);
         Ok(self.dirs.insert(Arc::new(DirHandle {
             node,
             fd: Arc::new(dir_fd),
@@ -1246,7 +1297,7 @@ impl FileSystem for LocalFs {
     ) -> FsResult<ReaddirReply> {
         let handle = self.dir_handle(node, dh)?;
         let start = handle.resume_at(offset)?;
-        let budget = max_bytes as usize;
+        let budget = reply_budget(max_bytes);
         let mut used = READDIR_REPLY_OVERHEAD;
         let mut entries = Vec::new();
         let mut cursor = start;
@@ -1257,12 +1308,13 @@ impl FileSystem for LocalFs {
             // to overshoot on its own is still under 300 bytes, far inside the
             // negotiated frame, and refusing it would leave the client
             // re-issuing the same offset forever.
-            if cursor > start && used + cost > budget {
+            if !entries.is_empty() && used + cost > budget {
                 break;
             }
             used += cost;
             entries.push(DirEntry {
                 name: e.name.clone(),
+                ino: e.ino,
                 kind: e.kind,
                 offset: e.cookie,
             });
@@ -1289,19 +1341,17 @@ impl FileSystem for LocalFs {
         // instead of the reply strands a lookup count no FORGET will retire.
         let dir_attr = attr_from_statx(&self.statx_fd(&handle.fd).await.map_err(errno)?);
 
-        let budget = max_bytes as usize;
+        let budget = reply_budget(max_bytes);
         let mut used = READDIR_REPLY_OVERHEAD;
         let mut entries = Vec::new();
         let mut cursor = start;
 
         while let Some(e) = handle.entries.get(cursor) {
             let cost = e.name.len() + READDIRPLUS_ENTRY_OVERHEAD;
-            if cursor > start && used + cost > budget {
+            if !entries.is_empty() && used + cost > budget {
                 break;
             }
             cursor += 1;
-            // Spent whether or not the entry survives below, so a page bounds
-            // the work it does as well as the bytes it returns.
             used += cost;
 
             let entry = if e.name == b"." || e.name == b".." {
@@ -1318,22 +1368,24 @@ impl FileSystem for LocalFs {
                 // Through `lookup_impl`, because every `Entry` a client
                 // receives is one lookup count it owes exactly one FORGET for,
                 // and that is the only place a node is registered.
-                let Ok(name) = CString::new(e.name.clone()) else {
-                    continue;
-                };
-                match self.lookup_impl(&handle.fd, &name).await {
-                    Ok(entry) => entry,
-                    Err(err) => {
-                        // Skipped, never fatal. The snapshot is older than the
-                        // directory, so a name unlinked since the sweep is
-                        // ordinary rather than exceptional - and failing the
-                        // page would also strand every lookup count already
-                        // registered into it. The client sees a listing
-                        // missing that name, which is what a listing of a
-                        // directory it no longer belongs to should look like.
-                        tracing::debug!(?err, "readdirplus skipped an entry");
-                        continue;
-                    }
+                match CString::new(e.name.clone()) {
+                    Ok(name) => match self.lookup_impl(&handle.fd, &name).await {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            // Reported, never fatal, never dropped. The
+                            // snapshot is older than the directory, so a name
+                            // unlinked since the sweep is ordinary rather than
+                            // exceptional - and failing the page would strand
+                            // every lookup count already registered into it.
+                            // See `unresolved_entry` for why the name still
+                            // travels instead of vanishing from the page.
+                            tracing::debug!(?err, "readdirplus could not resolve an entry");
+                            unresolved_entry()
+                        }
+                    },
+                    // Unreachable: `getdents64` names hold no NUL. Reported
+                    // like any other unresolvable name rather than dropped.
+                    Err(_) => unresolved_entry(),
                 }
             };
             entries.push(DirEntryPlus {
@@ -1357,9 +1409,15 @@ impl FileSystem for LocalFs {
             // EBADF from the application's `closedir(3)`.
             None => return Ok(()),
         }
-        // Unlike `release`, no blocking hop: closing a directory descriptor
-        // frees no file blocks, and the snapshot is plain heap memory.
-        drop(self.dirs.remove(dh));
+        if let Some(handle) = self.dirs.remove(dh) {
+            // Off the runtime for the same reason `release` moves its `close`
+            // there, only more so: the descriptor is the cheap part, and
+            // freeing a large directory's snapshot is a million small
+            // deallocations plus the cookie map behind them.
+            tokio::task::spawn_blocking(move || drop(handle))
+                .await
+                .map_err(join_errno)?;
+        }
         Ok(())
     }
 
@@ -1399,24 +1457,40 @@ impl FileSystem for LocalFs {
         let name = xattr_name(name)?;
         let fd = self.xattr_fd(node).await?;
         let buf = self.pool.get();
-        // `size == 0` is FUSE's length probe: the kernel reports how big the
-        // value is and writes nothing. Otherwise the ask is clamped to what
-        // can actually be carried - a value cannot exceed XATTR_SIZE_MAX, and
-        // the pooled buffer is this server's own ceiling.
-        let want = if size == 0 {
-            0
+        // The largest value this server can hand back: the kernel's own
+        // ceiling and the pooled buffer, whichever binds first.
+        let ceiling = buf.capacity().min(MAX_XATTR_SIZE);
+        let probe = size == 0;
+        // `size == 0` is FUSE's length probe, and it still goes to the kernel
+        // with the full ceiling rather than a zero-length buffer. A
+        // zero-length call would report the value's true size, but the
+        // completion clamps its count to the buffer's capacity
+        // (`finish_transfer`), so the reply could not distinguish "the value
+        // is exactly this big" from "the value is bigger than anything we can
+        // carry" - and that distinction is the whole of the check below.
+        // Asking for the ceiling costs one copy of a value that is at most
+        // 64 KiB, against a reopen and a blocking hop already paid.
+        let want = if probe {
+            ceiling
         } else {
-            (size as usize).min(MAX_XATTR_SIZE).min(buf.capacity()) as u32
-        };
+            (size as usize).min(ceiling)
+        } as u32;
         let (buf, res) = self.uring.fgetxattr(&fd, name, buf, want).await;
-        // A buffer shorter than the value is ERANGE straight from the syscall,
-        // which is the answer the client's own getxattr(2) expects.
-        let n = res.map_err(errno)?;
-        if want == 0 {
-            // The completion published the *needed* size as the buffer's
-            // length, but the kernel wrote no bytes into it: reading it now
-            // would hand the client whatever the last request left in the
-            // recycled storage. The count is the entire answer.
+        let n = match res {
+            Ok(n) => n,
+            // A value past the ceiling can never travel. Reporting its true
+            // size would send the client back for a fetch that answers ERANGE
+            // and a probe that repeats the advice, forever. E2BIG ends the
+            // exchange, and mirrors the ceiling `setxattr` enforces inbound.
+            Err(e) if probe && e.raw_os_error() == Some(libc::ERANGE) => return Err(E2BIG),
+            // On a real fetch a buffer shorter than the value is ERANGE
+            // straight from the syscall, which is what the client's own
+            // getxattr(2) expects to see.
+            Err(e) => return Err(errno(e)),
+        };
+        if probe {
+            // The client asked for the length alone; the bytes the kernel put
+            // in the buffer are not part of this answer.
             return Ok((n, Vec::new()));
         }
         Ok((n, buf.as_slice().to_vec()))
@@ -1490,9 +1564,31 @@ pub(crate) async fn test_fs_writeback(
     policy: crate::config::FsyncPolicy,
     writeback: bool,
 ) -> (tempfile::TempDir, LocalFs) {
+    test_fs_with(policy, writeback, 1 << 20).await
+}
+
+/// A `LocalFs` whose pooled buffers are deliberately small.
+///
+/// `max_io_size` has no lower clamp in the config, and Task 12 settles it as
+/// `min(client, server)`, so the branches where a value outgrows the pool are
+/// reachable by configuration rather than merely theoretical.
+#[cfg(test)]
+pub(crate) async fn test_fs_pool(
+    policy: crate::config::FsyncPolicy,
+    buf_size: usize,
+) -> (tempfile::TempDir, LocalFs) {
+    test_fs_with(policy, false, buf_size).await
+}
+
+#[cfg(test)]
+async fn test_fs_with(
+    policy: crate::config::FsyncPolicy,
+    writeback: bool,
+    buf_size: usize,
+) -> (tempfile::TempDir, LocalFs) {
     let dir = tempfile::tempdir().unwrap();
     let uring = uring::UringExecutor::new(1, 64).unwrap();
-    let pool = buffers::BufferPool::new(1 << 20, 8);
+    let pool = buffers::BufferPool::new(buf_size, 8);
     let fs = LocalFs::new(dir.path(), policy, writeback, uring, pool).unwrap();
     (dir, fs)
 }
@@ -2438,12 +2534,12 @@ mod tests {
     }
 
     /// The snapshot is older than the directory it describes. A name unlinked
-    /// between `OPENDIR` and the page that would have reported it is skipped
-    /// rather than fatal — failing the page instead would strand every lookup
-    /// count already registered into it, and no `FORGET` would ever arrive to
-    /// retire them.
+    /// between `OPENDIR` and the page that reports it comes back as node 0
+    /// rather than failing the page — failing would strand every lookup count
+    /// already registered into it, and no `FORGET` would arrive to retire
+    /// them. Its neighbours resolve normally in the same page.
     #[tokio::test]
-    async fn readdirplus_skips_an_entry_that_vanished_after_the_snapshot() {
+    async fn readdirplus_reports_a_vanished_name_beside_its_surviving_neighbours() {
         let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
         for name in ["keep", "gone"] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
@@ -2453,13 +2549,174 @@ mod tests {
 
         let page = fs.readdirplus(ROOT_NODE, dh, 0, 1 << 16).await.unwrap();
         assert!(page.end);
-        let names: Vec<_> = page.entries.iter().map(|e| e.name.clone()).collect();
-        assert!(names.contains(&b"keep".to_vec()));
-        assert!(!names.contains(&b"gone".to_vec()));
-        // The cursor still walked past the vanished name: "." and ".." plus
-        // the one file that is still there.
-        assert_eq!(page.entries.len(), 3);
+        assert_eq!(page.entries.len(), 4); // "." ".." keep gone
+        let node_of = |name: &[u8]| {
+            page.entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name:?} is missing from the page"))
+                .entry
+                .node
+        };
+        assert!(node_of(b"keep") > ROOT_NODE);
+        assert_eq!(node_of(b"gone"), 0, "a vanished name owes no lookup count");
         fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// A page the server could resolve nothing in still has to carry names.
+    /// `ReaddirplusReply` has no cursor of its own, so the only way a client
+    /// can advance is the offset of an entry it received: an empty page that
+    /// says `end: false` leaves it re-sending the same offset forever, or
+    /// reading the gap as the end of a listing that is not over. One `rm -rf`
+    /// racing one `ls -l` on a large directory is enough to produce a whole
+    /// page of names that vanished after the snapshot.
+    #[tokio::test]
+    async fn readdirplus_reports_vanished_names_rather_than_emptying_a_page() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        for i in 0..16 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
+        }
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        for i in 0..16 {
+            std::fs::remove_file(dir.path().join(format!("f{i}"))).unwrap();
+        }
+
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            // One entry per page, so every page past the dots is made
+            // entirely of names that no longer resolve.
+            let page = fs.readdirplus(ROOT_NODE, dh, offset, 0).await.unwrap();
+            assert!(
+                !page.entries.is_empty() || page.end,
+                "a non-final page with no entries leaves the client no cursor"
+            );
+            if let Some(last) = page.entries.last() {
+                offset = last.offset;
+            }
+            let end = page.end;
+            for e in &page.entries {
+                if e.name != b"." && e.name != b".." {
+                    assert_eq!(
+                        e.entry.node, 0,
+                        "{:?} vanished, so it owes no lookup count",
+                        e.name
+                    );
+                }
+                names.push(e.name.clone());
+            }
+            if end {
+                break;
+            }
+        }
+        // Every name the snapshot held still travels, so READDIR and
+        // READDIRPLUS agree on what the directory contains.
+        assert_eq!(names.len(), 18);
+        for i in 0..16 {
+            assert!(names.contains(&format!("f{i}").into_bytes()));
+        }
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// Spec §3.1 makes an oversized body fatal on receipt, so a client that
+    /// asks for a megabyte of entries and gets an honest megabyte back kills
+    /// its own mount. The backend clamps regardless of what dispatch does.
+    #[tokio::test]
+    async fn a_page_never_exceeds_the_maximum_body_size() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        // Names long enough that a 64 KiB page cannot hold the directory.
+        for i in 0..600 {
+            std::fs::write(dir.path().join(format!("{:0>200}", i)), b"").unwrap();
+        }
+        let dh = fs.opendir(ROOT_NODE).await.unwrap();
+        let max = lbfs_proto::frame::MAX_BODY_SIZE as usize;
+
+        for ask in [u32::MAX, 1 << 20] {
+            let page = fs.readdir(ROOT_NODE, dh, 0, ask).await.unwrap();
+            assert!(!page.end, "the directory must not fit in one page");
+            let body = postcard::to_allocvec(&page).unwrap();
+            assert!(body.len() <= max, "readdir body {} > {max}", body.len());
+
+            let plus = fs.readdirplus(ROOT_NODE, dh, 0, ask).await.unwrap();
+            assert!(!plus.end);
+            let body = postcard::to_allocvec(&plus).unwrap();
+            assert!(body.len() <= max, "readdirplus body {} > {max}", body.len());
+        }
+        fs.releasedir(ROOT_NODE, dh).await.unwrap();
+    }
+
+    /// `getdents64` hands over an inode for every name and nothing downstream
+    /// can reconstruct it: `READDIR` carries no attributes, and glibc's
+    /// `readdir(3)` drops a dirent whose `d_ino` is zero. `..` is the case
+    /// that proves it travels — its inode is the parent's, which the
+    /// directory's own attributes cannot supply.
+    #[tokio::test]
+    async fn readdir_carries_the_inode_of_every_entry() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/f"), b"x").unwrap();
+        let sub = fs.lookup(ROOT_NODE, b"sub").await.unwrap();
+        let dh = fs.opendir(sub.node).await.unwrap();
+
+        let page = fs.readdir(sub.node, dh, 0, 1 << 16).await.unwrap();
+        let ino_of = |name: &[u8]| {
+            page.entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name:?} is missing"))
+                .ino
+        };
+        let root = fs.getattr(ROOT_NODE, None).await.unwrap();
+        let f = fs.lookup(sub.node, b"f").await.unwrap();
+
+        assert!(page.entries.iter().all(|e| e.ino != 0));
+        assert_eq!(ino_of(b"f"), f.attr.ino);
+        assert_eq!(ino_of(b"."), sub.attr.ino);
+        assert_eq!(ino_of(b".."), root.ino, "'..' reports the parent's inode");
+        fs.releasedir(sub.node, dh).await.unwrap();
+    }
+
+    /// `O_DIRECTORY` is not decoration. Without it the reopen of a FIFO node
+    /// blocks inside `fifo_open` until a writer arrives, parking a
+    /// `spawn_blocking` worker for as long as the client cares to wait — and a
+    /// client that opens enough of them drains the pool and stalls the server.
+    /// With it the kernel refuses before it reaches `may_open` at all.
+    #[tokio::test]
+    async fn opendir_on_a_fifo_fails_instead_of_blocking() {
+        let (dir, fs) = test_fs(FsyncPolicy::Honor).await;
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join("p"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let p = fs.lookup(ROOT_NODE, b"p").await.unwrap();
+
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(5), fs.opendir(p.node))
+            .await
+            .expect("opendir on a FIFO must answer rather than park a worker");
+        assert_eq!(opened.unwrap_err(), Errno(libc::ENOTDIR as u16));
+    }
+
+    /// `d_off` is unique on every filesystem this server has met, but ext4
+    /// packs an htree hash into it, so a collision is structurally possible.
+    /// Lowest-index-wins replays one name; highest-index-wins would drop the
+    /// name between silently.
+    #[test]
+    fn a_duplicate_cookie_resumes_at_the_earlier_entry() {
+        let entry = |name: &[u8], cookie| SnapshotEntry {
+            name: name.to_vec(),
+            ino: 1,
+            kind: FileKind::Regular,
+            cookie,
+        };
+        let entries = [entry(b"a", 7), entry(b"b", 7), entry(b"c", 9)];
+        let map = resume_map(&entries);
+
+        assert_eq!(map.get(&7), Some(&1), "resuming from 7 must replay \"b\"");
+        assert_eq!(map.get(&9), Some(&3));
     }
 
     /// A directory handle is bound to the node it was opened on, exactly like
@@ -2603,6 +2860,38 @@ mod tests {
         }
         let (size, val) = fs.getxattr(e.node, b"user.k", u32::MAX).await.unwrap();
         assert_eq!((size, val.as_slice()), (2, b"v1".as_slice()));
+    }
+
+    /// The pooled buffer is the server's own ceiling on a value, and
+    /// `max_io_size` has no lower clamp — a small pool makes that ceiling the
+    /// live one. Both ends of the exchange have to respect it: `setxattr`
+    /// refuses before it copies past the buffer, and the `getxattr` probe
+    /// refuses rather than reporting a size whose fetch can only answer
+    /// `ERANGE`, which would leave the client probing forever.
+    #[tokio::test]
+    async fn a_value_the_pool_buffer_cannot_carry_is_e2big_at_both_ends() {
+        let (dir, fs) = test_fs_pool(FsyncPolicy::Honor, 512).await;
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"").unwrap();
+        let e = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+        let value = vec![b'v'; 4096];
+
+        // The size check precedes the reopen, so this holds even on a
+        // filesystem with no user xattrs at all.
+        assert_eq!(
+            fs.setxattr(e.node, b"user.k", &value, 0).await.unwrap_err(),
+            E2BIG
+        );
+
+        // Plant the same value out of band, so the probe has one to find.
+        if rustix::fs::setxattr(&path, "user.k", &value, rustix::fs::XattrFlags::empty()).is_err() {
+            return; // no user xattrs here; nothing left to prove
+        }
+        assert_eq!(
+            fs.getxattr(e.node, b"user.k", 0).await.unwrap_err(),
+            E2BIG,
+            "a probe must not report a size the fetch can never carry"
+        );
     }
 
     /// An xattr name is arbitrary bytes to this server, but the syscall takes

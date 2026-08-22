@@ -76,6 +76,15 @@ pub struct StatfsReply {
 pub struct DirEntry {
     #[serde(with = "serde_bytes")]
     pub name: Vec<u8>,
+    /// The entry's inode number, straight from `getdents64`'s `d_ino`.
+    ///
+    /// Not decoration: glibc's `readdir(3)` *drops* a dirent whose `d_ino` is
+    /// zero, treating it as a deleted slot. Without this field the client
+    /// would have to invent a number for every entry, and inventing one that
+    /// disagrees with the `LOOKUP` that follows is worse than carrying the
+    /// real one. `..` therefore reports the true parent inode, which is the
+    /// one place a directory's own attributes cannot supply it.
+    pub ino: u64,
     pub kind: FileKind,
     pub offset: u64, // opaque resume cursor: pass back as ReaddirRequest.offset
 }
