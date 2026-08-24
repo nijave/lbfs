@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -e
+
+# A named system user so the directories the server accesses and hosts can be
+# permissioned deterministically: a fixed UID that shows up in ls output,
+# ACLs, and backup tooling instead of a per-boot dynamic one.
+if ! getent passwd _lbfs >/dev/null; then
+    adduser --system --group --home /var/lib/lbfs --no-create-home _lbfs
+fi
+
+#DEBHELPER#

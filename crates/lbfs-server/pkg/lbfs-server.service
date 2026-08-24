@@ -1,6 +1,8 @@
-# The VM harness unit, deployed by `vm/deploy.sh`. Its near-twin is
-# `crates/lbfs-server/pkg/lbfs-server.service`, which the .deb ships; see the
-# note there about which parts are meant to stay in step.
+# The packaged unit. `vm/lbfs-server.service` is its near-twin and the two are
+# deliberately separate: the VM harness scp's a binary to /usr/local/bin and
+# runs it as `ubuntu`, which is not what an installed package should do. Keep
+# the tuning below — the restart policy, the rate limit, LimitNOFILE — in step
+# between them; the paths and the user are meant to differ.
 [Unit]
 Description=lbfs server
 After=network.target
@@ -15,13 +17,17 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-ExecStart=/usr/local/bin/lbfs-server --config /etc/lbfs.toml
+ExecStart=/usr/bin/lbfs-server --config /etc/lbfs.toml
 # A server that dies takes the export with it: an io_uring lane that loses its
 # ring now aborts the process rather than answer EIO forever, and that is only
 # the right trade if something puts the process back.
 Restart=on-failure
 RestartSec=1
-User=ubuntu
+User=_lbfs
+Group=_lbfs
+# The package's postinst creates the _lbfs system user; this directory gives
+# it a persistent home for any state the server keeps outside its export.
+StateDirectory=lbfs
 
 # The server holds one O_PATH descriptor per node a client still remembers, so
 # this number is the largest tree a client may have live at once. It raises its

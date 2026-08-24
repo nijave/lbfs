@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 concurrency:
@@ -45,8 +46,11 @@ jobs:
   #       with:
   #         command: check advisories
 
+  # Runs on pull requests too, unlike the release job below. Packaging breaks
+  # in ways `check` cannot see — a bad asset path, a `cargo deb` flag that does
+  # not exist — and a job that only runs after the merge finds them on `main`,
+  # in the same run that would have published them.
   build:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: check
     runs-on: ubuntu-latest
     steps:
@@ -61,14 +65,54 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libfuse3-dev pkg-config
 
-      - name: Build release binaries
-        run: cargo build --release -p lbfs-server -p lbfs-client
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build packages
+        run: |
+          args=()
+          # Tag builds carry the real version in the .deb metadata; branch
+          # builds keep whatever the manifests say. The `-1` keeps the Debian
+          # revision that an unstamped build gets by default, so a tagged
+          # package and a branch package are named the same shape.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            args+=(--deb-version="${GITHUB_REF_NAME#v}-1")
+          fi
+          # One invocation per package: `cargo deb` takes a single `--package`
+          # and rejects a second one outright.
+          cargo deb "${args[@]}" -p lbfs-server
+          cargo deb "${args[@]}" -p lbfs-client
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lbfs-binaries
+          name: lbfs-debs
           path: |
-            target/release/lbfs-server
-            target/release/lbfs-client
+            target/debian/*.deb
           if-no-files-found: error
+
+  # Split from `build` so `contents: write` is held only by a job that cannot
+  # run outside a tag, rather than by every `main` push that just needs to
+  # compile.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lbfs-debs
+          path: debs
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # `create` fails if the release already exists, which is what a re-run
+        # of this job is, so fall back to replacing the assets on it.
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes debs/*.deb ||
+            gh release upload "$GITHUB_REF_NAME" --clobber debs/*.deb

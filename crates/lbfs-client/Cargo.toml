@@ -3,6 +3,7 @@ name = "lbfs-client"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+description = "Mounts a remote lbfs export over FUSE"
 
 [dependencies]
 lbfs-proto = { workspace = true, features = ["io"] }
@@ -26,3 +27,15 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.deb]
+maintainer = "Nick Venenga <nick@venenga.com>"
+section = "utils"
+# `fuse3`, not `libfuse3-3`. `$auto` runs dpkg-shlibdeps over the ELF, so the
+# library fuser links — `libfuse3.so.3` — is already covered and naming it here
+# adds nothing. What the ELF cannot show is the helper libfuse execs:
+# `fusermount3` and `/etc/fuse.conf` ship in `fuse3`, and an unprivileged
+# mount, `--allow-other`, and `--auto-unmount` each need them. `fuse3` depends
+# on `libfuse3-3`, so the library still arrives.
+depends = "fuse3, $auto"
+assets = [["target/release/lbfs-client", "usr/bin/", "755"]]
