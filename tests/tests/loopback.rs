@@ -114,8 +114,9 @@ fn require_fuse() {
     );
     assert!(
         which("fusermount3").is_some(),
-        "the loopback suite needs `fusermount3` on PATH: libfuse3 shells out to \
-         it for both the unprivileged mount and the unmount. Install fuse3."
+        "the loopback suite needs `fusermount3` on PATH: fuser's pure-Rust \
+         mount path runs it for both the unprivileged mount and the unmount. \
+         Install fuse3."
     );
 }
 
@@ -394,7 +395,7 @@ impl Loopback {
     /// asserting about what the mount left behind has to happen after this
     /// returns.
     ///
-    /// **Every file opened on the mount must be closed first.** libfuse3
+    /// **Every file opened on the mount must be closed first.** `fusermount3`
     /// unmounts with `MNT_DETACH`, which takes the mountpoint out of the mount
     /// table at once but leaves the superblock — and with it the FUSE
     /// connection — alive until the last reference goes. One `File` still in

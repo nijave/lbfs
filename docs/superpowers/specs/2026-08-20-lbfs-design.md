@@ -416,13 +416,16 @@ make vm-down     # destroy domains + overlays (base image kept)
 Client and server kernels are independent, so version asymmetry is testable.
 
 **Deployment:** guest binaries come from a container build
-(`make build-guest`: podman + a Debian-based rust image with
-`libfuse3-dev`, gnu target, `target/guest`). Debian's older glibc runs
-forward-compatibly on the Ubuntu guests (max required symbol GLIBC_2.34
-vs guest 2.43), and the client links the guest's `libfuse3.so.4` (from
-the `fuse3` package). The io-uring crate is direct syscalls. The
-original static-musl plan died on two host facts: Fedora's packaged
-Rust ships no musl std, and fuser's default features link libfuse3.
+(`make build-guest`: podman + a Debian-based rust image, gnu target,
+`target/guest`). Debian's older glibc runs forward-compatibly on the
+Ubuntu guests (max required symbol GLIBC_2.39 vs guest 2.43 — the client
+reached 2.39 when the pure-Rust mount moved the `fusermount3` exec into
+Rust, whose spawn path imports `pidfd_spawnp`). Neither
+binary links anything past libc: the io-uring crate is direct syscalls,
+and from fuser 0.16.0 the client mounts through the crate's pure-Rust
+path, running `fusermount3` from the guests' `fuse3` package instead of
+linking `libfuse3.so`. The original static-musl plan died on one host
+fact that still holds: Fedora's packaged Rust ships no musl std.
 
 ## 10. Testing Strategy
 

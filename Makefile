@@ -22,14 +22,17 @@ test-loopback:
 
 # Binaries for the VM guests, built in a container rather than here.
 #
-# Not musl, and not the host toolchain. The client links libfuse3, so a musl
-# build would have to bring its own; and a distro-packaged rustc has no musl
-# std to build against in the first place. A container with the guests' own
-# libc family is both simpler and closer to what the guests actually run:
-# Debian's glibc is older than Ubuntu 26.04's, which is the direction that
-# works. The io-uring crate issues raw syscalls, so liburing is not involved,
-# and libfuse3 is the one shared library the pair needs beyond libc — cloud-init
-# installs it on both guests.
+# Not musl, and not the host toolchain: a distro-packaged rustc has no musl std
+# to build against. A container with the guests' own libc family is both
+# simpler and closer to what the guests run — Debian's glibc is older than
+# Ubuntu 26.04's, which is the direction that works.
+#
+# The container installs nothing. The io-uring crate issues raw syscalls, so
+# liburing is not involved, and since fuser 0.16.0 the client mounts through
+# its pure-Rust path — it runs `fusermount3` rather than linking libfuse3, so
+# there are no FUSE headers to find at build time and no FUSE library to load
+# at run time. The guests still need the `fuse3` package for the `fusermount3`
+# binary itself; `vm/lib.sh` asks for it.
 #
 # The registry cache is a named volume and `target/guest` is inside the mounted
 # checkout, so the second build is a rebuild rather than a redownload. SELinux
@@ -44,10 +47,7 @@ build-guest:
 	  -v lbfs-guest-cargo:/usr/local/cargo/registry \
 	  -w /work \
 	  $(GUEST_IMAGE) \
-	  bash -euc 'apt-get update -qq && \
-	    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-	      libfuse3-dev pkg-config >/dev/null && \
-	    RUSTUP_TOOLCHAIN=$$(rustup default | cut -d" " -f1) \
+	  bash -euc 'RUSTUP_TOOLCHAIN=$$(rustup default | cut -d" " -f1) \
 	    cargo build --release --target-dir target/guest -p lbfs-server -p lbfs-client'
 
 vm-up:

@@ -43,9 +43,9 @@ fn require_fuse() {
     );
     assert!(
         which("fusermount3").is_some(),
-        "this test needs `fusermount3` on PATH: libfuse3 shells out to it for \
-         both the unprivileged mount and the unmount, so without it the client \
-         fails to mount and this case reports only an exit code. Install fuse3."
+        "this test needs `fusermount3` on PATH: fuser's pure-Rust mount path \
+         runs it for the mount and the unmount, so without it the client fails \
+         to mount and this case reports only an exit code. Install fuse3."
     );
 }
 
