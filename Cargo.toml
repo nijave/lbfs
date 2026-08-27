@@ -35,7 +35,7 @@ thiserror = "2"
 # those constants and callbacks are not compiled at all. The kernel still
 # negotiates down to whatever it supports, so asking for 7.31 costs nothing on
 # an older one.
-fuser = { version = "0.15", features = ["abi-7-31"] }
+fuser = { version = "=0.16.0", features = ["abi-7-31"] }
 proptest = "1"
 tempfile = "3"
 futures = "0.3"

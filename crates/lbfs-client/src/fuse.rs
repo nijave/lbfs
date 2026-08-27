@@ -333,26 +333,29 @@ fn first_entry_overflow(emitted: usize, name: &[u8]) {
 
 /// One capability this client asks the kernel for, and what its absence costs.
 struct Capability {
-    bit: u32,
+    bit: u64,
     name: &'static str,
     /// Whether a kernel without it makes the mount wrong rather than merely
     /// slow.
     required: bool,
 }
 
-/// `FUSE_HANDLE_KILLPRIV_V2`, which fuser 0.15.1 does not name.
+/// `FUSE_HANDLE_KILLPRIV_V2`, which fuser 0.16.0 does not name.
 ///
 /// fuser's `consts` stops at `FUSE_HANDLE_KILLPRIV` (bit 19). Bit 28 arrived
-/// with ABI 7.33 and fuser negotiates at most 7.31 — but the kernel does not
-/// check the minor version for this flag. `process_init_reply` reads it inside
-/// one `if (arg->minor >= 6)` and applies it with no further guard
-/// (`fs/fuse/inode.c:1411-1414`), exactly as it does for `FUSE_ASYNC_DIO`, and
-/// `fuse_new_init` offers it unconditionally (`inode.c:1505`). The value fits
-/// in `u32`, so fuser's `fuse_init_in.flags` carries it without the `flags2`
-/// extension fuser lacks, and `KernelConfig::add_capabilities` checks the ask
-/// against the kernel's own offered bits rather than a list of names fuser
-/// knows. A locally declared constant is therefore the whole mechanism.
-const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+/// with ABI 7.33 and fuser negotiates at most 7.40 while naming no constant
+/// between bits 26 and 36 — but the kernel does not check the minor version
+/// for this flag. `process_init_reply` reads it inside one `if (arg->minor >=
+/// 6)` and applies it with no further guard (`fs/fuse/inode.c:1411-1414`),
+/// exactly as it does for `FUSE_ASYNC_DIO`, and `fuse_new_init` offers it
+/// unconditionally (`inode.c:1505`). `KernelConfig::add_capabilities` checks
+/// the ask against the kernel's own offered bits rather than a list of names
+/// fuser knows, so a locally declared constant is the whole mechanism.
+///
+/// The word is `u64` from 0.16.0 on: that release widened the whole INIT flag
+/// family and `add_capabilities` with it, to make room for the bits above 31
+/// that `fuse_init_in.flags2` carries.
+const FUSE_HANDLE_KILLPRIV_V2: u64 = 1 << 28;
 
 /// The capabilities this client asks the kernel for.
 ///
@@ -1563,7 +1566,7 @@ mod tests {
         assert_eq!(READDIR_PAGE_BYTES, 4096);
     }
 
-    fn requested(writeback: bool) -> u32 {
+    fn requested(writeback: bool) -> u64 {
         capabilities(writeback).iter().fold(0, |all, c| all | c.bit)
     }
 
