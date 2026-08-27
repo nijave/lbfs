@@ -33,8 +33,9 @@ match what happened teaches nobody what it got wrong. Sections 5 and 9 of
 `docs/superpowers/plans/2026-08-22-fuser-two-step-upgrade.md` both work this
 way.
 
-A comment that names a blocker should name every blocker, or the next person
-follows it and lands a red build.
+The same rule reaches comments in code and CI: one that names a blocker
+should name every blocker, or the next person follows it and lands a red
+build.
 
 ## Gates
 
@@ -42,7 +43,7 @@ follows it and lands a red build.
 |---|---|
 | `make check` | Before every commit — fmt, clippy, and the test suites. |
 | `make test-loopback` | Before every commit touching the client, the server, or the protocol. It mounts a real filesystem, so it needs `/dev/fuse` and `fusermount3`. |
-| `make vm-test` | Before merging anything that changes the mount path, packaging, or deployment. Needs the libvirt guest pair from `make vm-up`. |
+| `make vm-test` | Before merging anything that changes the mount path, packaging, or deployment. Needs the libvirt guest pair from `make vm-up`, with the current binaries installed by `make vm-deploy` — against a stale deploy it vouches for the wrong build. |
 
 Read the built artifact, not only the source, when a change alters what the
 binary links or execs. `ldd` shows what left; `objdump -T` shows what arrived,
