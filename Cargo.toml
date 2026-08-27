@@ -27,15 +27,22 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-# `abi-7-31` is not a nicety. fuser gates its FUSE features on the ABI level it
-# claims, and every kernel-cache knob spec §7 asks for lives above the 7.8
-# default: `FUSE_DO_READDIRPLUS`/`FUSE_READDIRPLUS_AUTO` are 7.21,
+# The ABI level is a claim about what this client understands, and fuser gates
+# its own constants on it. Every kernel-cache knob spec §7 asks for lives above
+# the 7.8 default: `FUSE_DO_READDIRPLUS`/`FUSE_READDIRPLUS_AUTO` are 7.21,
 # `FUSE_WRITEBACK_CACHE` is 7.23, `batch_forget` is 7.16, and `max_pages` (what
-# carries a negotiated `max_write` past 128 KiB) is 7.28. Without the feature
-# those constants and callbacks are not compiled at all. The kernel still
-# negotiates down to whatever it supports, so asking for 7.31 costs nothing on
-# an older one.
-fuser = { version = "=0.16.0", features = ["abi-7-31"] }
+# carries a negotiated `max_write` past 128 KiB) is 7.28. 7.40 is the highest
+# level 0.16.0 offers, and it costs nothing above 7.31 today: the release names
+# no constant between bits 26 and 36, and a feature nobody asks for is one the
+# kernel leaves off. `the_only_high_capability_asked_for_is_killpriv_v2` in
+# `fuse.rs` is what keeps that true. The kernel negotiates down to whatever it
+# supports, so asking for 7.40 costs nothing on an older one.
+#
+# `libfuse` is deliberately absent from the feature list. 0.16.0 made it opt-in
+# (`default = []`), and leaving it off selects fuser's pure-Rust mount, which
+# runs `fusermount3` instead of linking `libfuse3.so`. See README "Why a
+# container and not a musl target".
+fuser = { version = "=0.16.0", features = ["abi-7-40"] }
 proptest = "1"
 tempfile = "3"
 futures = "0.3"

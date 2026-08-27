@@ -1603,7 +1603,7 @@ mod tests {
     }
 
     /// The one capability this whole change exists for. Bit 28 per
-    /// `include/uapi/linux/fuse.h`; fuser 0.15.1 has no constant for it, and
+    /// `include/uapi/linux/fuse.h`; fuser 0.16.0 has no constant for it, and
     /// `KernelConfig::add_capabilities` accepts any bit the kernel offered, so
     /// the local constant is the whole mechanism.
     #[test]
@@ -1630,6 +1630,25 @@ mod tests {
                 .expect("the capability list carries it");
             assert!(!cap.required);
             assert_eq!(cap.name, "FUSE_HANDLE_KILLPRIV_V2");
+        }
+    }
+
+    /// Declaring ABI 7.40 is a claim about what this client understands, and
+    /// fuser 0.16.0 names no INIT constant between bit 26 and bit 36 — above
+    /// bit 25 the tag carries only `FUSE_INIT_EXT` (30), `FUSE_INIT_RESERVED`
+    /// (31) and `FUSE_PASSTHROUGH` (37). The claim holds because a feature
+    /// nobody asks for is a feature the kernel leaves off. Bit 28 is the one
+    /// high bit this client does ask for, declared locally and answered by the
+    /// server's own set-user-ID strip. Anything else appearing up here is a
+    /// feature being negotiated with no code behind it.
+    #[test]
+    fn the_only_high_capability_asked_for_is_killpriv_v2() {
+        for writeback in [true, false] {
+            let high = requested(writeback) & !((1u64 << 26) - 1);
+            assert_eq!(
+                high, FUSE_HANDLE_KILLPRIV_V2,
+                "an unexpected capability above bit 25 (writeback={writeback})"
+            );
         }
     }
 
