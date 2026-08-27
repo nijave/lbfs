@@ -42,7 +42,7 @@ thiserror = "2"
 # (`default = []`), and leaving it off selects fuser's pure-Rust mount, which
 # runs `fusermount3` instead of linking `libfuse3.so`. See README "Why a
 # container and not a musl target".
-fuser = { version = "=0.16.0", features = ["abi-7-40"] }
+fuser = { version = "=0.17.0", features = ["abi-7-40"] }
 proptest = "1"
 tempfile = "3"
 futures = "0.3"
