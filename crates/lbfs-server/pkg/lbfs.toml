@@ -1,0 +1,16 @@
+# Installed as /etc/lbfs.toml and registered as a conffile, so edits here
+# survive a package upgrade.
+#
+# Loopback, not `0.0.0.0`, because the package's postinst starts the unit. lbfs
+# v1 has no authentication: anyone who can reach the port and name a path the
+# allowlist covers gets that export. A default that binds every interface would
+# mean `apt install` alone publishes the export, so widening this is the
+# operator's decision to make after the allowlist below says something real.
+listen = "127.0.0.1:9423"
+
+# Deliberately a path that does not exist yet. Create the export root, give
+# `_lbfs` access to it, then point this at it — see the packaging notes in the
+# README.
+allowed_paths = ["/srv/exports/*"]
+
+fsync = "honor"

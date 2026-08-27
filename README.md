@@ -136,6 +136,41 @@ honest way to run on such a kernel.
 
 ## Deployment
 
+### Debian packages
+
+Tagged builds attach `lbfs-server` and `lbfs-client` `.deb`s to the GitHub
+release; every other CI run leaves the same pair as a `lbfs-debs` artifact.
+
+```sh
+sudo apt install ./lbfs-server_*_amd64.deb    # or ./lbfs-client_*_amd64.deb
+```
+
+The server package installs the binary at `/usr/bin/lbfs-server`, the config at
+`/etc/lbfs.toml` as a conffile so your edits survive an upgrade, and a unit
+that runs as a dedicated `_lbfs` system user its `postinst` creates. It enables
+and starts that unit, so **the shipped config binds `127.0.0.1` rather than
+`0.0.0.0`** — v1 has no authentication, and a default reaching every interface
+would mean installing the package published the export. Two things to do before
+the install is useful:
+
+1. Create the export root and give `_lbfs` access to it. The server acts with
+   that account's privileges on every request, so an export tree it cannot
+   traverse answers `EACCES` and one it owns outright is one a client can
+   rewrite at will:
+
+   ```sh
+   sudo install -d -o _lbfs -g _lbfs /srv/exports/data
+   ```
+
+2. Point `listen` at an address the client can reach, check `allowed_paths`
+   covers the root you just made, then `sudo systemctl restart lbfs-server`.
+
+The client package needs no configuration. It depends on `fuse3` for
+`fusermount3`, which libfuse execs to mount without privileges — `--allow-other`
+additionally wants `user_allow_other` uncommented in `/etc/fuse.conf`.
+
+### By hand
+
 `vm/lbfs-server.service` is a working unit; copy it to
 `/etc/systemd/system/lbfs-server.service`, put the config at `/etc/lbfs.toml`,
 and drop the binary at `/usr/local/bin/lbfs-server`. Change its `User=` to
