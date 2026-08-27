@@ -699,7 +699,7 @@ git commit -m "build: drop the libfuse3 link, and say so everywhere it was claim
 
 This is the Global Constraint made into a step. The record matters more than usual here, because the note it appends to is the document the next bump takes its pricing from, and its A2 table carries five claims that do not survive contact with the tag.
 
-- [ ] **Step 1: Read the three areas that matter**
+- [x] **Step 1: Read the three areas that matter**
 
 ```bash
 cd /tmp/fuser-review
@@ -710,11 +710,11 @@ git show v0.18.0:src/lib.rs | sed -n '/pub fn add_capabilities/,/^    }/p'
 git show v0.18.0:Cargo.toml | sed -n '/^\[dependencies\]/,/^\[/p'
 ```
 
-- [ ] **Step 2: Confirm each line of the record below against what you just read**
+- [x] **Step 2: Confirm each line of the record below against what you just read**
 
 Writing this plan meant checking every statement in Step 3's block against tag `v0.18.0`. Read the diff yourself and confirm each one; correct any that upstream has since changed, and if a correction lands, re-price Task 6 before starting it.
 
-- [ ] **Step 3: Append the record**
+- [x] **Step 3: Append the record**
 
 Add to the end of `docs/notes/2026-08-22-fuser-upgrade-assessment.md`:
 
@@ -769,12 +769,12 @@ event-loop thread. `InitFlags::FUSE_HANDLE_KILLPRIV_V2` (bit 28),
 values the two earlier plans declare by hand.
 ```
 
-- [ ] **Step 4: Check the prose gate**
+- [x] **Step 4: Check the prose gate**
 
 Run: `vale --output=line docs/notes/2026-08-22-fuser-upgrade-assessment.md`
 Expected: no output.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/notes/2026-08-22-fuser-upgrade-assessment.md
