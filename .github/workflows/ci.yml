@@ -65,7 +65,7 @@ jobs:
         run: cargo build --release -p lbfs-server -p lbfs-client
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lbfs-binaries
           path: |
