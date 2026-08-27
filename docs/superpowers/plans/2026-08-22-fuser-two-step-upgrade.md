@@ -12,10 +12,10 @@
 
 **Assessment this plan executes:** `docs/notes/2026-08-22-fuser-upgrade-assessment.md`
 
-**Status:** Step one landed on PR #9, where it now awaits review — Tasks 1
-through 4, each its own commit, with `make check` and `make test-loopback`
-green before every one and `make vm-test` green on the live guest pair at the
-end. The client now pins `=0.16.0` with `abi-7-40`, links no FUSE library, and
+**Status:** Step one merged to `main` as PR #9 (`22b64e8`) — Tasks 1 through
+4, each its own commit, with `make check` and `make test-loopback` green
+before every one and `make vm-test` green on the live guest pair at the end.
+The client now pins `=0.16.0` with `abi-7-40`, links no FUSE library, and
 mounts by running `fusermount3`. Step two — Tasks 5 through 11, the `=0.18.0`
 pin and the three things it makes reachable — has not started. Section 9
 records what step one's execution found that the tasks below did not predict;
