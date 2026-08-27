@@ -29,7 +29,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # Disabled until the fuser package upgrade is merged; re-enable then.
+  # Disabled, and two things have to clear before it comes back. The fuser
+  # advisory (RUSTSEC-2021-0154) is one, and pinning `=0.16.0` retires it. The
+  # other is RUSTSEC-2023-0089, which arrives through a dependency fuser has
+  # nothing to do with — see `deny.toml`. Re-enabling on the strength of the
+  # fuser bump alone leaves this job red.
   # audit:
   #   runs-on: ubuntu-latest
   #   steps:
