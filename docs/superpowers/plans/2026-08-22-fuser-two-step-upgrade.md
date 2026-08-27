@@ -12,6 +12,16 @@
 
 **Assessment this plan executes:** `docs/notes/2026-08-22-fuser-upgrade-assessment.md`
 
+**Status:** Step one landed on PR #9, where it now awaits review — Tasks 1
+through 4, each its own commit, with `make check` and `make test-loopback`
+green before every one and `make vm-test` green on the live guest pair at the
+end. The client now pins `=0.16.0` with `abi-7-40`, links no FUSE library, and
+mounts by running `fusermount3`. Step two — Tasks 5 through 11, the `=0.18.0`
+pin and the three things it makes reachable — has not started. Section 9
+records what step one's execution found that the tasks below did not predict;
+read it before starting Task 5, because one of the two changes what Task 11
+has to amend.
+
 ## Global Constraints
 
 - **This plan runs fourth.** Two client plans land before it: `docs/superpowers/plans/2026-08-22-per-write-getattr-elimination.md`, then `docs/superpowers/plans/2026-08-22-parallel-direct-writes.md`. Every line number and code block below describes the tree those two leave behind. Section 1 of Design and Context gives the ordering argument.
@@ -161,6 +171,39 @@ The memory bill is real: `BUFFER_SIZE = MAX_WRITE_SIZE + 4096` and `MAX_WRITE_SI
 
 Task 9 ships the knob off and Task 10 measures it. The expected reading on today's shapes is no change: the guest has two vCPUs, one of them already carrying tokio workers, so a second event loop competes rather than adds. Record the numbers either way — the point of the knob is that a four-vCPU guest earns a measurement later without another code change, and a measurement nobody wrote down is one somebody repeats.
 
+### 9. What step one's execution found that this plan did not predict
+
+Two of the tasks below describe an outcome execution did not produce. The
+tasks keep their original wording, because a plan somebody rewrites to match
+what happened teaches nobody what it got wrong. This section carries the
+corrections instead.
+
+**The client's glibc floor rose from 2.34 to 2.39, and no task saw it
+coming.** Task 4 retires the `libfuse3.so` link and reasons about what
+`dpkg-shlibdeps` can no longer find. It misses what the ELF gains. Running
+`fusermount3` from Rust rather than from libfuse links the standard library's
+spawn path, which imports `pidfd_spawnp` and `pidfd_getpid` at GLIBC_2.39. Both
+symbols are weak, so the binary runs on an older glibc perfectly well, but
+`dpkg-shlibdeps` reads the version and writes it into the package, and `dpkg`
+refuses the install. `lbfs-client`'s Depends went from `fuse3, libc6 (>= 2.34),
+libfuse3-3 (>= 3.2.3)` to `fuse3, libc6 (>= 2.39)` — a narrower install base,
+Ubuntu 24.04 or Debian 13 and newer, in exchange for a link the package no
+longer carries. `lbfs-server` still asks for 2.34.
+
+The lesson generalises past this bump: a task that removes a link should read
+the built artifact, not only the source. Task 4 Step 2 checks `ldd` for what
+left. Nothing checked `objdump -T` for what arrived, and `ldd` cannot show it.
+Task 11 Step 1 amends the spec's deployment paragraph; that paragraph now
+already carries the 2.39 figure, so Task 11 must confirm rather than introduce
+it.
+
+**Task 3 predicts a `Cargo.lock` delta that cannot exist.** Step 3 expects
+`abi-7-40` to pull `nix`/`ioctl` into the lockfile. It does not, and the
+prediction was never sound: a lockfile records resolved versions, not the
+features that select them, so a feature flag alone moves nothing there. The
+claim the step actually needed — that the ABI bump adds no crate — held, and
+`cargo tree` is what shows it.
+
 ---
 
 ## File Map
@@ -193,7 +236,7 @@ This case lands **before** any version change, on 0.15.1, so the two bumps have 
 
 This case also catches correction b. If Task 6 reaches for `join()` where 0.15.1 had `join()`, the session thread never ends, `Loopback::try_unmount` times out, and this goes red with a message that says so.
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 Add to `tests/tests/loopback.rs`, beside the `file_content_round_trips` pair:
 
@@ -262,17 +305,17 @@ fn writes_reach_the_export_on_unmount_without_the_writeback_cache() {
 }
 ```
 
-- [ ] **Step 2: Run the two new cases**
+- [x] **Step 2: Run the two new cases**
 
 Run: `cargo test -p lbfs-tests --test loopback writes_reach_the_export -- --ignored --test-threads=1`
 Expected: PASS, both. They pass on today's tree by design — this is a characterisation test, and its job starts at the next two commits.
 
-- [ ] **Step 3: Run the whole loopback suite**
+- [x] **Step 3: Run the whole loopback suite**
 
 Run: `make test-loopback`
 Expected: PASS, the two new cases among them, and no regression in the existing ones. The suite's size depends on how many cases the two earlier plans added, so count regressions rather than totals.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/tests/loopback.rs
@@ -291,7 +334,7 @@ git commit -m "test(loopback): the unmount drains before it returns"
 - Consumes: the tree the two earlier plans leave — `const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;` above `fn capabilities`, `Capability { bit: u32, name, required }`, `fn requested(writeback: bool) -> u32` in the test module.
 - Produces: the same three items with `u64` in place of `u32`, and `fuser = { version = "=0.16.0", features = ["abi-7-31"] }`.
 
-- [ ] **Step 1: Read the release diff and write down what it says**
+- [x] **Step 1: Read the release diff and write down what it says**
 
 ```bash
 git clone https://github.com/cberner/fuser /tmp/fuser-review 2>/dev/null || true
@@ -304,12 +347,12 @@ git show v0.16.0:Cargo.toml | sed -n '/^\[features\]/,/^\[\[/p'
 
 What to confirm before going on, in this order: `pub trait Filesystem` still takes `&mut self` and `Request<'_>`; `add_capabilities` reads `u64`; `default = []` where 0.15.1 had `default = ["libfuse"]`; and `abi-7-40 = ["abi-7-36", "nix/ioctl"]`. Paste the four answers into the commit message body at Step 8. If any of them has changed, stop and re-price the task rather than editing.
 
-- [ ] **Step 2: Run the tripwire on the pre-bump tree**
+- [x] **Step 2: Run the tripwire on the pre-bump tree**
 
 Run: `cargo test -p lbfs-tests --test loopback privileged_bits -- --ignored --test-threads=1`
 Expected: PASS, both cases. This is the "before" half of the Global Constraint. A red result here means something earlier broke, and this task must not start.
 
-- [ ] **Step 3: Pin the crate**
+- [x] **Step 3: Pin the crate**
 
 In `Cargo.toml`, replace line 35 only, leaving the comment block above it as it stands:
 
@@ -317,12 +360,12 @@ In `Cargo.toml`, replace line 35 only, leaving the comment block above it as it 
 fuser = { version = "=0.16.0", features = ["abi-7-31"] }
 ```
 
-- [ ] **Step 4: Let the compiler name the damage**
+- [x] **Step 4: Let the compiler name the damage**
 
 Run: `cargo check -p lbfs-client 2>&1 | grep -E "^error" | head`
 Expected: `error[E0308]: mismatched types` at the `add_capabilities` call and at the `Capability` entries — the `u32`/`u64` mismatch and nothing else.
 
-- [ ] **Step 5: Widen the three words**
+- [x] **Step 5: Widen the three words**
 
 In `crates/lbfs-client/src/fuse.rs`, change the field on `struct Capability`:
 
@@ -365,17 +408,17 @@ And in the test module, the helper at line 1521:
     }
 ```
 
-- [ ] **Step 6: Run the gate**
+- [x] **Step 6: Run the gate**
 
 Run: `cargo fmt --all && make check`
 Expected: PASS. `cargo test --workspace` reports no failures; clippy is silent.
 
-- [ ] **Step 7: Run both loopback suites, tripwire included**
+- [x] **Step 7: Run both loopback suites, tripwire included**
 
 Run: `make test-loopback`
 Expected: PASS, every case in both suites, `privileged_bits_die_on_write_*` and `writes_reach_the_export_on_unmount_*` included.
 
-- [ ] **Step 8: Commit the crate bump alone**
+- [x] **Step 8: Commit the crate bump alone**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/lbfs-client/src/fuse.rs
@@ -408,7 +451,7 @@ governance note in docs/notes/2026-08-22-fuser-upgrade-assessment.md."
 
 Announcing 7.40 tells the kernel this client understands every feature up to that level, while 0.16.0 names no INIT constant between bit 26 and bit 36 — the only ones above bit 25 on the tag are `FUSE_INIT_EXT` (30), `FUSE_INIT_RESERVED` (31) and `FUSE_PASSTHROUGH` (37). That gap is harmless because every feature in it turns on an INIT flag nobody asks for, and the kernel turns on nothing nobody asked for. Bit 28 is the single exception, and this client asks for it on purpose. The new test is what keeps that argument true after somebody adds a capability without reading this paragraph.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `mod tests` block in `crates/lbfs-client/src/fuse.rs`, beside the other capability tests:
 
@@ -433,12 +476,12 @@ Add to the `mod tests` block in `crates/lbfs-client/src/fuse.rs`, beside the oth
     }
 ```
 
-- [ ] **Step 2: Run it to see it pass on the current ask**
+- [x] **Step 2: Run it to see it pass on the current ask**
 
 Run: `cargo test -p lbfs-client --lib the_only_high_capability`
 Expected: PASS. The test is a guard rather than a driver here; it fails the moment the capability list grows a high bit, which is the point.
 
-- [ ] **Step 3: Declare 7.40**
+- [x] **Step 3: Declare 7.40**
 
 In `Cargo.toml`, replace the comment block at lines 27-34 and the pin at line 35 together:
 
@@ -461,22 +504,22 @@ In `Cargo.toml`, replace the comment block at lines 27-34 and the pin at line 35
 fuser = { version = "=0.16.0", features = ["abi-7-40"] }
 ```
 
-- [ ] **Step 4: Run the gate**
+- [x] **Step 4: Run the gate**
 
 Run: `cargo fmt --all && make check`
 Expected: PASS. `Cargo.lock` gains the `ioctl` feature on the `nix` entry already present at line 579; no new crate appears.
 
-- [ ] **Step 5: Confirm no libfuse link survives**
+- [x] **Step 5: Confirm no libfuse link survives**
 
 Run: `cargo build --release -p lbfs-client && ldd target/release/lbfs-client | grep -i fuse || echo "no fuse library"`
 Expected: `no fuse library`.
 
-- [ ] **Step 6: Run both loopback suites, tripwire included**
+- [x] **Step 6: Run both loopback suites, tripwire included**
 
 Run: `make test-loopback`
 Expected: PASS. This is the run that proves the pure-Rust mount path behaves: `auto_unmount`, the `max_read=` option, the lazy unmount and the drain all go through it now.
 
-- [ ] **Step 7: Commit the ABI bump alone**
+- [x] **Step 7: Commit the ABI bump alone**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/lbfs-client/src/fuse.rs
@@ -506,7 +549,7 @@ test says so and fails if that stops being true."
 
 The client no longer links `libfuse3.so.4`. It runs `fusermount3` as a child process, which the guests already carry through the `fuse3` package (`vm/lib.sh:53`) and the host already needs for `make test-loopback`. **Leave `GUEST_PACKAGES` alone** — dropping `fuse3` would remove the binary the mount now runs.
 
-- [ ] **Step 1: Strip the build container**
+- [x] **Step 1: Strip the build container**
 
 In `Makefile`, replace the comment block and the `build-guest` recipe at lines 23-51:
 
@@ -542,12 +585,12 @@ build-guest:
 	    cargo build --release --target-dir target/guest -p lbfs-server -p lbfs-client'
 ```
 
-- [ ] **Step 2: Build for the guests and check the link**
+- [x] **Step 2: Build for the guests and check the link**
 
 Run: `make build-guest && ldd target/guest/release/lbfs-client | grep -i fuse || echo "no fuse library"`
 Expected: `no fuse library`. Before this change the same command printed `libfuse3.so.4 => not found` on a Fedora host, because the guest links a library the host does not carry.
 
-- [ ] **Step 3: Correct the README**
+- [x] **Step 3: Correct the README**
 
 In `README.md`, replace line 13's sentence:
 
@@ -571,7 +614,7 @@ still install the `fuse3` package, because that is where `fusermount3` comes
 from.
 ```
 
-- [ ] **Step 4: Correct the spec's deployment paragraph**
+- [x] **Step 4: Correct the spec's deployment paragraph**
 
 In `docs/superpowers/specs/2026-08-20-lbfs-design.md`, replace the sentences at lines 360-367:
 
@@ -587,7 +630,7 @@ linking `libfuse3.so`. The original static-musl plan died on one host
 fact that still holds: Fedora's packaged Rust ships no musl std.
 ```
 
-- [ ] **Step 5: Correct the VM comment**
+- [x] **Step 5: Correct the VM comment**
 
 In `vm/up.sh`, replace line 127 inside the package-check comment:
 
@@ -595,7 +638,7 @@ In `vm/up.sh`, replace line 127 inside the package-check comment:
   # suite and the client's mount path depend on, and refuse to report a
 ```
 
-- [ ] **Step 6: Correct the two test messages**
+- [x] **Step 6: Correct the two test messages**
 
 In `tests/tests/loopback.rs`, replace the second assertion of `require_fuse()`:
 
@@ -625,17 +668,17 @@ In `crates/lbfs-client/tests/loopback_cli.rs`, replace the same assertion:
     );
 ```
 
-- [ ] **Step 7: Run the gate and both loopback suites**
+- [x] **Step 7: Run the gate and both loopback suites**
 
 Run: `make check && make test-loopback`
 Expected: PASS.
 
-- [ ] **Step 8: Deploy and run the end-to-end suite**
+- [x] **Step 8: Deploy and run the end-to-end suite**
 
 Run: `make vm-deploy && make vm-test`
 Expected: every PASS line, including the fio `crc32c` verify job and the disconnect drill. If the pair is down, `make vm-up` first. This is the step that proves a binary with no libfuse link mounts on a real guest.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add Makefile README.md docs/superpowers/specs/2026-08-20-lbfs-design.md \
