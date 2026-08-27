@@ -15,9 +15,9 @@ time instead of pulling data down locally before a job runs. The design spec's
 
 ## Build
 
-The host build needs a stable Rust toolchain, `pkg-config`, and the libfuse3
-development package. `make check` runs the standard gate — `cargo fmt --check`,
-`cargo clippy -D warnings`, and the workspace tests:
+The host build needs a stable Rust toolchain and nothing else. `make check`
+runs the standard gate — `cargo fmt --check`, `cargo clippy -D warnings`, and
+the workspace tests:
 
 ```sh
 make check
@@ -33,14 +33,15 @@ make build-guest               # GUEST_IMAGE=docker.io/library/rust:1-trixie
 
 ### Why a container and not a musl target
 
-The client links libfuse3, so a static musl binary would have to carry its own
-copy of it, and a distro-packaged rustc has no musl std to build against in the
-first place. A container running the guests' own libc family solves both at
-once and stays closer to what the guests run. Debian trixie's glibc is older
-than Ubuntu 26.04's, which is the direction that works. The `io-uring` crate
-issues raw syscalls, so liburing never enters the picture, and libfuse3 is the
-one shared library the pair needs beyond libc — cloud-init installs it on both
-guests.
+A distro-packaged rustc has no musl std to build against, so a static musl
+binary is not on the table on this host. A container running the guests' own
+libc family solves that and stays closer to what the guests run. Debian
+trixie's glibc is older than Ubuntu 26.04's, which is the direction that works.
+Neither binary links anything beyond libc: the `io-uring` crate issues raw
+syscalls, and the client mounts through fuser's pure-Rust path, which runs
+`fusermount3` as a child process rather than linking `libfuse3.so`. The guests
+still install the `fuse3` package, because that is where `fusermount3` comes
+from.
 
 ## Server
 
@@ -166,8 +167,17 @@ the install is useful:
    covers the root you just made, then `sudo systemctl restart lbfs-server`.
 
 The client package needs no configuration. It depends on `fuse3` for
-`fusermount3`, which libfuse execs to mount without privileges — `--allow-other`
-additionally wants `user_allow_other` uncommented in `/etc/fuse.conf`.
+`fusermount3`, which fuser's pure-Rust mount path runs to mount without
+privileges — `--allow-other` additionally wants `user_allow_other` uncommented
+in `/etc/fuse.conf`.
+
+The client package wants `libc6 >= 2.39`, which is Ubuntu 24.04 or Debian 13
+and newer. That ceiling is the mount path's doing rather than the protocol's:
+running `fusermount3` from Rust pulls in the standard library's spawn path,
+which imports `pidfd_spawnp`. The symbol is weak and the binary runs on an
+older glibc, but `dpkg` reads the version and refuses the install, so an older
+target needs a build on an older builder. The server package asks only
+for `libc6 >= 2.34`.
 
 ### By hand
 

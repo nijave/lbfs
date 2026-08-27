@@ -333,26 +333,29 @@ fn first_entry_overflow(emitted: usize, name: &[u8]) {
 
 /// One capability this client asks the kernel for, and what its absence costs.
 struct Capability {
-    bit: u32,
+    bit: u64,
     name: &'static str,
     /// Whether a kernel without it makes the mount wrong rather than merely
     /// slow.
     required: bool,
 }
 
-/// `FUSE_HANDLE_KILLPRIV_V2`, which fuser 0.15.1 does not name.
+/// `FUSE_HANDLE_KILLPRIV_V2`, which fuser 0.16.0 does not name.
 ///
 /// fuser's `consts` stops at `FUSE_HANDLE_KILLPRIV` (bit 19). Bit 28 arrived
-/// with ABI 7.33 and fuser negotiates at most 7.31 — but the kernel does not
-/// check the minor version for this flag. `process_init_reply` reads it inside
-/// one `if (arg->minor >= 6)` and applies it with no further guard
-/// (`fs/fuse/inode.c:1411-1414`), exactly as it does for `FUSE_ASYNC_DIO`, and
-/// `fuse_new_init` offers it unconditionally (`inode.c:1505`). The value fits
-/// in `u32`, so fuser's `fuse_init_in.flags` carries it without the `flags2`
-/// extension fuser lacks, and `KernelConfig::add_capabilities` checks the ask
-/// against the kernel's own offered bits rather than a list of names fuser
-/// knows. A locally declared constant is therefore the whole mechanism.
-const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+/// with ABI 7.33 and fuser negotiates at most 7.40 while naming no constant
+/// between bits 26 and 36 — but the kernel does not check the minor version
+/// for this flag. `process_init_reply` reads it inside one `if (arg->minor >=
+/// 6)` and applies it with no further guard (`fs/fuse/inode.c:1411-1414`),
+/// exactly as it does for `FUSE_ASYNC_DIO`, and `fuse_new_init` offers it
+/// unconditionally (`inode.c:1505`). `KernelConfig::add_capabilities` checks
+/// the ask against the kernel's own offered bits rather than a list of names
+/// fuser knows, so a locally declared constant is the whole mechanism.
+///
+/// The word is `u64` from 0.16.0 on: that release widened the whole INIT flag
+/// family and `add_capabilities` with it, to make room for the bits above 31
+/// that `fuse_init_in.flags2` carries.
+const FUSE_HANDLE_KILLPRIV_V2: u64 = 1 << 28;
 
 /// The capabilities this client asks the kernel for.
 ///
@@ -1563,7 +1566,7 @@ mod tests {
         assert_eq!(READDIR_PAGE_BYTES, 4096);
     }
 
-    fn requested(writeback: bool) -> u32 {
+    fn requested(writeback: bool) -> u64 {
         capabilities(writeback).iter().fold(0, |all, c| all | c.bit)
     }
 
@@ -1600,7 +1603,7 @@ mod tests {
     }
 
     /// The one capability this whole change exists for. Bit 28 per
-    /// `include/uapi/linux/fuse.h`; fuser 0.15.1 has no constant for it, and
+    /// `include/uapi/linux/fuse.h`; fuser 0.16.0 has no constant for it, and
     /// `KernelConfig::add_capabilities` accepts any bit the kernel offered, so
     /// the local constant is the whole mechanism.
     #[test]
@@ -1627,6 +1630,25 @@ mod tests {
                 .expect("the capability list carries it");
             assert!(!cap.required);
             assert_eq!(cap.name, "FUSE_HANDLE_KILLPRIV_V2");
+        }
+    }
+
+    /// Declaring ABI 7.40 is a claim about what this client understands, and
+    /// fuser 0.16.0 names no INIT constant between bit 26 and bit 36 — above
+    /// bit 25 the tag carries only `FUSE_INIT_EXT` (30), `FUSE_INIT_RESERVED`
+    /// (31) and `FUSE_PASSTHROUGH` (37). The claim holds because a feature
+    /// nobody asks for is a feature the kernel leaves off. Bit 28 is the one
+    /// high bit this client does ask for, declared locally and answered by the
+    /// server's own set-user-ID strip. Anything else appearing up here is a
+    /// feature being negotiated with no code behind it.
+    #[test]
+    fn the_only_high_capability_asked_for_is_killpriv_v2() {
+        for writeback in [true, false] {
+            let high = requested(writeback) & !((1u64 << 26) - 1);
+            assert_eq!(
+                high, FUSE_HANDLE_KILLPRIV_V2,
+                "an unexpected capability above bit 25 (writeback={writeback})"
+            );
         }
     }
 

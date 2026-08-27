@@ -20,13 +20,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # fuser's build script links libfuse via pkg-config, so even
-      # check-only builds need its development headers.
-      - name: Install libfuse3
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libfuse3-dev pkg-config
-
       - name: Format
         run: cargo fmt --all --check
 
@@ -36,7 +29,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # Disabled until the fuser package upgrade is merged; re-enable then.
+  # Disabled, and two things have to clear before it comes back. The fuser
+  # advisory (RUSTSEC-2021-0154) is one, and pinning `=0.16.0` retires it. The
+  # other is RUSTSEC-2023-0089, which arrives through a dependency fuser has
+  # nothing to do with — see `deny.toml`. Re-enabling on the strength of the
+  # fuser bump alone leaves this job red.
   # audit:
   #   runs-on: ubuntu-latest
   #   steps:
@@ -59,11 +56,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install libfuse3
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libfuse3-dev pkg-config
 
       - uses: taiki-e/install-action@v2
         with:
@@ -102,7 +94,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # Major kept in step with `upload-artifact` above, so the pair that
+      # writes and reads one artifact is never split across a format change.
+      - uses: actions/download-artifact@v7
         with:
           name: lbfs-debs
           path: debs

@@ -114,8 +114,9 @@ fn require_fuse() {
     );
     assert!(
         which("fusermount3").is_some(),
-        "the loopback suite needs `fusermount3` on PATH: libfuse3 shells out to \
-         it for both the unprivileged mount and the unmount. Install fuse3."
+        "the loopback suite needs `fusermount3` on PATH: fuser's pure-Rust \
+         mount path runs it for both the unprivileged mount and the unmount. \
+         Install fuse3."
     );
 }
 
@@ -394,7 +395,7 @@ impl Loopback {
     /// asserting about what the mount left behind has to happen after this
     /// returns.
     ///
-    /// **Every file opened on the mount must be closed first.** libfuse3
+    /// **Every file opened on the mount must be closed first.** `fusermount3`
     /// unmounts with `MNT_DETACH`, which takes the mountpoint out of the mount
     /// table at once but leaves the superblock — and with it the FUSE
     /// connection — alive until the last reference goes. One `File` still in
@@ -648,6 +649,68 @@ fn file_content_round_trips_with_the_writeback_cache() {
 #[ignore = "mounts a real filesystem; run with `make test-loopback`"]
 fn file_content_round_trips_without_the_writeback_cache() {
     file_content_round_trips(false);
+}
+
+/// Unmounting is the drain, and the drain is what the shipped binary leans on.
+///
+/// `crates/lbfs-client/src/main.rs` treats `drop(session)` as "unmount, drain,
+/// exit": `umount(2)` syncs the superblock before it detaches, so whatever the
+/// client kernel still holds comes back through this bridge as ordinary
+/// `WRITE` callbacks, on a session thread that is still running and a
+/// connection that is still open. Every other case in this file reads its data
+/// back through the mount, which proves the round trip and not the teardown.
+/// This one reads only from the export, and only after the unmount has
+/// returned, so a teardown that detached early would show up as missing bytes
+/// rather than as a passing test.
+///
+/// It doubles as the guard on the unmount path itself. `Loopback::unmount`
+/// gives the session thread a bounded time to end; a crate whose unmount stops
+/// waking that thread fails here with a timeout instead of hanging the run.
+fn writes_reach_the_export_by_the_time_the_unmount_returns(writeback: bool) {
+    let mut lb = Loopback::start(Opts {
+        writeback,
+        ..Opts::default()
+    });
+    lb.wait_ready();
+
+    // Many small files plus one large one: the small ones exercise the
+    // per-file teardown path, the large one spans enough pages that the
+    // writeback thread, rather than the closing descriptor, carries some of it.
+    let mut expected: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    for i in 0..64u8 {
+        let body = vec![i; 64 << 10];
+        std::fs::write(lb.mnt().join(format!("small-{i}")), &body).unwrap();
+        expected.push((lb.export().join(format!("small-{i}")), body));
+    }
+    let big: Vec<u8> = (0..(8u32 << 20)).map(|n| (n % 251) as u8).collect();
+    std::fs::write(lb.mnt().join("big"), &big).unwrap();
+    expected.push((lb.export().join("big"), big));
+
+    lb.unmount();
+
+    for (path, body) in expected {
+        let landed = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{} is missing after the unmount: {e}", path.display()));
+        assert_eq!(
+            landed.len(),
+            body.len(),
+            "{} is short after the unmount",
+            path.display()
+        );
+        assert!(landed == body, "{} holds the wrong bytes", path.display());
+    }
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn writes_reach_the_export_on_unmount_with_the_writeback_cache() {
+    writes_reach_the_export_by_the_time_the_unmount_returns(true);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn writes_reach_the_export_on_unmount_without_the_writeback_cache() {
+    writes_reach_the_export_by_the_time_the_unmount_returns(false);
 }
 
 /// The promise `FUSE_HANDLE_KILLPRIV_V2` buys, checked end to end.

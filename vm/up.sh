@@ -124,7 +124,7 @@ for ip in "$SERVER_IP" "$CLIENT_IP"; do
   # The verdict comes from dpkg, not from cloud-init's own opinion of itself.
   # `done` says nothing about whether a package landed, and `degraded` covers
   # plenty that Task 18 would never notice — so ask directly about the six the
-  # suite and the client's libfuse3 link depend on, and refuse to report a
+  # suite and the client's mount path depend on, and refuse to report a
   # working pair without them. `db:Status-Status` reads `installed` only for a
   # package that is really there, and dpkg-query complains on stderr about one
   # it has never heard of, which is worth keeping in the diagnostic.

@@ -31,11 +31,11 @@ workspace = true
 [package.metadata.deb]
 maintainer = "Nick Venenga <nick@venenga.com>"
 section = "utils"
-# `fuse3`, not `libfuse3-3`. `$auto` runs dpkg-shlibdeps over the ELF, so the
-# library fuser links — `libfuse3.so.3` — is already covered and naming it here
-# adds nothing. What the ELF cannot show is the helper libfuse execs:
-# `fusermount3` and `/etc/fuse.conf` ship in `fuse3`, and an unprivileged
-# mount, `--allow-other`, and `--auto-unmount` each need them. `fuse3` depends
-# on `libfuse3-3`, so the library still arrives.
+# `fuse3` has to be named here, and `$auto` cannot find it. Since fuser 0.16.0
+# the client links no FUSE library at all — it mounts through the crate's
+# pure-Rust path — so dpkg-shlibdeps reads the ELF and sees only libc. What the
+# ELF cannot show is the program that path execs: `fusermount3` and
+# `/etc/fuse.conf` ship in `fuse3`, and an unprivileged mount,
+# `--allow-other`, and `--auto-unmount` each need them.
 depends = "fuse3, $auto"
 assets = [["target/release/lbfs-client", "usr/bin/", "755"]]
