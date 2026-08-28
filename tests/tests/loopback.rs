@@ -221,10 +221,13 @@ struct Opts {
     /// tuning knob.
     writeback: bool,
     fsync: FsyncPolicy,
-    /// Entry and attribute lifetime. Zero makes every name and every `stat` a
-    /// round trip, which is what a test about a *dead* server needs — with the
-    /// default second, the kernel would answer from cache and prove nothing.
+    /// Attribute lifetime. Zero makes every `stat` a round trip, which is
+    /// what a test about a *dead* server needs — with the default second, the
+    /// kernel would answer from cache and prove nothing.
     ttl: Duration,
+    /// Name lifetime. Defaults to `ttl`, which is what the shipped client does
+    /// when `--entry-timeout` is absent.
+    entry_ttl: Duration,
 }
 
 impl Default for Opts {
@@ -234,6 +237,7 @@ impl Default for Opts {
             writeback: true,
             fsync: FsyncPolicy::Honor,
             ttl: Duration::from_secs(1),
+            entry_ttl: Duration::from_secs(1),
         }
     }
 }
@@ -333,6 +337,7 @@ impl Loopback {
             Arc::clone(&conn),
             client_rt.handle().clone(),
             opts.ttl,
+            opts.entry_ttl,
             opts.writeback,
         );
         // The same option list the binary builds, from the same negotiated
@@ -712,6 +717,45 @@ fn writes_reach_the_export_on_unmount_with_the_writeback_cache() {
 #[ignore = "mounts a real filesystem; run with `make test-loopback`"]
 fn writes_reach_the_export_on_unmount_without_the_writeback_cache() {
     writes_reach_the_export_by_the_time_the_unmount_returns(false);
+}
+
+/// A long name lifetime beside a short attribute lifetime, end to end.
+///
+/// The point of separating them is that a path can stay resolved while its
+/// attributes go stale, so this asserts both halves: a `stat` past the
+/// attribute lifetime sees a size the server changed behind the mount's back,
+/// and the name itself never had to be looked up again for that to happen.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn a_long_name_lifetime_does_not_hold_a_stale_size() {
+    let lb = Loopback::start(Opts {
+        ttl: Duration::from_millis(50),
+        entry_ttl: Duration::from_secs(3600),
+        // With the writeback cache on, the kernel owns `i_size` for a file
+        // this mount wrote and never refetches it, so no attribute lifetime —
+        // short or long — would let the server's change show through. The
+        // subject here is the TTL split, so the cache that overrides both
+        // lifetimes stays off.
+        writeback: false,
+        ..Opts::default()
+    });
+    lb.wait_ready();
+
+    let seen = lb.mnt().join("grows");
+    let real = lb.export().join("grows");
+    std::fs::write(&seen, b"one").unwrap();
+    assert_eq!(std::fs::metadata(&seen).unwrap().len(), 3);
+
+    // Behind the mount's back, so only an expired attribute lifetime can
+    // reveal it.
+    std::fs::write(&real, b"four-plus").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        std::fs::metadata(&seen).unwrap().len(),
+        9,
+        "the attribute lifetime did not expire, or the entry lifetime pinned it"
+    );
 }
 
 /// The promise `FUSE_HANDLE_KILLPRIV_V2` buys, checked end to end.
@@ -1557,6 +1601,7 @@ fn a_dead_server_leaves_an_eio_mount_that_still_unmounts() {
     // nothing about the connection underneath.
     let mut lb = Loopback::start(Opts {
         ttl: Duration::ZERO,
+        entry_ttl: Duration::ZERO,
         ..Opts::default()
     });
     let mnt = lb.mnt().to_path_buf();

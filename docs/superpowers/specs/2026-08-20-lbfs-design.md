@@ -331,7 +331,10 @@ A future control message will force a real sync regardless of this setting;
   negotiated window is a semaphore acquired before send. `FORGET`s skip the
   table (no reply); the client batches them, flushing on count or timer.
 - **Caching (all kernel-side, justified by the one-client assumption):**
-  `entry_timeout`/`attr_timeout` default 1 s, CLI-tunable (0 disables);
+  `entry_timeout`/`attr_timeout` default 1 s, both CLI-tunable (0 disables),
+  and `entry_timeout` defaults to whatever `attr_timeout` is. The split
+  reaches `ReplyEntry` replies only — `CREATE` and `READDIRPLUS` carry one
+  lifetime and send it as both;
   **writeback cache** on (kernel aggregates small writes — the biggest win
   for build workloads); `keep_cache` so re-reads stay local; `readdirplus`
   on; `max_write`/`max_readahead` = negotiated max I/O size.
@@ -360,7 +363,7 @@ A future control message will force a real sync regardless of this setting;
 - **Lifecycle:** `connect → HELLO → ATTACH → mount`; pre-mount failures are
   clean CLI errors. SIGINT/SIGTERM: unmount, drain, exit. CLI:
   `lbfs-client <server:port> <remote-path> <mountpoint> [--attr-timeout N]
-  [--allow-other] [--auto-unmount] [--no-writeback]`.
+  [--entry-timeout N] [--allow-other] [--auto-unmount] [--no-writeback]`.
 - **Connection loss:** all in-flight and later ops fail `EIO`; the mount
   stays present and cleanly unmountable. No transparent reconnect in v1
   (node/handle state is session-scoped server-side; honest reconnection

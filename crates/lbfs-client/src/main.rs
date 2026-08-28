@@ -45,6 +45,19 @@ struct Cli {
     #[arg(long, default_value_t = 1.0)]
     attr_timeout: f64,
 
+    /// How long the kernel may trust a cached name, in seconds.
+    ///
+    /// Defaults to `--attr-timeout`, which is what this client did before the
+    /// two became separable. Raising it alone suits a workload that resolves
+    /// the same paths repeatedly and reads their attributes rarely — a build
+    /// tree is the case in point. Zero disables dentry caching. It reaches
+    /// `LOOKUP`, `MKDIR`, `SYMLINK` and `LINK` replies; a file this mount
+    /// created, and a name it learned from a directory listing, use
+    /// `--attr-timeout` for both lifetimes because FUSE's reply for those
+    /// carries only one.
+    #[arg(long)]
+    entry_timeout: Option<f64>,
+
     /// Let other users on this machine reach the mount.
     #[arg(long)]
     allow_other: bool,
@@ -119,6 +132,7 @@ fn run() -> Result<(), StartupError> {
 
     let cli = Cli::parse();
     let ttl = attr_timeout(cli.attr_timeout)?;
+    let entry_ttl = entry_timeout(cli.entry_timeout, ttl)?;
     if !cli.remote_path.is_absolute() {
         // The server matches the path against its allowlist after resolving it
         // from its own working directory, so a relative one is at best a
@@ -146,7 +160,7 @@ fn run() -> Result<(), StartupError> {
     let mut signals = rt.block_on(async { Signals::install() })?;
 
     let cfg = session_config(limits.max_io_size, cli.allow_other, cli.auto_unmount);
-    let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, writeback);
+    let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, entry_ttl, writeback);
     let session =
         fuser::spawn_mount(fs, &cli.mountpoint, &cfg).map_err(|source| StartupError::Mount {
             path: cli.mountpoint.display().to_string(),
@@ -249,6 +263,19 @@ fn attr_timeout(secs: f64) -> Result<Duration, StartupError> {
     Duration::try_from_secs_f64(secs).map_err(|_| StartupError::AttrTimeout)
 }
 
+/// The name lifetime, falling back to the attribute lifetime when the operator
+/// named only one.
+///
+/// A fallback rather than a constant default, so `--attr-timeout 0` keeps
+/// disabling both caches the way it always did, and a mount that names neither
+/// flag behaves as every mount did before the two became separable.
+fn entry_timeout(entry: Option<f64>, attr: Duration) -> Result<Duration, StartupError> {
+    match entry {
+        None => Ok(attr),
+        Some(secs) => attr_timeout(secs),
+    }
+}
+
 /// `host:port` to one address.
 ///
 /// Blocking DNS, which is correct here: this runs once, before the runtime has
@@ -286,9 +313,55 @@ mod tests {
         assert_eq!(cli.mountpoint, PathBuf::from("/mnt/lbfs"));
         // Spec §7: caching on, writeback on, mount private to its owner.
         assert_eq!(cli.attr_timeout, 1.0);
+        assert_eq!(cli.entry_timeout, None);
         assert!(!cli.no_writeback);
         assert!(!cli.allow_other);
         assert!(!cli.auto_unmount);
+    }
+
+    /// Absent means "the same as the attribute lifetime", which is what every
+    /// mount did before `entry_with_ttls` made the two separable. Present
+    /// means what it says, including zero, which disables dentry caching on
+    /// its own.
+    #[test]
+    fn the_entry_lifetime_falls_back_to_the_attribute_lifetime() {
+        let attr = Duration::from_millis(500);
+        assert_eq!(entry_timeout(None, attr).unwrap(), attr);
+        assert_eq!(
+            entry_timeout(Some(60.0), attr).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(entry_timeout(Some(0.0), attr).unwrap(), Duration::ZERO);
+        assert!(entry_timeout(Some(-1.0), attr).is_err());
+        assert!(entry_timeout(Some(f64::NAN), attr).is_err());
+    }
+
+    /// The flag parses, and its absence parses as absence rather than as a
+    /// number somebody has to remember the meaning of.
+    #[test]
+    fn the_entry_timeout_flag_parses() {
+        let cli = Cli::parse_from([
+            "lbfs-client",
+            "--attr-timeout",
+            "0.5",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(cli.entry_timeout, None);
+
+        let split = Cli::parse_from([
+            "lbfs-client",
+            "--attr-timeout",
+            "0.5",
+            "--entry-timeout",
+            "60",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(split.attr_timeout, 0.5);
+        assert_eq!(split.entry_timeout, Some(60.0));
     }
 
     #[test]

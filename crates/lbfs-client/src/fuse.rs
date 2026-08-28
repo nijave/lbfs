@@ -513,14 +513,24 @@ pub fn session_config(max_io_size: u32, allow_other: bool, auto_unmount: bool) -
 // The filesystem
 // ---------------------------------------------------------------------------
 
-/// The `fuser::Filesystem` implementation: one connection, one runtime, one
-/// cache lifetime.
+/// The `fuser::Filesystem` implementation: one connection, one runtime, two
+/// cache lifetimes.
 pub struct LbfsFuse {
     conn: Arc<Connection>,
     rt: tokio::runtime::Handle,
-    /// Both the entry and the attribute timeout (spec §7). Zero disables
-    /// kernel caching of both.
-    ttl: Duration,
+    /// How long the kernel may trust a cached `stat` (spec §7). Zero disables
+    /// attribute caching.
+    attr_ttl: Duration,
+    /// How long the kernel may trust a cached name-to-node mapping (spec §7).
+    /// Zero disables dentry caching.
+    ///
+    /// Separate from `attr_ttl` only where `ReplyEntry` carries the reply.
+    /// `ReplyCreate::created` and `ReplyDirectoryPlus::add` still take one
+    /// lifetime and send it as both, so a file this mount just created, and a
+    /// name it learned from a `READDIRPLUS`, both cache their dentry for
+    /// `attr_ttl`. Erring short costs round trips and never correctness, which
+    /// is the direction to err in.
+    entry_ttl: Duration,
     writeback: bool,
 }
 
@@ -528,20 +538,28 @@ impl LbfsFuse {
     pub fn new(
         conn: Arc<Connection>,
         rt: tokio::runtime::Handle,
-        ttl: Duration,
+        attr_ttl: Duration,
+        entry_ttl: Duration,
         writeback: bool,
     ) -> LbfsFuse {
         LbfsFuse {
             conn,
             rt,
-            ttl,
+            attr_ttl,
+            entry_ttl,
             writeback,
         }
     }
 
     /// What every callback captures before it spawns.
     fn ctx(&self) -> (Arc<Connection>, Duration) {
-        (Arc::clone(&self.conn), self.ttl)
+        (Arc::clone(&self.conn), self.attr_ttl)
+    }
+
+    /// The same, for the four callbacks that answer with a `ReplyEntry` and can
+    /// therefore give the two lifetimes different values.
+    fn entry_ctx(&self) -> (Arc<Connection>, Duration, Duration) {
+        (Arc::clone(&self.conn), self.attr_ttl, self.entry_ttl)
     }
 }
 
@@ -555,10 +573,18 @@ fn errno(e: Errno) -> FuseErrno {
     FuseErrno::from_i32(i32::from(e.0))
 }
 
-fn reply_entry(reply: ReplyEntry, ttl: Duration, r: Result<Entry, Errno>) {
+fn reply_entry(
+    reply: ReplyEntry,
+    attr_ttl: Duration,
+    entry_ttl: Duration,
+    r: Result<Entry, Errno>,
+) {
     match r {
-        Ok(e) => reply.entry(
-            &ttl,
+        // Attribute lifetime first: that is the order `entry_with_ttls` takes,
+        // and swapping them compiles cleanly and caches the wrong thing.
+        Ok(e) => reply.entry_with_ttls(
+            &attr_ttl,
+            &entry_ttl,
             &to_fuse_attr(e.node, &e.attr),
             Generation(e.generation),
         ),
@@ -672,7 +698,8 @@ impl fuser::Filesystem for LbfsFuse {
         tracing::info!(
             max_io,
             writeback = self.writeback,
-            ttl = ?self.ttl,
+            attr_ttl = ?self.attr_ttl,
+            entry_ttl = ?self.entry_ttl,
             "mount initialized"
         );
         Ok(())
@@ -688,10 +715,11 @@ impl fuser::Filesystem for LbfsFuse {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
-        let (conn, ttl) = self.ctx();
+        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
         let name = name.as_bytes().to_vec();
-        self.rt
-            .spawn(async move { reply_entry(reply, ttl, conn.lookup(parent, &name).await) });
+        self.rt.spawn(async move {
+            reply_entry(reply, attr_ttl, entry_ttl, conn.lookup(parent, &name).await)
+        });
     }
 
     /// No reply object, no way to wait: [`Connection::send_forget`] is
@@ -785,10 +813,16 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
-        let (conn, ttl) = self.ctx();
+        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
         let name = name.as_bytes().to_vec();
-        self.rt
-            .spawn(async move { reply_entry(reply, ttl, conn.mkdir(parent, &name, mode).await) });
+        self.rt.spawn(async move {
+            reply_entry(
+                reply,
+                attr_ttl,
+                entry_ttl,
+                conn.mkdir(parent, &name, mode).await,
+            )
+        });
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -816,11 +850,16 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
-        let (conn, ttl) = self.ctx();
+        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
         let name = link_name.as_bytes().to_vec();
         let target = target.as_os_str().as_bytes().to_vec();
         self.rt.spawn(async move {
-            reply_entry(reply, ttl, conn.symlink(parent, &name, &target).await)
+            reply_entry(
+                reply,
+                attr_ttl,
+                entry_ttl,
+                conn.symlink(parent, &name, &target).await,
+            )
         });
     }
 
@@ -860,11 +899,16 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEntry,
     ) {
         let (ino, newparent) = (ino.0, newparent.0);
-        let (conn, ttl) = self.ctx();
+        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
         let newname = newname.as_bytes().to_vec();
-        self.rt.spawn(
-            async move { reply_entry(reply, ttl, conn.link(ino, newparent, &newname).await) },
-        );
+        self.rt.spawn(async move {
+            reply_entry(
+                reply,
+                attr_ttl,
+                entry_ttl,
+                conn.link(ino, newparent, &newname).await,
+            )
+        });
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {

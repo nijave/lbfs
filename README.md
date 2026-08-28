@@ -122,6 +122,7 @@ mismatch prints a plain error instead of leaving an `EIO` mountpoint behind.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--attr-timeout <seconds>` | `1.0` | How long the kernel may trust a cached name or attribute. `0` turns both caches off. Fractions are fine. |
+| `--entry-timeout <seconds>` | same as `--attr-timeout` | How long the kernel may trust a cached name. Raise it alone for a workload that resolves the same paths often and reads their attributes rarely. Reaches `LOOKUP`, `MKDIR`, `SYMLINK` and `LINK`; a freshly created file and a name from a listing use `--attr-timeout` for both, because FUSE's reply for those carries one lifetime. |
 | `--allow-other` | off | Let other users on the client machine reach the mount. |
 | `--auto-unmount` | off | Ask `fusermount3` to unmount if the process dies uncleanly. Implies `--allow-other`, and needs `user_allow_other` in `/etc/fuse.conf`. |
 | `--no-writeback` | off | Write through to the server instead of letting the kernel batch dirty pages. |

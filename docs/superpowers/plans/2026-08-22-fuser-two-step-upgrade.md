@@ -215,6 +215,13 @@ promises none. Task 7 accordingly has two hand-declared constants to retire
 `fuser::consts` forced), not three; `FOPEN_PARALLEL_DIRECT_WRITES` becomes the
 parallel-writes plan's business on the day its client change lands.
 
+**Task 8's loopback case cannot pass as written.** Its `Opts` keep the
+fixture's `writeback: true`, and under the writeback cache the kernel owns
+`i_size` for a file the mount wrote — no attribute lifetime, short or long,
+lets a server-side size change show through. The mechanism under test is the
+TTL split, so the shipped case turns the writeback cache off and says why in
+place.
+
 ---
 
 ## File Map
@@ -1878,7 +1885,7 @@ Spec §7 has always written this as two knobs — "`entry_timeout`/`attr_timeout
 
 The split reaches `lookup`, `mkdir`, `symlink` and `link`. `ReplyCreate::created` and `ReplyDirectoryPlus::add` still send one lifetime as both, so a freshly created file and a name learned from a listing use the attribute lifetime for their dentry. That is the conservative direction — a shorter name lifetime costs round trips, never correctness — and it wants saying in the field's doc comment so nobody reads the flag as covering more than it does.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The defaulting rule is the only branch worth a unit test, and it belongs in
 `crates/lbfs-client/src/main.rs` beside `attr_timeout`, which it mirrors. The
@@ -1906,12 +1913,12 @@ Add to the `mod tests` block in `crates/lbfs-client/src/main.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p lbfs-client --lib entry_lifetime`
 Expected: FAIL — `cannot find function 'entry_timeout' in this scope`.
 
-- [ ] **Step 3: Give the bridge two lifetimes**
+- [x] **Step 3: Give the bridge two lifetimes**
 
 Replace the struct, its constructor and `ctx`:
 
@@ -1967,7 +1974,7 @@ impl LbfsFuse {
 }
 ```
 
-- [ ] **Step 4: Widen `reply_entry` and its four callers**
+- [x] **Step 4: Widen `reply_entry` and its four callers**
 
 ```rust
 fn reply_entry(
@@ -2004,7 +2011,7 @@ The `tracing::info!` at the end of `init` gains the second number:
         );
 ```
 
-- [ ] **Step 5: Add the CLI flag**
+- [x] **Step 5: Add the CLI flag**
 
 In `crates/lbfs-client/src/main.rs`, add after `attr_timeout`:
 
@@ -2048,7 +2055,7 @@ and in `run()`, after `let ttl = attr_timeout(cli.attr_timeout)?;`:
 
 then pass it: `LbfsFuse::new(conn, rt.handle().clone(), ttl, entry_ttl, writeback)`.
 
-- [ ] **Step 6: Add the CLI test**
+- [x] **Step 6: Add the CLI test**
 
 In the `mod tests` block of `main.rs`, extend `cli_parses_the_documented_invocation` with one line and add one case:
 
@@ -2086,7 +2093,7 @@ In the `mod tests` block of `main.rs`, extend `cli_parses_the_documented_invocat
     }
 ```
 
-- [ ] **Step 7: Repair the loopback fixture**
+- [x] **Step 7: Repair the loopback fixture**
 
 In `tests/tests/loopback.rs`, add a field to `Opts` and its default:
 
@@ -2115,7 +2122,7 @@ and pass it at the construction site near line 331:
 
 Every existing `Opts { ttl: Duration::ZERO, ..Opts::default() }` in the file keeps a one-second entry lifetime after this change, which would defeat any case that sets `ttl` to zero to force a round trip. Find them with `grep -n "ttl:" tests/tests/loopback.rs` and set `entry_ttl: Duration::ZERO` beside each one.
 
-- [ ] **Step 8: Add the loopback case**
+- [x] **Step 8: Add the loopback case**
 
 ```rust
 /// A long name lifetime beside a short attribute lifetime, end to end.
@@ -2152,12 +2159,12 @@ fn a_long_name_lifetime_does_not_hold_a_stale_size() {
 }
 ```
 
-- [ ] **Step 9: Run the tests**
+- [x] **Step 9: Run the tests**
 
 Run: `cargo test -p lbfs-client --lib entry_lifetime entry_timeout_flag && cargo test -p lbfs-tests --test loopback a_long_name_lifetime -- --ignored --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 10: Document the flag**
+- [x] **Step 10: Document the flag**
 
 In `README.md`, add a row to the client flag table beside `--attr-timeout`:
 
@@ -2181,12 +2188,12 @@ and update the CLI line further down the same section:
   [--entry-timeout N] [--allow-other] [--auto-unmount] [--no-writeback]`.
 ```
 
-- [ ] **Step 11: Run the whole gate**
+- [x] **Step 11: Run the whole gate**
 
 Run: `make check && make test-loopback`
 Expected: PASS.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs crates/lbfs-client/src/main.rs \
