@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use lbfs_client::conn::Connection;
-use lbfs_client::fuse::{mount_options, LbfsFuse};
+use lbfs_client::fuse::{session_config, LbfsFuse};
 use lbfs_proto::frame::{DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE};
 use lbfs_server::config::{Allowlist, Config, FsyncPolicy};
 use rustix::fs::{StatVfsMountFlags, XattrFlags};
@@ -339,7 +339,7 @@ impl Loopback {
         // ceiling: `max_read` has to agree with what the multiplexer will
         // accept or the kernel issues reads that come back `EINVAL`.
         let session =
-            fuser::spawn_mount2(fs, &mnt, &mount_options(limits.max_io_size, false, false))
+            fuser::spawn_mount(fs, &mnt, &session_config(limits.max_io_size, false, false))
                 .expect("the mount succeeds");
 
         let mounted = Loopback {
@@ -357,10 +357,10 @@ impl Loopback {
 
     /// Wait until the mount answers, or say why it never will.
     ///
-    /// `spawn_mount2` returns once the mount syscall is done, but `INIT` runs
+    /// `spawn_mount` returns once the mount syscall is done, but `INIT` runs
     /// afterwards on the session thread — and `init` is allowed to refuse,
     /// which ends the session and leaves an `ENOTCONN` mountpoint behind a
-    /// perfectly successful `spawn_mount2`. Watching the session thread turns
+    /// perfectly successful `spawn_mount`. Watching the session thread turns
     /// that into a named failure instead of a twenty-second timeout.
     fn wait_ready(&self) {
         let session = self.session.as_ref().expect("just mounted");
@@ -420,8 +420,8 @@ impl Loopback {
     /// The same, reporting rather than asserting, so [`Loopback::drop`] can use
     /// it. A panic raised while unwinding aborts the whole test binary and
     /// takes every other case's diagnostics with it, and
-    /// `BackgroundSession::join` unwraps both the thread result and the
-    /// session's `io::Result`.
+    /// `BackgroundSession::umount_and_join` returns an `io::Result` that a
+    /// failed unmount fills in.
     fn try_unmount(&mut self) -> bool {
         let Some(session) = self.session.take() else {
             return !is_fuse_mount(&self.mnt);
@@ -432,8 +432,9 @@ impl Loopback {
         // down rather than being left behind.
         let (done, ended) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || session.join()));
-            let _ = done.send(outcome.is_ok());
+            let outcome =
+                std::panic::catch_unwind(AssertUnwindSafe(move || session.umount_and_join()));
+            let _ = done.send(matches!(outcome, Ok(Ok(()))));
         });
         match ended.recv_timeout(UNMOUNT_TIMEOUT) {
             Ok(true) => true,

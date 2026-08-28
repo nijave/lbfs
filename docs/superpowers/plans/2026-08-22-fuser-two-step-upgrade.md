@@ -204,6 +204,17 @@ features that select them, so a feature flag alone moves nothing there. The
 claim the step actually needed — that the ABI bump adds no crate — held, and
 `cargo tree` is what shows it.
 
+**Task 6 describes an `open_flags` this tree never had.** Steps 6 and 13
+assume the parallel-writes plan left `open_flags(app_flags)` requesting
+`FOPEN_PARALLEL_DIRECT_WRITES` on `O_DIRECT` opens. That plan's client-side
+change never merged — `main`'s `open_flags()` takes no arguments and asks for
+`FOPEN_KEEP_CACHE` alone — so the migration kept that shape, retyped to
+`FopenFlags`, rather than introduce a behaviour change inside a commit that
+promises none. Task 7 accordingly has two hand-declared constants to retire
+(`FUSE_HANDLE_KILLPRIV_V2` and the local `FUSE_WRITE_KILL_PRIV` the removal of
+`fuser::consts` forced), not three; `FOPEN_PARALLEL_DIRECT_WRITES` becomes the
+parallel-writes plan's business on the day its client change lands.
+
 ---
 
 ## File Map
@@ -797,12 +808,12 @@ git commit -m "docs: record the 0.18.0 diff read before the bump"
 
 One commit, and one behaviour change: none. Everything the new API makes possible waits for Tasks 7 through 9, so a reviewer reading this diff is checking a translation and nothing else.
 
-- [ ] **Step 1: Run the tripwire on the pre-bump tree**
+- [x] **Step 1: Run the tripwire on the pre-bump tree**
 
 Run: `cargo test -p lbfs-tests --test loopback privileged_bits -- --ignored --test-threads=1`
 Expected: PASS, both cases.
 
-- [ ] **Step 2: Pin the crate**
+- [x] **Step 2: Pin the crate**
 
 In `Cargo.toml`, replace the comment block and pin from Task 3 with:
 
@@ -820,12 +831,12 @@ In `Cargo.toml`, replace the comment block and pin from Task 3 with:
 fuser = { version = "=0.18.0" }
 ```
 
-- [ ] **Step 3: Read the wall of errors once, before editing**
+- [x] **Step 3: Read the wall of errors once, before editing**
 
 Run: `cargo check -p lbfs-client 2>&1 | grep -c "^error"`
 Expected: a three-digit number. Read the first twenty with `cargo check -p lbfs-client 2>&1 | head -80` so the shapes below are recognisable rather than surprising.
 
-- [ ] **Step 4: Replace the import block**
+- [x] **Step 4: Replace the import block**
 
 In `crates/lbfs-client/src/fuse.rs`, replace lines 47-67 — the whole `use` block, `fuser::consts` included — with:
 
@@ -857,7 +868,7 @@ use lbfs_proto::Errno;
 use crate::conn::Connection;
 ```
 
-- [ ] **Step 5: Retype the two local constants and the capability list**
+- [x] **Step 5: Retype the two local constants and the capability list**
 
 The two constants keep their raw values for this commit; Task 7 is where the question of trusting the crate's own names gets asked. Replace the declaration the kill-priv plan left:
 
@@ -901,7 +912,7 @@ struct Capability {
 | `FUSE_HANDLE_KILLPRIV_V2` | `FUSE_HANDLE_KILLPRIV_V2` | unchanged — the local constant is an `InitFlags` now |
 | `FUSE_WRITEBACK_CACHE` | `FUSE_WRITEBACK_CACHE` | `InitFlags::FUSE_WRITEBACK_CACHE` |
 
-- [ ] **Step 6: Rewrite `open_flags`**
+- [x] **Step 6: Rewrite `open_flags`**
 
 Replace the signature and body the parallel-writes plan left, keeping its doc comment word for word above it:
 
@@ -917,7 +928,7 @@ fn open_flags(app_flags: OpenFlags) -> FopenFlags {
 
 `OpenFlags` is `pub struct OpenFlags(pub i32)`, so `.0` is the application's own flag word, unchanged in meaning from the `i32` the callback used to receive.
 
-- [ ] **Step 7: Replace `mount_options` with `session_config`**
+- [x] **Step 7: Replace `mount_options` with `session_config`**
 
 Replace `pub fn mount_options(...)` at line 426 and its doc comment entirely:
 
@@ -982,7 +993,7 @@ pub fn session_config(max_io_size: u32, allow_other: bool, auto_unmount: bool) -
 }
 ```
 
-- [ ] **Step 8: Rewrite the error and reply helpers**
+- [x] **Step 8: Rewrite the error and reply helpers**
 
 Replace `fn errno` and the six `reply_*` helpers at lines 492-549:
 
@@ -1054,7 +1065,7 @@ fn reply_statfs(reply: ReplyStatfs, r: Result<StatfsReply, Errno>) {
 }
 ```
 
-- [ ] **Step 9: Wrap the node id in `to_fuse_attr`**
+- [x] **Step 9: Wrap the node id in `to_fuse_attr`**
 
 One line inside `to_fuse_attr` at line 147, doc comment unchanged:
 
@@ -1062,7 +1073,7 @@ One line inside `to_fuse_attr` at line 147, doc comment unchanged:
         ino: INodeNo(node),
 ```
 
-- [ ] **Step 10: Rewrite `init` and `destroy`**
+- [x] **Step 10: Rewrite `init` and `destroy`**
 
 Replace the `init` signature and its two error returns; every comment inside the body stays as written:
 
@@ -1078,7 +1089,7 @@ The two `return Err(libc::EPROTO);` lines at 566 and 605 become:
 
 `destroy(&mut self)` keeps its signature; both callbacks run once, outside the concurrent phase, which is why they alone still take `&mut self`.
 
-- [ ] **Step 11: Delete the `batch_forget` override**
+- [x] **Step 11: Delete the `batch_forget` override**
 
 Remove the whole method at lines 639-643. The trait's default loops the slice and calls `forget`, which is what the override did per node, so the deletion changes nothing observable. Correction c in Design and Context explains why the migration is a deletion: `ForgetOne` names a private type and no outside crate can write the signature.
 
@@ -1097,7 +1108,7 @@ Then rewrite `forget` itself:
     }
 ```
 
-- [ ] **Step 12: Sweep the callbacks that only change shape**
+- [x] **Step 12: Sweep the callbacks that only change shape**
 
 For each callback below, apply the same three edits and nothing else: `&mut self` becomes `&self`, `Request<'_>` becomes `Request`, and the newtyped parameters get unwrapped on the first line of the body so every existing body line survives untouched.
 
@@ -1129,7 +1140,7 @@ For each callback below, apply the same three edits and nothing else: `&mut self
 
 `mknod`'s single statement becomes `reply.error(FuseErrno::ENOSYS);`.
 
-- [ ] **Step 13: Rewrite the eleven callbacks that change more than shape**
+- [x] **Step 13: Rewrite the eleven callbacks that change more than shape**
 
 ```rust
     /// `flags` carries `RENAME_NOREPLACE` and `RENAME_EXCHANGE` straight
@@ -1417,7 +1428,7 @@ The doc comment above `readdir` gains one sentence, because half of what it expl
     }
 ```
 
-- [ ] **Step 14: Repair the test module**
+- [x] **Step 14: Repair the test module**
 
 `fn requested` returns a flag set now:
 
@@ -1657,7 +1668,7 @@ in `attr_conversion_preserves_fields`, and
 
 in `attr_conversion_reports_the_node_id_not_the_servers_inode`. `attr_conversion_keeps_setuid_setgid_and_sticky` reads `perm` only and needs no edit.
 
-- [ ] **Step 15: Repair the binary**
+- [x] **Step 15: Repair the binary**
 
 In `crates/lbfs-client/src/main.rs`, replace lines 148-155:
 
@@ -1673,7 +1684,7 @@ In `crates/lbfs-client/src/main.rs`, replace lines 148-155:
 
 and update the import at the top of the file from `mount_options` to `session_config`. The comment at line 141 mentioning `spawn_mount2` becomes `spawn_mount`; the drain comment at lines 164-171 stays word for word, because the behaviour it describes does not change — `BackgroundSession` still has no `Drop` of its own and the `Mount` it holds still unmounts when dropped.
 
-- [ ] **Step 16: Repair the loopback fixture**
+- [x] **Step 16: Repair the loopback fixture**
 
 In `tests/tests/loopback.rs`, change the import at line 64:
 
@@ -1713,22 +1724,22 @@ That last change is the one to read twice. `join()` still exists on 0.18.0 and s
 
 Also update the two `spawn_mount2` mentions in the comments at lines 359 and 362.
 
-- [ ] **Step 17: Run the gate**
+- [x] **Step 17: Run the gate**
 
 Run: `cargo fmt --all && make check`
 Expected: PASS. If clippy reports `clippy::field_reassign_with_default` on `session_config`, that lint fires on a `Default` followed by field assignment — the pattern `#[non_exhaustive]` forces here. Add `#[allow(clippy::field_reassign_with_default)]` to the function with a one-line comment naming E0639 as the reason, rather than reaching for a struct expression that cannot compile.
 
-- [ ] **Step 18: Run both loopback suites, tripwire and drain included**
+- [x] **Step 18: Run both loopback suites, tripwire and drain included**
 
 Run: `make test-loopback`
 Expected: PASS, every case in both suites. Watch for `privileged_bits_die_on_write_*` and `writes_reach_the_export_on_unmount_*` by name. A timeout in the second pair means Step 16's join is wrong.
 
-- [ ] **Step 19: Deploy and run the end-to-end suite**
+- [x] **Step 19: Deploy and run the end-to-end suite**
 
 Run: `make build-guest && make vm-deploy && make vm-test`
 Expected: every PASS line.
 
-- [ ] **Step 20: Commit**
+- [x] **Step 20: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/lbfs-client/src/fuse.rs \

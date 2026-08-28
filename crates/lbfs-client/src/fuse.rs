@@ -45,18 +45,22 @@
 //! its own files.
 
 use std::ffi::OsStr;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fuser::consts::{
-    FOPEN_KEEP_CACHE, FUSE_ASYNC_DIO, FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO,
-    FUSE_WRITEBACK_CACHE, FUSE_WRITE_KILL_PRIV,
-};
+// `fuser::Errno` and `lbfs_proto::Errno` are both in scope here and both are
+// spelled `Errno`. The wire one keeps the bare name, because it is the one
+// this module handles by the dozen; the kernel-facing one is aliased. Renaming
+// the wire type instead would ripple into every `Result<_, Errno>` signature in
+// the crate for the sake of one conversion function.
 use fuser::{
-    KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request, TimeOrNow,
+    BsdFileFlags, Config, CopyFileRangeFlags, Errno as FuseErrno, FileHandle, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
+    ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow,
+    WriteFlags,
 };
 use lbfs_proto::ops::CopyFileRangeRequest;
 use lbfs_proto::types::{
@@ -144,7 +148,7 @@ fn kind_of_wire(kind: FileKind) -> fuser::FileType {
 /// names a file the server has never heard of. See the module documentation.
 pub fn to_fuse_attr(node: NodeId, a: &FileAttr) -> fuser::FileAttr {
     fuser::FileAttr {
-        ino: node,
+        ino: INodeNo(node),
         size: a.size,
         blocks: a.blocks,
         atime: to_system_time(a.atime_sec, a.atime_nsec),
@@ -333,29 +337,24 @@ fn first_entry_overflow(emitted: usize, name: &[u8]) {
 
 /// One capability this client asks the kernel for, and what its absence costs.
 struct Capability {
-    bit: u64,
+    bit: InitFlags,
     name: &'static str,
     /// Whether a kernel without it makes the mount wrong rather than merely
     /// slow.
     required: bool,
 }
 
-/// `FUSE_HANDLE_KILLPRIV_V2`, which fuser 0.16.0 does not name.
+/// `FUSE_HANDLE_KILLPRIV_V2`, bit 28 per `include/uapi/linux/fuse.h`.
 ///
-/// fuser's `consts` stops at `FUSE_HANDLE_KILLPRIV` (bit 19). Bit 28 arrived
-/// with ABI 7.33 and fuser negotiates at most 7.40 while naming no constant
-/// between bits 26 and 36 — but the kernel does not check the minor version
-/// for this flag. `process_init_reply` reads it inside one `if (arg->minor >=
-/// 6)` and applies it with no further guard (`fs/fuse/inode.c:1411-1414`),
-/// exactly as it does for `FUSE_ASYNC_DIO`, and `fuse_new_init` offers it
-/// unconditionally (`inode.c:1505`). `KernelConfig::add_capabilities` checks
-/// the ask against the kernel's own offered bits rather than a list of names
-/// fuser knows, so a locally declared constant is the whole mechanism.
-///
-/// The word is `u64` from 0.16.0 on: that release widened the whole INIT flag
-/// family and `add_capabilities` with it, to make room for the bits above 31
-/// that `fuse_init_in.flags2` carries.
-const FUSE_HANDLE_KILLPRIV_V2: u64 = 1 << 28;
+/// Declared here rather than taken from the crate for one more commit, so this
+/// bump stays a translation. `from_bits_retain` is the constructor that keeps a
+/// bit the type does not name, which is exactly what a hand-declared flag is.
+const FUSE_HANDLE_KILLPRIV_V2: InitFlags = InitFlags::from_bits_retain(1 << 28);
+
+/// `FUSE_WRITE_KILL_SUIDGID`, bit 2, which fuser 0.16.0 named
+/// `FUSE_WRITE_KILL_PRIV` in `consts` — a module this release removes.
+/// Declared locally for one more commit, same as the constant above.
+const FUSE_WRITE_KILL_PRIV: u32 = 1 << 2;
 
 /// The capabilities this client asks the kernel for.
 ///
@@ -377,14 +376,14 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
         // one LOOKUP round trip per name, which is a throughput loss and
         // nothing worse.
         Capability {
-            bit: FUSE_DO_READDIRPLUS,
+            bit: InitFlags::FUSE_DO_READDIRPLUS,
             name: "FUSE_DO_READDIRPLUS",
             required: false,
         },
         // Lets the kernel drop back to plain READDIR for a listing whose
         // attributes nothing asked for.
         Capability {
-            bit: FUSE_READDIRPLUS_AUTO,
+            bit: InitFlags::FUSE_READDIRPLUS_AUTO,
             name: "FUSE_READDIRPLUS_AUTO",
             required: false,
         },
@@ -394,7 +393,7 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
         // arrives here as depth 1. Costs nothing when it is absent — the
         // kernel simply keeps serialising, which is today's behaviour.
         Capability {
-            bit: FUSE_ASYNC_DIO,
+            bit: InitFlags::FUSE_ASYNC_DIO,
             name: "FUSE_ASYNC_DIO",
             required: false,
         },
@@ -423,7 +422,7 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
         // been taken away. Mounting anyway would corrupt appends silently;
         // `--no-writeback` is the honest way to run on such a kernel.
         caps.push(Capability {
-            bit: FUSE_WRITEBACK_CACHE,
+            bit: InitFlags::FUSE_WRITEBACK_CACHE,
             name: "FUSE_WRITEBACK_CACHE",
             required: true,
         });
@@ -438,8 +437,8 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
 /// twice. One client owns the export, so nothing can invalidate that cache
 /// behind the mount's back, and this holds whether or not writes are cached —
 /// `--no-writeback` turns off dirty-page aggregation, not reading.
-fn open_flags() -> u32 {
-    FOPEN_KEEP_CACHE
+fn open_flags() -> FopenFlags {
+    FopenFlags::FOPEN_KEEP_CACHE
 }
 
 /// Whether this `WRITE` must clear set-user-ID and set-group-ID first.
@@ -454,15 +453,15 @@ fn open_flags() -> u32 {
 /// The direct-I/O path sets the bit whether or not the kernel granted the
 /// capability (`fs/fuse/file.c:1701-1703`), so forwarding it is safe on any
 /// mount: at worst the server strips more often than the contract demands.
-fn kill_suidgid(write_flags: u32) -> bool {
-    write_flags & FUSE_WRITE_KILL_PRIV != 0
+fn kill_suidgid(write_flags: WriteFlags) -> bool {
+    write_flags.contains(WriteFlags::from_bits_retain(FUSE_WRITE_KILL_PRIV))
 }
 
-/// The mount options this client uses.
+/// The session configuration this client mounts with.
 ///
-/// `max_read` is the one that is not decoration. The negotiated I/O ceiling
-/// reaches the kernel's write path through `KernelConfig::set_max_write`, but
-/// `fuser` exposes no equivalent for reads and the kernel's default is far
+/// `max_read` is the one option that is not decoration. The negotiated I/O
+/// ceiling reaches the kernel's write path through `KernelConfig::set_max_write`,
+/// but `fuser` exposes no equivalent for reads and the kernel's default is far
 /// larger. Without this option the kernel would issue reads the multiplexer
 /// refuses with `EINVAL` — an unreadable file for no visible reason — so the
 /// number is fixed here, at mount time, from the same negotiation.
@@ -470,8 +469,20 @@ fn kill_suidgid(write_flags: u32) -> bool {
 /// `default_permissions` is what makes the kernel enforce the server's
 /// reported mode bits locally, which is why `ACCESS` is `ENOSYS` server-side
 /// (spec §7).
-pub fn mount_options(max_io_size: u32, allow_other: bool, auto_unmount: bool) -> Vec<MountOption> {
-    let mut opts = vec![
+///
+/// Who may reach the mount is a `SessionACL` rather than a mount option from
+/// this release on. `SessionACL::Owner` is FUSE's own default and keeps the
+/// mount private to the user who made it; `SessionACL::All` is the old
+/// `allow_other`. The third value, `RootAndOwner`, is not offered here — a
+/// mount that root may enter and nobody else is a shape no lbfs deployment has
+/// asked for, and every value added to this function is one more combination
+/// the tests have to cover.
+///
+/// `Config` is `#[non_exhaustive]`, so it cannot be written as a struct
+/// expression from this crate at all — not even with `..Default::default()`.
+/// Start from the default and assign.
+pub fn session_config(max_io_size: u32, allow_other: bool, auto_unmount: bool) -> Config {
+    let mut mount_options = vec![
         MountOption::FSName("lbfs".to_string()),
         MountOption::DefaultPermissions,
         MountOption::CUSTOM(format!("max_read={max_io_size}")),
@@ -485,19 +496,24 @@ pub fn mount_options(max_io_size: u32, allow_other: bool, auto_unmount: bool) ->
         MountOption::NoSuid,
         MountOption::NoDev,
     ];
-    if allow_other {
-        opts.push(MountOption::AllowOther);
-    }
     if auto_unmount {
         // Off by default, and a flag rather than a constant, because
         // `fusermount3` only honors it for a mount that also carries
-        // `allow_other` — `fuser` adds that implicitly — and only when
+        // `allow_other` — `fuser` widens the ACL implicitly — and only when
         // `user_allow_other` is set in `/etc/fuse.conf`. Widening a private
         // mount to every user on the machine is not a default, and on a host
         // without that line it is not a default that works.
-        opts.push(MountOption::AutoUnmount);
+        mount_options.push(MountOption::AutoUnmount);
     }
-    opts
+
+    let mut config = Config::default();
+    config.mount_options = mount_options;
+    config.acl = if allow_other {
+        SessionACL::All
+    } else {
+        SessionACL::Owner
+    };
+    config
 }
 
 // ---------------------------------------------------------------------------
@@ -539,13 +555,20 @@ impl LbfsFuse {
 /// A `u16` errno as the kernel wants it. Every error out of the multiplexer
 /// arrives this way, including the `EIO` a dead connection answers with, so
 /// disconnection needs no handling of its own here (spec §7).
-fn errno(e: Errno) -> libc::c_int {
-    e.0 as libc::c_int
+///
+/// `Errno::from_i32` answers `EIO` for anything that is not a positive number,
+/// which is the right reading of a zero arriving where an error belongs.
+fn errno(e: Errno) -> FuseErrno {
+    FuseErrno::from_i32(i32::from(e.0))
 }
 
 fn reply_entry(reply: ReplyEntry, ttl: Duration, r: Result<Entry, Errno>) {
     match r {
-        Ok(e) => reply.entry(&ttl, &to_fuse_attr(e.node, &e.attr), e.generation),
+        Ok(e) => reply.entry(
+            &ttl,
+            &to_fuse_attr(e.node, &e.attr),
+            Generation(e.generation),
+        ),
         Err(e) => reply.error(errno(e)),
     }
 }
@@ -580,7 +603,7 @@ fn reply_data(reply: ReplyData, r: Result<Vec<u8>, Errno>) {
 fn reply_xattr(reply: ReplyXattr, size: u32, r: Result<(u32, Vec<u8>), Errno>) {
     match r {
         Ok((len, _)) if size == 0 => reply.size(len),
-        Ok((len, _)) if len > size => reply.error(libc::ERANGE),
+        Ok((len, _)) if len > size => reply.error(FuseErrno::ERANGE),
         Ok((_, value)) => reply.data(&value),
         Err(e) => reply.error(errno(e)),
     }
@@ -596,7 +619,7 @@ fn reply_statfs(reply: ReplyStatfs, r: Result<StatfsReply, Errno>) {
 }
 
 impl fuser::Filesystem for LbfsFuse {
-    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         let max_io = self.conn.limits.max_io_size;
         // The kernel's default write ceiling is 16 MiB, far above anything the
         // handshake settled on; a write over the negotiated size is refused by
@@ -610,7 +633,7 @@ impl fuser::Filesystem for LbfsFuse {
                 nearest,
                 "the kernel will not accept the negotiated write ceiling"
             );
-            return Err(libc::EPROTO);
+            return Err(io::Error::from_raw_os_error(libc::EPROTO));
         }
         // Advisory: the kernel reports its own ceiling and refuses anything
         // above it, which is fine — readahead below the I/O size costs
@@ -649,7 +672,7 @@ impl fuser::Filesystem for LbfsFuse {
                     "this kernel does not support a capability the server has \
                      already been promised; re-run with --no-writeback"
                 );
-                return Err(libc::EPROTO);
+                return Err(io::Error::from_raw_os_error(libc::EPROTO));
             }
             tracing::warn!(capability = cap.name, "unsupported by this kernel");
         }
@@ -670,7 +693,8 @@ impl fuser::Filesystem for LbfsFuse {
         tracing::info!("mount torn down");
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let parent = parent.0;
         let (conn, ttl) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt
@@ -679,17 +703,17 @@ impl fuser::Filesystem for LbfsFuse {
 
     /// No reply object, no way to wait: [`Connection::send_forget`] is
     /// synchronous and batches behind the scenes, so this must not spawn.
-    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        self.conn.send_forget(ino, nlookup);
+    ///
+    /// `batch_forget` is deliberately not overridden. Its slice element type is
+    /// private to `fuser`, so the signature cannot be written from here — and
+    /// it does not need to be, because the trait's default body calls this
+    /// method once per node, which is exactly what the old override did.
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.conn.send_forget(ino.0, nlookup);
     }
 
-    fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuser::fuse_forget_one]) {
-        for node in nodes {
-            self.conn.send_forget(node.nodeid, node.nlookup);
-        }
-    }
-
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let (ino, fh) = (ino.0, fh.map(|h| h.0));
         let (conn, ttl) = self.ctx();
         self.rt
             .spawn(async move { reply_attr(reply, ttl, ino, conn.getattr(ino, fh).await) });
@@ -697,9 +721,9 @@ impl fuser::Filesystem for LbfsFuse {
 
     #[allow(clippy::too_many_arguments)]
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -711,14 +735,15 @@ impl fuser::Filesystem for LbfsFuse {
         // an mtime when writeback caching is on, and the mtime it rides with
         // moves the ctime anyway.
         _ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         // BSD file flags. Linux has no `chflags`.
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let (ino, fh) = (ino.0, fh.map(|h| h.0));
         let (conn, ttl) = self.ctx();
         let args = SetattrArgs {
             mode,
@@ -733,7 +758,8 @@ impl fuser::Filesystem for LbfsFuse {
             .spawn(async move { reply_attr(reply, ttl, ino, conn.setattr(ino, args).await) });
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_data(reply, conn.readlink(ino).await) });
@@ -742,22 +768,22 @@ impl fuser::Filesystem for LbfsFuse {
     /// No `MKNOD` opcode: the protocol creates regular files through `CREATE`
     /// and everything else not at all. `ENOSYS` lets the kernel remember that.
     fn mknod(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
         _name: &OsStr,
         _mode: u32,
         _umask: u32,
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(libc::ENOSYS);
+        reply.error(FuseErrno::ENOSYS);
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         // Already applied to `mode` by the kernel: this client does not request
@@ -765,20 +791,23 @@ impl fuser::Filesystem for LbfsFuse {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         let (conn, ttl) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt
             .spawn(async move { reply_entry(reply, ttl, conn.mkdir(parent, &name, mode).await) });
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let (conn, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt
             .spawn(async move { reply_unit(reply, conn.unlink(parent, &name).await) });
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let (conn, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt
@@ -786,13 +815,14 @@ impl fuser::Filesystem for LbfsFuse {
     }
 
     fn symlink(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         link_name: &OsStr,
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         let (conn, ttl) = self.ctx();
         let name = link_name.as_bytes().to_vec();
         let target = target.as_os_str().as_bytes().to_vec();
@@ -803,17 +833,20 @@ impl fuser::Filesystem for LbfsFuse {
 
     /// `flags` carries `RENAME_NOREPLACE` and `RENAME_EXCHANGE` straight
     /// through to the server's `renameat2`, which is what preserves the
-    /// atomicity the caller asked for (spec §8).
+    /// atomicity the caller asked for (spec §8). `RenameFlags` decodes with
+    /// `from_bits_retain`, so a bit this crate does not name still reaches the
+    /// syscall unchanged.
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        flags: u32,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let (parent, newparent, flags) = (parent.0, newparent.0, flags.bits());
         let (conn, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         let newname = newname.as_bytes().to_vec();
@@ -826,13 +859,14 @@ impl fuser::Filesystem for LbfsFuse {
     }
 
     fn link(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        newparent: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let (ino, newparent) = (ino.0, newparent.0);
         let (conn, ttl) = self.ctx();
         let newname = newname.as_bytes().to_vec();
         self.rt.spawn(
@@ -840,11 +874,12 @@ impl fuser::Filesystem for LbfsFuse {
         );
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
-            match conn.open(ino, flags as u32).await {
-                Ok(fh) => reply.opened(fh, open_flags()),
+            match conn.open(ino, flags.0 as u32).await {
+                Ok(fh) => reply.opened(FileHandle(fh), open_flags()),
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -852,15 +887,16 @@ impl fuser::Filesystem for LbfsFuse {
 
     #[allow(clippy::too_many_arguments)]
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let parent = parent.0;
         let (conn, ttl) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt.spawn(async move {
@@ -868,8 +904,8 @@ impl fuser::Filesystem for LbfsFuse {
                 Ok((e, fh)) => reply.created(
                     &ttl,
                     &to_fuse_attr(e.node, &e.attr),
-                    e.generation,
-                    fh,
+                    Generation(e.generation),
+                    FileHandle(fh),
                     open_flags(),
                 ),
                 Err(e) => reply.error(errno(e)),
@@ -879,38 +915,36 @@ impl fuser::Filesystem for LbfsFuse {
 
     #[allow(clippy::too_many_arguments)]
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
-        self.rt.spawn(async move {
-            match u64::try_from(offset) {
-                Ok(offset) => reply_data(reply, conn.read(ino, fh, offset, size).await),
-                Err(_) => reply.error(libc::EINVAL),
-            }
-        });
+        self.rt
+            .spawn(async move { reply_data(reply, conn.read(ino, fh, offset, size).await) });
     }
 
     #[allow(clippy::too_many_arguments)]
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         let kill = kill_suidgid(write_flags);
         // The slice borrows the session's single receive buffer, which is
@@ -918,10 +952,6 @@ impl fuser::Filesystem for LbfsFuse {
         // write outlive the callback.
         let data = data.to_vec();
         self.rt.spawn(async move {
-            let Ok(offset) = u64::try_from(offset) else {
-                reply.error(libc::EINVAL);
-                return;
-            };
             match conn.write(ino, fh, offset, data, kill).await {
                 Ok(written) => reply.written(written),
                 Err(e) => reply.error(errno(e)),
@@ -930,44 +960,57 @@ impl fuser::Filesystem for LbfsFuse {
     }
 
     fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _lock_owner: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_unit(reply, conn.flush(ino, fh).await) });
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_unit(reply, conn.release(ino, fh).await) });
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_unit(reply, conn.fsync(ino, fh, datasync).await) });
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
             match conn.opendir(ino).await {
-                Ok(dh) => reply.opened(dh, 0),
+                // A directory handle wants no flags, which is what the zero
+                // this used to pass said.
+                Ok(dh) => reply.opened(FileHandle(dh), FopenFlags::empty()),
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -977,21 +1020,23 @@ impl fuser::Filesystem for LbfsFuse {
     /// ends.
     ///
     /// The offset is an opaque cursor, not a byte count: it is the `d_off` the
-    /// server's `getdents64` reported, reinterpreted as `u64` on the way out
-    /// and back again on the way in, so a filesystem that packs a hash into the
-    /// high bit round-trips unchanged. Only zero has a meaning of its own —
-    /// the start of the listing.
+    /// server's `getdents64` reported. From fuser 0.18.0 on it arrives and
+    /// leaves as a `u64`, so the reinterpretation the earlier code performed on
+    /// the way in and out is gone and a filesystem that packs a hash into the
+    /// high bit round-trips because nothing touches it. Only zero has a meaning
+    /// of its own — the start of the listing.
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
-            let mut cursor = offset as u64;
+            let mut cursor = offset;
             // Across pages, not within one: the kernel's buffer holds the whole
             // reply, so this is what says whether a refusal leaves it empty.
             let mut emitted = 0usize;
@@ -1013,8 +1058,8 @@ impl fuser::Filesystem for LbfsFuse {
                     // a discarded entry owes no `FORGET` — the difference from
                     // `readdirplus`, where every entry carries a lookup count.
                     if reply.add(
-                        e.ino,
-                        e.offset as i64,
+                        INodeNo(e.ino),
+                        e.offset,
                         kind_of_wire(e.kind),
                         OsStr::from_bytes(&e.name),
                     ) {
@@ -1031,16 +1076,17 @@ impl fuser::Filesystem for LbfsFuse {
     }
 
     fn readdirplus(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, ttl) = self.ctx();
         self.rt.spawn(async move {
-            let mut cursor = offset as u64;
+            let mut cursor = offset;
             // As in `readdir`: the count that decides whether a refused entry
             // leaves an empty reply spans the pages, not one of them.
             let mut emitted = 0usize;
@@ -1062,12 +1108,12 @@ impl fuser::Filesystem for LbfsFuse {
                     |e, node| {
                         let attr = to_fuse_attr(node, &e.entry.attr);
                         reply.add(
-                            node,
-                            e.offset as i64,
+                            INodeNo(node),
+                            e.offset,
                             OsStr::from_bytes(&e.name),
                             &ttl,
                             &attr,
-                            e.entry.generation,
+                            Generation(e.entry.generation),
                         )
                     },
                     |node| conn.send_forget(node, 1),
@@ -1087,32 +1133,35 @@ impl fuser::Filesystem for LbfsFuse {
     }
 
     fn releasedir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_unit(reply, conn.releasedir(ino, fh).await) });
     }
 
     fn fsyncdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_unit(reply, conn.fsyncdir(ino, fh, datasync).await) });
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_statfs(reply, conn.statfs(ino).await) });
@@ -1120,9 +1169,9 @@ impl fuser::Filesystem for LbfsFuse {
 
     #[allow(clippy::too_many_arguments)]
     fn setxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         name: &OsStr,
         value: &[u8],
         flags: i32,
@@ -1130,6 +1179,7 @@ impl fuser::Filesystem for LbfsFuse {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         let value = value.to_vec();
@@ -1138,27 +1188,23 @@ impl fuser::Filesystem for LbfsFuse {
         });
     }
 
-    fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        name: &OsStr,
-        size: u32,
-        reply: ReplyXattr,
-    ) {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt
             .spawn(async move { reply_xattr(reply, size, conn.getxattr(ino, &name, size).await) });
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         self.rt
             .spawn(async move { reply_xattr(reply, size, conn.listxattr(ino, size).await) });
     }
 
-    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt
@@ -1166,21 +1212,18 @@ impl fuser::Filesystem for LbfsFuse {
     }
 
     fn fallocate(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        length: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
-            let (Ok(offset), Ok(length)) = (u64::try_from(offset), u64::try_from(length)) else {
-                reply.error(libc::EINVAL);
-                return;
-            };
             reply_unit(
                 reply,
                 conn.fallocate(ino, fh, offset, length, mode as u32).await,
@@ -1188,19 +1231,23 @@ impl fuser::Filesystem for LbfsFuse {
         });
     }
 
+    /// The one offset the kernel still hands over signed, because `SEEK_HOLE`
+    /// and `SEEK_DATA` take a starting point rather than a length. The guard
+    /// stays where its four neighbours lost theirs.
     fn lseek(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
         offset: i64,
         whence: i32,
         reply: ReplyLseek,
     ) {
+        let (ino, fh) = (ino.0, fh.0);
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
             let Ok(offset) = u64::try_from(offset) else {
-                reply.error(libc::EINVAL);
+                reply.error(FuseErrno::EINVAL);
                 return;
             };
             match conn.lseek(ino, fh, offset, whence as u32).await {
@@ -1214,33 +1261,28 @@ impl fuser::Filesystem for LbfsFuse {
 
     #[allow(clippy::too_many_arguments)]
     fn copy_file_range(
-        &mut self,
-        _req: &Request<'_>,
-        ino_in: u64,
-        fh_in: u64,
-        offset_in: i64,
-        ino_out: u64,
-        fh_out: u64,
-        offset_out: i64,
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
         len: u64,
         // Reserved by the syscall; must be zero, and the kernel checks.
-        _flags: u32,
+        _flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
-            let (Ok(off_in), Ok(off_out)) = (u64::try_from(offset_in), u64::try_from(offset_out))
-            else {
-                reply.error(libc::EINVAL);
-                return;
-            };
             let req = CopyFileRangeRequest {
-                node_in: ino_in,
-                fh_in,
-                off_in,
-                node_out: ino_out,
-                fh_out,
-                off_out,
+                node_in: ino_in.0,
+                fh_in: fh_in.0,
+                off_in: offset_in,
+                node_out: ino_out.0,
+                fh_out: fh_out.0,
+                off_out: offset_out,
                 len,
             };
             match conn.copy_file_range(&req).await {
@@ -1307,7 +1349,7 @@ mod tests {
             ..Default::default()
         };
         let f = to_fuse_attr(7, &a);
-        assert_eq!(f.ino, 7);
+        assert_eq!(f.ino, INodeNo(7));
         assert_eq!(f.size, 42);
         assert_eq!(f.blocks, 1);
         assert_eq!(f.perm, 0o640);
@@ -1347,7 +1389,7 @@ mod tests {
             mode: libc::S_IFREG | 0o644,
             ..Default::default()
         };
-        assert_eq!(to_fuse_attr(42, &a).ino, 42);
+        assert_eq!(to_fuse_attr(42, &a).ino, INodeNo(42));
     }
 
     #[test]
@@ -1566,8 +1608,10 @@ mod tests {
         assert_eq!(READDIR_PAGE_BYTES, 4096);
     }
 
-    fn requested(writeback: bool) -> u64 {
-        capabilities(writeback).iter().fold(0, |all, c| all | c.bit)
+    fn requested(writeback: bool) -> InitFlags {
+        capabilities(writeback)
+            .iter()
+            .fold(InitFlags::empty(), |all, c| all | c.bit)
     }
 
     /// The server drops `O_TRUNC` from `OPEN` on purpose and expects the
@@ -1577,7 +1621,7 @@ mod tests {
     #[test]
     fn atomic_o_trunc_is_never_requested() {
         for writeback in [true, false] {
-            assert_eq!(requested(writeback) & fuser::consts::FUSE_ATOMIC_O_TRUNC, 0);
+            assert!(!requested(writeback).contains(InitFlags::FUSE_ATOMIC_O_TRUNC));
         }
     }
 
@@ -1585,11 +1629,11 @@ mod tests {
     fn readdirplus_is_always_requested_and_writeback_only_when_asked() {
         for writeback in [true, false] {
             let caps = requested(writeback);
-            assert_eq!(caps & FUSE_DO_READDIRPLUS, FUSE_DO_READDIRPLUS);
-            assert_eq!(caps & FUSE_READDIRPLUS_AUTO, FUSE_READDIRPLUS_AUTO);
+            assert!(caps.contains(InitFlags::FUSE_DO_READDIRPLUS));
+            assert!(caps.contains(InitFlags::FUSE_READDIRPLUS_AUTO));
         }
-        assert_eq!(requested(true) & FUSE_WRITEBACK_CACHE, FUSE_WRITEBACK_CACHE);
-        assert_eq!(requested(false) & FUSE_WRITEBACK_CACHE, 0);
+        assert!(requested(true).contains(InitFlags::FUSE_WRITEBACK_CACHE));
+        assert!(!requested(false).contains(InitFlags::FUSE_WRITEBACK_CACHE));
     }
 
     /// Asked for on every mount, cached or not. `O_DIRECT` skips the page
@@ -1598,7 +1642,7 @@ mod tests {
     #[test]
     fn async_dio_is_always_requested() {
         for writeback in [true, false] {
-            assert_eq!(requested(writeback) & FUSE_ASYNC_DIO, FUSE_ASYNC_DIO);
+            assert!(requested(writeback).contains(InitFlags::FUSE_ASYNC_DIO));
         }
     }
 
@@ -1608,12 +1652,9 @@ mod tests {
     /// the local constant is the whole mechanism.
     #[test]
     fn killpriv_v2_is_always_requested_at_bit_twenty_eight() {
-        assert_eq!(FUSE_HANDLE_KILLPRIV_V2, 1 << 28);
+        assert_eq!(FUSE_HANDLE_KILLPRIV_V2.bits(), 1 << 28);
         for writeback in [true, false] {
-            assert_eq!(
-                requested(writeback) & FUSE_HANDLE_KILLPRIV_V2,
-                FUSE_HANDLE_KILLPRIV_V2
-            );
+            assert!(requested(writeback).contains(FUSE_HANDLE_KILLPRIV_V2));
         }
     }
 
@@ -1644,9 +1685,10 @@ mod tests {
     #[test]
     fn the_only_high_capability_asked_for_is_killpriv_v2() {
         for writeback in [true, false] {
-            let high = requested(writeback) & !((1u64 << 26) - 1);
+            let low = InitFlags::from_bits_retain((1u64 << 26) - 1);
             assert_eq!(
-                high, FUSE_HANDLE_KILLPRIV_V2,
+                requested(writeback) & !low,
+                FUSE_HANDLE_KILLPRIV_V2,
                 "an unexpected capability above bit 25 (writeback={writeback})"
             );
         }
@@ -1663,7 +1705,7 @@ mod tests {
             .filter(|c| c.required)
             .map(|c| c.bit)
             .collect();
-        assert_eq!(required, vec![FUSE_WRITEBACK_CACHE]);
+        assert_eq!(required, vec![InitFlags::FUSE_WRITEBACK_CACHE]);
         assert!(capabilities(false).iter().all(|c| !c.required));
     }
 
@@ -1671,8 +1713,8 @@ mod tests {
     /// turns off dirty-page aggregation, not the page cache.
     #[test]
     fn opens_keep_the_page_cache() {
-        assert_eq!(open_flags() & FOPEN_KEEP_CACHE, FOPEN_KEEP_CACHE);
-        assert_eq!(open_flags() & fuser::consts::FOPEN_DIRECT_IO, 0);
+        assert!(open_flags().contains(FopenFlags::FOPEN_KEEP_CACHE));
+        assert!(!open_flags().contains(FopenFlags::FOPEN_DIRECT_IO));
     }
 
     /// `fuser` has no `set_max_read`, so the negotiated ceiling can only reach
@@ -1680,10 +1722,14 @@ mod tests {
     /// reads the multiplexer answers with `EINVAL`.
     #[test]
     fn the_mount_pins_max_read_to_the_negotiated_size() {
-        let opts = mount_options(4096, false, false);
-        assert!(opts.contains(&MountOption::CUSTOM("max_read=4096".to_string())));
-        assert!(opts.contains(&MountOption::FSName("lbfs".to_string())));
-        assert!(opts.contains(&MountOption::DefaultPermissions));
+        let cfg = session_config(4096, false, false);
+        assert!(cfg
+            .mount_options
+            .contains(&MountOption::CUSTOM("max_read=4096".to_string())));
+        assert!(cfg
+            .mount_options
+            .contains(&MountOption::FSName("lbfs".to_string())));
+        assert!(cfg.mount_options.contains(&MountOption::DefaultPermissions));
     }
 
     /// The server's attributes travel verbatim, setuid bits and `rdev`
@@ -1693,7 +1739,7 @@ mod tests {
     #[test]
     fn the_mount_never_honours_setuid_bits_or_device_nodes() {
         for (allow_other, auto_unmount) in [(false, false), (true, true)] {
-            let opts = mount_options(1 << 20, allow_other, auto_unmount);
+            let opts = session_config(1 << 20, allow_other, auto_unmount).mount_options;
             assert!(opts.contains(&MountOption::NoSuid));
             assert!(opts.contains(&MountOption::NoDev));
             assert!(!opts.contains(&MountOption::Suid));
@@ -1701,32 +1747,50 @@ mod tests {
         }
     }
 
-    /// Neither widens access by default: `allow_other` exposes the mount to
-    /// every user on the machine, and `auto_unmount` makes `fuser` add
-    /// `allow_other` implicitly.
+    /// Neither widens access by default. Reach is an ACL from this release on
+    /// rather than a mount option, and `auto_unmount` makes `fuser` widen the
+    /// ACL implicitly, so the two are still opt-in together.
     #[test]
-    fn access_widening_options_are_opt_in() {
-        let plain = mount_options(1 << 20, false, false);
-        assert!(!plain.contains(&MountOption::AllowOther));
-        assert!(!plain.contains(&MountOption::AutoUnmount));
+    fn access_widening_is_opt_in() {
+        let plain = session_config(1 << 20, false, false);
+        assert_eq!(plain.acl, SessionACL::Owner);
+        assert!(!plain.mount_options.contains(&MountOption::AutoUnmount));
 
-        let wide = mount_options(1 << 20, true, true);
-        assert!(wide.contains(&MountOption::AllowOther));
-        assert!(wide.contains(&MountOption::AutoUnmount));
+        let wide = session_config(1 << 20, true, true);
+        assert_eq!(wide.acl, SessionACL::All);
+        assert!(wide.mount_options.contains(&MountOption::AutoUnmount));
     }
 
-    /// `fuser` rejects a list holding two options that contradict each other,
-    /// and it rejects it by failing the mount.
+    /// Never `RootAndOwner`: a mount root may enter and nobody else is a shape
+    /// no lbfs deployment asks for, and an ACL nothing sets is one nothing
+    /// tests.
     #[test]
-    fn the_option_list_holds_no_duplicates_or_conflicts() {
+    fn the_root_and_owner_acl_is_never_chosen() {
         for (allow_other, auto_unmount) in [(false, false), (true, false), (true, true)] {
-            let opts = mount_options(1 << 20, allow_other, auto_unmount);
+            let cfg = session_config(1 << 20, allow_other, auto_unmount);
+            assert_ne!(cfg.acl, SessionACL::RootAndOwner);
+        }
+    }
+
+    /// `fuser` rejects an option list holding the same option twice, and it
+    /// rejects it by failing the mount.
+    #[test]
+    fn the_option_list_holds_no_duplicates() {
+        for (allow_other, auto_unmount) in [(false, false), (true, false), (true, true)] {
+            let opts = session_config(1 << 20, allow_other, auto_unmount).mount_options;
             let unique: std::collections::HashSet<_> = opts.iter().collect();
             assert_eq!(unique.len(), opts.len(), "{opts:?}");
-            // The one pair `fuser` calls a conflict that this list could ever
-            // produce.
-            assert!(!opts.contains(&MountOption::AllowRoot));
         }
+    }
+
+    /// One event loop and one shared descriptor, until somebody measures
+    /// otherwise on a guest with cores to spare. Each extra thread costs a
+    /// resident 16 MiB receive buffer.
+    #[test]
+    fn the_session_runs_one_event_loop_by_default() {
+        let cfg = session_config(1 << 20, false, false);
+        assert_eq!(cfg.n_threads, None);
+        assert!(!cfg.clone_fd);
     }
 
     /// fuser names bit 2 `FUSE_WRITE_KILL_PRIV`; the current kernel uapi calls
@@ -1735,13 +1799,14 @@ mod tests {
     /// change which bit the bridge reads.
     #[test]
     fn the_kill_flag_is_bit_two_and_nothing_else() {
-        assert_eq!(fuser::consts::FUSE_WRITE_KILL_PRIV, 1 << 2);
-        assert!(kill_suidgid(1 << 2));
-        assert!(kill_suidgid(0xFFFF_FFFF));
-        assert!(!kill_suidgid(0));
+        let flags = |bits: u32| WriteFlags::from_bits_retain(bits);
+        assert_eq!(FUSE_WRITE_KILL_PRIV, 1 << 2);
+        assert!(kill_suidgid(flags(1 << 2)));
+        assert!(kill_suidgid(flags(0xFFFF_FFFF)));
+        assert!(!kill_suidgid(flags(0)));
         // FUSE_WRITE_CACHE and FUSE_WRITE_LOCKOWNER must not read as a strip.
-        assert!(!kill_suidgid(1 << 0));
-        assert!(!kill_suidgid(1 << 1));
-        assert!(!kill_suidgid((1 << 0) | (1 << 1)));
+        assert!(!kill_suidgid(flags(1 << 0)));
+        assert!(!kill_suidgid(flags(1 << 1)));
+        assert!(!kill_suidgid(flags((1 << 0) | (1 << 1))));
     }
 }

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use lbfs_client::conn::{ConnectError, Connection};
-use lbfs_client::fuse::{mount_options, LbfsFuse};
+use lbfs_client::fuse::{session_config, LbfsFuse};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -137,7 +137,7 @@ fn run() -> Result<(), StartupError> {
         .map_err(|source| StartupError::Connect { addr, source })?;
 
     // Before the mount, not after. A signal arriving in the window between
-    // `spawn_mount2` returning and the handlers being installed would take its
+    // `spawn_mount` returning and the handlers being installed would take its
     // default action and kill this process with a mount already on the
     // directory and nothing left to unmount it. Not before `connect`, though:
     // registering a handler suppresses the default action whether or not
@@ -145,10 +145,10 @@ fn run() -> Result<(), StartupError> {
     // nothing for as long as a silent server can hold the handshake open.
     let mut signals = rt.block_on(async { Signals::install() })?;
 
-    let opts = mount_options(limits.max_io_size, cli.allow_other, cli.auto_unmount);
+    let cfg = session_config(limits.max_io_size, cli.allow_other, cli.auto_unmount);
     let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, writeback);
     let session =
-        fuser::spawn_mount2(fs, &cli.mountpoint, &opts).map_err(|source| StartupError::Mount {
+        fuser::spawn_mount(fs, &cli.mountpoint, &cfg).map_err(|source| StartupError::Mount {
             path: cli.mountpoint.display().to_string(),
             source,
         })?;
@@ -214,7 +214,7 @@ const SESSION_POLL: Duration = Duration::from_millis(200);
 /// answers `EIO` until somebody unmounts it (spec §7). A dead *session* is,
 /// because there is no mount left to serve — and the `init` path that refuses a
 /// kernel without the writeback cache reaches exactly this state, having
-/// already returned `Ok` from `spawn_mount2`. Without this the process would
+/// already returned `Ok` from `spawn_mount`. Without this the process would
 /// wait for a signal that is not coming, holding the runtime, the socket and an
 /// `ENOTCONN` mountpoint.
 ///
