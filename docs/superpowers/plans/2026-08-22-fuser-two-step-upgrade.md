@@ -1777,7 +1777,7 @@ its guard."
 
 A separate commit because it asks a separate question. The bits are the same either way; what changes is whose constant the client trusts. Trusting the crate's is right here — writing this plan meant checking all three values against `include/uapi/linux/fuse.h` — and a hand-declared constant that silently disagrees with the crate's own name is worse than either.
 
-- [ ] **Step 1: Rewrite the three pin-tests first**
+- [x] **Step 1: Rewrite the three pin-tests first**
 
 Replace `killpriv_v2_is_always_requested_at_bit_twenty_eight`, `the_parallel_write_bit_is_bit_six` and add one for the write flag:
 
@@ -1804,7 +1804,7 @@ Replace `killpriv_v2_is_always_requested_at_bit_twenty_eight`, `the_parallel_wri
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Step 1 replaces the two old tests rather than adding beside them, so nothing
 duplicates a name.
@@ -1812,11 +1812,11 @@ duplicates a name.
 Run: `cargo test -p lbfs-client --lib hand_checked_flag_bits killpriv_v2`
 Expected: PASS on the two rewritten cases, because the crate's constants carry the right values already. The failure arrives in Step 3, the moment the local constants go: `cargo check -p lbfs-client` then reports `cannot find value 'FUSE_HANDLE_KILLPRIV_V2' in this scope` at `capabilities()`, at `killpriv_v2_is_optional` and at `the_only_high_capability_asked_for_is_killpriv_v2`, plus the same for `FOPEN_PARALLEL_DIRECT_WRITES` and `FUSE_WRITE_KILL_PRIV`. Step 4 answers every one of them.
 
-- [ ] **Step 3: Delete the three local constants**
+- [x] **Step 3: Delete the three local constants**
 
 Remove `const FUSE_HANDLE_KILLPRIV_V2: InitFlags = ...`, `const FOPEN_PARALLEL_DIRECT_WRITES: FopenFlags = ...` and the `const FUSE_WRITE_KILL_PRIV: u32 = 1 << 2;` Task 6 Step 13 introduced. Their doc comments go with them; the reasoning they carried — why bit 28 works on a client declaring 7.40, and why bit 6 needs no negotiation — moves into the capability entry and the `open_flags` doc comment respectively, both of which already say most of it.
 
-- [ ] **Step 4: Point the four use sites at the crate**
+- [x] **Step 4: Point the four use sites at the crate**
 
 In `capabilities()`:
 
@@ -1842,17 +1842,17 @@ In `write`:
 
 In `killpriv_v2_is_optional` and `the_only_high_capability_asked_for_is_killpriv_v2`, replace the bare `FUSE_HANDLE_KILLPRIV_V2` with `InitFlags::FUSE_HANDLE_KILLPRIV_V2`, and in the four `open_flags` tests replace the bare `FOPEN_PARALLEL_DIRECT_WRITES` with `FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES`.
 
-- [ ] **Step 5: Confirm no local constant survives**
+- [x] **Step 5: Confirm no local constant survives**
 
 Run: `grep -n "^const FUSE_\|^const FOPEN_" crates/lbfs-client/src/fuse.rs`
 Expected: no output.
 
-- [ ] **Step 6: Run the gate and both loopback suites**
+- [x] **Step 6: Run the gate and both loopback suites**
 
 Run: `cargo fmt --all && make check && make test-loopback`
 Expected: PASS. The tripwire pair is the one to watch: `WriteFlags::FUSE_WRITE_KILL_SUIDGID` is now the name the strip depends on, and a wrong bit there would leak set-user-ID silently.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs

@@ -344,18 +344,6 @@ struct Capability {
     required: bool,
 }
 
-/// `FUSE_HANDLE_KILLPRIV_V2`, bit 28 per `include/uapi/linux/fuse.h`.
-///
-/// Declared here rather than taken from the crate for one more commit, so this
-/// bump stays a translation. `from_bits_retain` is the constructor that keeps a
-/// bit the type does not name, which is exactly what a hand-declared flag is.
-const FUSE_HANDLE_KILLPRIV_V2: InitFlags = InitFlags::from_bits_retain(1 << 28);
-
-/// `FUSE_WRITE_KILL_SUIDGID`, bit 2, which fuser 0.16.0 named
-/// `FUSE_WRITE_KILL_PRIV` in `consts` — a module this release removes.
-/// Declared locally for one more commit, same as the constant above.
-const FUSE_WRITE_KILL_PRIV: u32 = 1 << 2;
-
 /// The capabilities this client asks the kernel for.
 ///
 /// Deliberately short, and `FUSE_ATOMIC_O_TRUNC` is deliberately absent: the
@@ -406,8 +394,13 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
         // first write, and every write after that short-circuits with no
         // request at all. The price is a promise: the server clears the bits
         // instead. See spec §5.3 and `lbfs_server::fs::local::killpriv`.
+        //
+        // Bit 28, ABI 7.33. Negotiable from a client declaring 7.40 even
+        // though the kernel checks no minor version for it:
+        // `process_init_reply` applies it inside one `if (arg->minor >= 6)`
+        // and `fuse_new_init` offers it unconditionally.
         Capability {
-            bit: FUSE_HANDLE_KILLPRIV_V2,
+            bit: InitFlags::FUSE_HANDLE_KILLPRIV_V2,
             name: "FUSE_HANDLE_KILLPRIV_V2",
             required: false,
         },
@@ -454,7 +447,7 @@ fn open_flags() -> FopenFlags {
 /// capability (`fs/fuse/file.c:1701-1703`), so forwarding it is safe on any
 /// mount: at worst the server strips more often than the contract demands.
 fn kill_suidgid(write_flags: WriteFlags) -> bool {
-    write_flags.contains(WriteFlags::from_bits_retain(FUSE_WRITE_KILL_PRIV))
+    write_flags.contains(WriteFlags::FUSE_WRITE_KILL_SUIDGID)
 }
 
 /// The session configuration this client mounts with.
@@ -1646,15 +1639,23 @@ mod tests {
         }
     }
 
-    /// The one capability this whole change exists for. Bit 28 per
-    /// `include/uapi/linux/fuse.h`; fuser 0.16.0 has no constant for it, and
-    /// `KernelConfig::add_capabilities` accepts any bit the kernel offered, so
-    /// the local constant is the whole mechanism.
+    /// The values, checked against `include/uapi/linux/fuse.h` rather than
+    /// taken on trust. The crate names both now, so these tests stopped
+    /// pinning constants of ours and started pinning the crate's — which is the
+    /// thing worth checking at every bump, since a wrong bit here lands on a
+    /// flag with an entirely different meaning and nothing reports an error.
     #[test]
-    fn killpriv_v2_is_always_requested_at_bit_twenty_eight() {
-        assert_eq!(FUSE_HANDLE_KILLPRIV_V2.bits(), 1 << 28);
+    fn the_hand_checked_flag_bits_hold_their_values() {
+        assert_eq!(InitFlags::FUSE_HANDLE_KILLPRIV_V2.bits(), 1 << 28);
+        assert_eq!(WriteFlags::FUSE_WRITE_KILL_SUIDGID.bits(), 1 << 2);
+        assert_eq!(FopenFlags::FOPEN_DIRECT_IO.bits(), 1 << 0);
+        assert_eq!(FopenFlags::FOPEN_KEEP_CACHE.bits(), 1 << 1);
+    }
+
+    #[test]
+    fn killpriv_v2_is_always_requested() {
         for writeback in [true, false] {
-            assert!(requested(writeback).contains(FUSE_HANDLE_KILLPRIV_V2));
+            assert!(requested(writeback).contains(InitFlags::FUSE_HANDLE_KILLPRIV_V2));
         }
     }
 
@@ -1667,7 +1668,7 @@ mod tests {
         for writeback in [true, false] {
             let cap = capabilities(writeback)
                 .into_iter()
-                .find(|c| c.bit == FUSE_HANDLE_KILLPRIV_V2)
+                .find(|c| c.bit == InitFlags::FUSE_HANDLE_KILLPRIV_V2)
                 .expect("the capability list carries it");
             assert!(!cap.required);
             assert_eq!(cap.name, "FUSE_HANDLE_KILLPRIV_V2");
@@ -1688,7 +1689,7 @@ mod tests {
             let low = InitFlags::from_bits_retain((1u64 << 26) - 1);
             assert_eq!(
                 requested(writeback) & !low,
-                FUSE_HANDLE_KILLPRIV_V2,
+                InitFlags::FUSE_HANDLE_KILLPRIV_V2,
                 "an unexpected capability above bit 25 (writeback={writeback})"
             );
         }
@@ -1800,7 +1801,6 @@ mod tests {
     #[test]
     fn the_kill_flag_is_bit_two_and_nothing_else() {
         let flags = |bits: u32| WriteFlags::from_bits_retain(bits);
-        assert_eq!(FUSE_WRITE_KILL_PRIV, 1 << 2);
         assert!(kill_suidgid(flags(1 << 2)));
         assert!(kill_suidgid(flags(0xFFFF_FFFF)));
         assert!(!kill_suidgid(flags(0)));
