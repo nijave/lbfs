@@ -363,7 +363,8 @@ A future control message will force a real sync regardless of this setting;
 - **Lifecycle:** `connect → HELLO → ATTACH → mount`; pre-mount failures are
   clean CLI errors. SIGINT/SIGTERM: unmount, drain, exit. CLI:
   `lbfs-client <server:port> <remote-path> <mountpoint> [--attr-timeout N]
-  [--entry-timeout N] [--allow-other] [--auto-unmount] [--no-writeback]`.
+  [--entry-timeout N] [--allow-other] [--auto-unmount] [--no-writeback]
+  [--fuse-threads N] [--fuse-clone-fd]`.
 - **Connection loss:** all in-flight and later ops fail `EIO`; the mount
   stays present and cleanly unmountable. No transparent reconnect in v1
   (node/handle state is session-scoped server-side; honest reconnection

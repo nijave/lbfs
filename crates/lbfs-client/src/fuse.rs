@@ -508,16 +508,23 @@ pub fn session_config(
     if auto_unmount {
         // Off by default, and a flag rather than a constant, because
         // `fusermount3` only honors it for a mount that also carries
-        // `allow_other` — `fuser` widens the ACL implicitly — and only when
-        // `user_allow_other` is set in `/etc/fuse.conf`. Widening a private
-        // mount to every user on the machine is not a default, and on a host
-        // without that line it is not a default that works.
+        // `allow_other` — and only when `user_allow_other` is set in
+        // `/etc/fuse.conf`. Widening a private mount to every user on the
+        // machine is not a default, and on a host without that line it is not
+        // a default that works.
         mount_options.push(MountOption::AutoUnmount);
     }
 
     let mut config = Config::default();
     config.mount_options = mount_options;
-    config.acl = if allow_other {
+    // `auto_unmount` widens the ACL because it has to, and the widening
+    // happens here because fuser stopped doing it: 0.16 added `allow_other`
+    // itself (keeping userspace enforcement at `Owner`), while 0.18's
+    // `Session::new` refuses the combination outright — "auto_unmount
+    // requires acl != Owner". The flag's own documentation has always said it
+    // implies `--allow-other`, and `All` is the only ACL this release offers
+    // that keeps that promise.
+    config.acl = if allow_other || auto_unmount {
         SessionACL::All
     } else {
         SessionACL::Owner
@@ -1737,14 +1744,14 @@ mod tests {
         }
     }
 
-    /// Declaring ABI 7.40 is a claim about what this client understands, and
-    /// fuser 0.16.0 names no INIT constant between bit 26 and bit 36 — above
-    /// bit 25 the tag carries only `FUSE_INIT_EXT` (30), `FUSE_INIT_RESERVED`
-    /// (31) and `FUSE_PASSTHROUGH` (37). The claim holds because a feature
-    /// nobody asks for is a feature the kernel leaves off. Bit 28 is the one
-    /// high bit this client does ask for, declared locally and answered by the
-    /// server's own set-user-ID strip. Anything else appearing up here is a
-    /// feature being negotiated with no code behind it.
+    /// The ABI level is fixed at 7.40 from fuser 0.18.0 on, which is a claim
+    /// about what this client understands, and `InitFlags` on this release
+    /// names plenty above bit 25 — 26, 27, 29, and 32 through 39 among them.
+    /// What keeps the claim honest is not the crate's vocabulary but this
+    /// client's ask: a feature nobody requests is a feature the kernel leaves
+    /// off. Bit 28 is the one high bit this client does ask for, answered by
+    /// the server's own set-user-ID strip. Anything else appearing up here is
+    /// a feature being negotiated with no code behind it.
     #[test]
     fn the_only_high_capability_asked_for_is_killpriv_v2() {
         for writeback in [true, false] {
@@ -1812,8 +1819,7 @@ mod tests {
     }
 
     /// Neither widens access by default. Reach is an ACL from this release on
-    /// rather than a mount option, and `auto_unmount` makes `fuser` widen the
-    /// ACL implicitly, so the two are still opt-in together.
+    /// rather than a mount option, and both flags stay opt-in.
     #[test]
     fn access_widening_is_opt_in() {
         let plain = session_config(1 << 20, false, false, None, false);
@@ -1825,12 +1831,26 @@ mod tests {
         assert!(wide.mount_options.contains(&MountOption::AutoUnmount));
     }
 
+    /// `--auto-unmount` alone must still produce a mountable configuration.
+    /// fuser 0.18's `Session::new` refuses `AutoUnmount` beside
+    /// `SessionACL::Owner`, so the documented "implies `--allow-other`" has to
+    /// happen here — a config this test fails on is one that dies at mount
+    /// time with an error naming neither flag.
+    #[test]
+    fn auto_unmount_alone_widens_the_acl_it_cannot_mount_without() {
+        let cfg = session_config(1 << 20, false, true, None, false);
+        assert_eq!(cfg.acl, SessionACL::All);
+        assert!(cfg.mount_options.contains(&MountOption::AutoUnmount));
+    }
+
     /// Never `RootAndOwner`: a mount root may enter and nobody else is a shape
     /// no lbfs deployment asks for, and an ACL nothing sets is one nothing
     /// tests.
     #[test]
     fn the_root_and_owner_acl_is_never_chosen() {
-        for (allow_other, auto_unmount) in [(false, false), (true, false), (true, true)] {
+        for (allow_other, auto_unmount) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let cfg = session_config(1 << 20, allow_other, auto_unmount, None, false);
             assert_ne!(cfg.acl, SessionACL::RootAndOwner);
         }
@@ -1840,7 +1860,9 @@ mod tests {
     /// rejects it by failing the mount.
     #[test]
     fn the_option_list_holds_no_duplicates() {
-        for (allow_other, auto_unmount) in [(false, false), (true, false), (true, true)] {
+        for (allow_other, auto_unmount) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let opts =
                 session_config(1 << 20, allow_other, auto_unmount, None, false).mount_options;
             let unique: std::collections::HashSet<_> = opts.iter().collect();
@@ -1849,9 +1871,10 @@ mod tests {
     }
 
     /// One event loop and one shared descriptor unless somebody asks
-    /// otherwise. Each extra thread reserves a resident 16 MiB receive buffer
-    /// (`MAX_WRITE_SIZE + 4096`, one per thread, never shrunk to the negotiated
-    /// `max_write`), which on a 1962 MB guest is 3% per four threads.
+    /// otherwise. Each extra thread allocates a 16 MiB receive buffer
+    /// (`MAX_WRITE_SIZE + 4096`, one per thread); the measured resident share
+    /// is about 2 MB under a 1 MiB negotiated `max_write`, since pages fault
+    /// in only as far as requests touch them.
     #[test]
     fn the_session_runs_one_event_loop_by_default() {
         let cfg = session_config(1 << 20, false, false, None, false);

@@ -742,7 +742,6 @@ fn a_long_name_lifetime_does_not_hold_a_stale_size() {
         writeback: false,
         ..Opts::default()
     });
-    lb.wait_ready();
 
     let seen = lb.mnt().join("grows");
     let real = lb.export().join("grows");
