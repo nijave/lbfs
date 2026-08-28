@@ -2,6 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to execute this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Complete. All ten tasks ran and merged to `main` as the commit run
+`356f68e..1fe14cc` — spec, protocol v2, both client halves, the server policy
+module with its strip sites, the node-table type cache, the loopback pins, and
+the benchmark record, plus two things the work surfaced along the way: the
+`copy_file_range` strip fix (`16691a4`) and the fallocate follow-up note
+(`1fe14cc`). Measured result: 4 KiB random write fell from ~300 µs to ~166 µs,
+past the ~205 µs target. A 2026-08-27 doc audit found the boxes below unticked
+and ticked them after the fact; the text still describes the fuser 0.15.1 tree
+it ran on, and the fuser two-step upgrade plan later moved the same bridge code
+to 0.18.0.
+
 **Goal:** Cut the second round trip that every `WRITE` through an lbfs mount drags behind it, taking 4 KiB random-write latency from 296 µs to roughly 205 µs without weakening the set-user-ID guarantee the mount owes its callers.
 
 **Architecture:** The client asks its kernel for `FUSE_HANDLE_KILLPRIV_V2`, which lets the kernel latch `S_NOSEC` on each inode and stop probing `security.capability` before every write. In exchange lbfs takes on the promise that flag encodes, so the `WRITE` body grows a `kill_suidgid` flag that the bridge copies out of fuser's `write_flags`, and the server clears set-user-ID and set-group-ID itself whenever it holds `CAP_FSETID`, which is exactly when the backing kernel skips the strip. One independent change rides along: the node table remembers each node's file type, which drops a syscall from every xattr operation.
@@ -182,7 +193,7 @@ The triple belongs to `LocalFs::xattr_fd` (`mod.rs:425-442`), and it has one rem
 - Consumes: nothing.
 - Produces: the written contract every later task argues from. Names fixed here: wire field `kill_suidgid`, protocol version `2`, server policy names `Kernel` and `Explicit`.
 
-- [ ] **Step 1: Bump the version sentence in §3.2**
+- [x] **Step 1: Bump the version sentence in §3.2**
 
 Find this line in §3.2 step 1:
 
@@ -203,7 +214,7 @@ Replace it with:
    deploy together, so the refusal costs nothing.
 ```
 
-- [ ] **Step 2: Add the `WRITE` body note to §3.4**
+- [x] **Step 2: Add the `WRITE` body note to §3.4**
 
 Directly after the paragraph that begins `` `SETATTR` is a single op with an optional-field struct ``, add:
 
@@ -215,7 +226,7 @@ clear set-user-ID and set-group-ID before the bytes land. §5.3 says which side
 performs the clearing.
 ```
 
-- [ ] **Step 3: Add the kill-priv subsection to §5.3**
+- [x] **Step 3: Add the kill-priv subsection to §5.3**
 
 Append to §5.3, after the existing prose:
 
@@ -254,7 +265,7 @@ client whose kernel serializes those two operations per inode, and the result
 is narrower than v1 shipped with, so the design accepts the window.
 ```
 
-- [ ] **Step 4: Add the capability to §7**
+- [x] **Step 4: Add the capability to §7**
 
 In §7, find the sentence listing the capabilities the client requests and add `FUSE_HANDLE_KILLPRIV_V2` to it, then append:
 
@@ -268,7 +279,7 @@ capability, so a server honouring the flag on a mount that lost it strips more
 often than the contract demands — never less.
 ```
 
-- [ ] **Step 5: Trim the fast-follow in §11**
+- [x] **Step 5: Trim the fast-follow in §11**
 
 If §11 lists the per-write metadata round trip as future work, replace that bullet with:
 
@@ -282,12 +293,12 @@ If §11 lists the per-write metadata round trip as future work, replace that bul
 
 If §11 has no such bullet, add the one above at its end.
 
-- [ ] **Step 6: Check the prose gate**
+- [x] **Step 6: Check the prose gate**
 
 Run: `git diff --stat docs/superpowers/specs/2026-08-20-lbfs-design.md`
 Expected: one file changed, five hunks.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add docs/superpowers/specs/2026-08-20-lbfs-design.md
@@ -306,7 +317,7 @@ git commit -m "docs(spec): protocol v2, WRITE kill_suidgid, server kill-priv con
 - Consumes: Task 1's spec wording.
 - Produces: `PROTOCOL_VERSION: u32 = 2`; `WriteRequest { node: NodeId, fh: Fh, offset: u64, kill_suidgid: bool }`. Every later task builds that struct with all four fields.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block at the bottom of `crates/lbfs-proto/src/ops.rs`:
 
@@ -354,12 +365,12 @@ Add to the `mod tests` block at the bottom of `crates/lbfs-proto/src/ops.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p lbfs-proto`
 Expected: FAIL — `WriteRequest` has no field `kill_suidgid`, and `protocol_version_is_two` reports `1`.
 
-- [ ] **Step 3: Write the code**
+- [x] **Step 3: Write the code**
 
 In `crates/lbfs-proto/src/frame.rs`, replace the version line:
 
@@ -392,14 +403,14 @@ pub struct WriteRequest {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p lbfs-proto`
 Expected: PASS, including both golden byte strings.
 
 Note: the rest of the workspace no longer compiles at this point — every `WriteRequest` literal is missing a field. Tasks 3 and 6 repair the client and the server; run `cargo test -p lbfs-proto` rather than `make check` until Task 6 lands.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/lbfs-proto/src/frame.rs crates/lbfs-proto/src/ops.rs
@@ -422,7 +433,7 @@ git commit -m "feat(proto)!: WRITE carries kill_suidgid, protocol version 2"
 - Consumes: Task 2's `WriteRequest`.
 - Produces: `Connection::write(&self, node: NodeId, fh: Fh, offset: u64, data: Vec<u8>, kill_suidgid: bool) -> Result<u32, Errno>`; `fn kill_suidgid(write_flags: u32) -> bool` in `fuse.rs`; the frame helper `Client::write(&mut self, node, fh, offset, data, kill_suidgid)` in `tests/src/lib.rs`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `mod tests` block at the bottom of `crates/lbfs-client/src/fuse.rs`:
 
@@ -444,12 +455,12 @@ Add to the `mod tests` block at the bottom of `crates/lbfs-client/src/fuse.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p lbfs-client the_kill_flag_is_bit_two`
 Expected: FAIL — `cannot find function 'kill_suidgid' in this scope`.
 
-- [ ] **Step 3: Add the helper and widen the import**
+- [x] **Step 3: Add the helper and widen the import**
 
 In `crates/lbfs-client/src/fuse.rs`, replace the `fuser::consts` import at lines 52-55:
 
@@ -480,12 +491,12 @@ fn kill_suidgid(write_flags: u32) -> bool {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p lbfs-client the_kill_flag_is_bit_two`
 Expected: PASS.
 
-- [ ] **Step 5: Widen `Connection::write`**
+- [x] **Step 5: Widen `Connection::write`**
 
 In `crates/lbfs-client/src/conn.rs`, replace the method at line 848:
 
@@ -514,7 +525,7 @@ In `crates/lbfs-client/src/conn.rs`, replace the method at line 848:
     }
 ```
 
-- [ ] **Step 6: Forward the flag from the callback**
+- [x] **Step 6: Forward the flag from the callback**
 
 In `crates/lbfs-client/src/fuse.rs`, replace the `write` callback body at lines 855-882:
 
@@ -551,7 +562,7 @@ In `crates/lbfs-client/src/fuse.rs`, replace the `write` callback body at lines 
     }
 ```
 
-- [ ] **Step 7: Repair the remaining call sites**
+- [x] **Step 7: Repair the remaining call sites**
 
 `crates/lbfs-client/src/bin/lbfs-bench.rs` line 208 becomes:
 
@@ -610,14 +621,14 @@ and line 228 becomes:
 
 Then add `, false` to every `.write(` call in `tests/tests/protocol.rs` — the compiler names each one.
 
-- [ ] **Step 8: Run the client tests**
+- [x] **Step 8: Run the client tests**
 
 Run: `cargo test -p lbfs-client --lib`
 Expected: PASS.
 
 Note: `cargo test --workspace` still fails while the server has not caught up. Task 6 closes that.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/lbfs-client/src/conn.rs crates/lbfs-client/src/fuse.rs \
@@ -637,7 +648,7 @@ git commit -m "feat(client): forward FUSE_WRITE_KILL_SUIDGID onto the wire"
 - Consumes: Task 3's bridge.
 - Produces: `const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;` in `fuse.rs`, and a `Capability` entry with `required: false`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `mod tests` block in `crates/lbfs-client/src/fuse.rs`, beside the existing capability tests:
 
@@ -674,12 +685,12 @@ Add to the `mod tests` block in `crates/lbfs-client/src/fuse.rs`, beside the exi
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p lbfs-client killpriv_v2`
 Expected: FAIL — `cannot find value 'FUSE_HANDLE_KILLPRIV_V2' in this scope`.
 
-- [ ] **Step 3: Declare the constant**
+- [x] **Step 3: Declare the constant**
 
 In `crates/lbfs-client/src/fuse.rs`, add immediately above `fn capabilities(` (around line 357):
 
@@ -699,7 +710,7 @@ In `crates/lbfs-client/src/fuse.rs`, add immediately above `fn capabilities(` (a
 const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
 ```
 
-- [ ] **Step 4: Add the capability**
+- [x] **Step 4: Add the capability**
 
 In `crates/lbfs-client/src/fuse.rs`, inside `capabilities()`, append this entry to the `vec![...]` after the `FUSE_ASYNC_DIO` entry:
 
@@ -720,12 +731,12 @@ In `crates/lbfs-client/src/fuse.rs`, inside `capabilities()`, append this entry 
         },
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p lbfs-client killpriv_v2`
 Expected: PASS, both cases.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs
@@ -745,7 +756,7 @@ git commit -m "feat(client): request FUSE_HANDLE_KILLPRIV_V2 to drop the per-wri
 - Consumes: nothing.
 - Produces: `pub enum KillPrivPolicy { Kernel, Explicit }` with `KillPrivPolicy::detect() -> KillPrivPolicy`, and `pub fn stripped_mode(mode: u32) -> Option<u32>`. Tasks 6 and 7 call both.
 
-- [ ] **Step 1: Add the rustix feature**
+- [x] **Step 1: Add the rustix feature**
 
 In the workspace `Cargo.toml`, change the rustix line:
 
@@ -756,7 +767,7 @@ In the workspace `Cargo.toml`, change the rustix line:
 rustix = { version = "1", features = ["fs", "net", "process", "thread"] }
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `crates/lbfs-server/src/fs/local/killpriv.rs` holding only this test module for now:
 
@@ -835,12 +846,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p lbfs-server killpriv`
 Expected: FAIL — the module is not declared, so nothing compiles.
 
-- [ ] **Step 4: Write the code**
+- [x] **Step 4: Write the code**
 
 Prepend to `crates/lbfs-server/src/fs/local/killpriv.rs`, above the test module:
 
@@ -938,12 +949,12 @@ In `crates/lbfs-server/src/fs/local/mod.rs`, add the module beside the existing 
 pub mod killpriv;
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p lbfs-server killpriv`
 Expected: PASS — six cases.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/lbfs-server/src/fs/local/killpriv.rs \
@@ -964,7 +975,7 @@ git commit -m "feat(server): kill-priv policy and the VFS strip rule"
 - Consumes: Tasks 2 and 5.
 - Produces: `FileSystem::write(&self, node: NodeId, fh: Fh, offset: u64, data: PooledBuf, len: u32, kill_suidgid: bool) -> FsResult<u32>`; `LocalFs::killpriv` field; `LocalFs::strip_privileged_bits(&self, fd: &Arc<OwnedFd>) -> FsResult<()>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `mod tests` block at the bottom of `crates/lbfs-server/src/fs/local/mod.rs`:
 
@@ -1017,12 +1028,12 @@ Add to the `mod tests` block at the bottom of `crates/lbfs-server/src/fs/local/m
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p lbfs-server a_flagged_write`
 Expected: FAIL — `this method takes 5 arguments but 6 arguments were supplied`.
 
-- [ ] **Step 3: Widen the trait**
+- [x] **Step 3: Widen the trait**
 
 In `crates/lbfs-server/src/fs/mod.rs`, replace the `write` signature:
 
@@ -1043,7 +1054,7 @@ In `crates/lbfs-server/src/fs/mod.rs`, replace the `write` signature:
     ) -> FsResult<u32>;
 ```
 
-- [ ] **Step 4: Give `LocalFs` a policy and a strip**
+- [x] **Step 4: Give `LocalFs` a policy and a strip**
 
 In `crates/lbfs-server/src/fs/local/mod.rs`, add the import beside the existing ones:
 
@@ -1101,7 +1112,7 @@ Add the helper to the `impl LocalFs` block, right after `statx_fd`:
     }
 ```
 
-- [ ] **Step 5: Apply it in `LocalFs::write`**
+- [x] **Step 5: Apply it in `LocalFs::write`**
 
 Replace the head of `LocalFs::write`, from the signature through the `let fd` line:
 
@@ -1126,7 +1137,7 @@ Replace the head of `LocalFs::write`, from the signature through the `let fd` li
 
 Leave the rest of the method unchanged.
 
-- [ ] **Step 6: Pass the flag through dispatch**
+- [x] **Step 6: Pass the flag through dispatch**
 
 In `crates/lbfs-server/src/rpc/dispatch.rs`, replace line 225:
 
@@ -1137,7 +1148,7 @@ In `crates/lbfs-server/src/rpc/dispatch.rs`, replace line 225:
             {
 ```
 
-- [ ] **Step 7: Repair the existing backend tests**
+- [x] **Step 7: Repair the existing backend tests**
 
 Add `, false` as the sixth argument to each `fs.write(` call in `crates/lbfs-server/src/fs/local/mod.rs` — lines 1862, 1895, 2144, 2173, 2212, 2236 and 2271. For example line 1862 becomes:
 
@@ -1145,12 +1156,12 @@ Add `, false` as the sixth argument to each `fs.write(` call in `crates/lbfs-ser
         assert_eq!(fs.write(entry.node, fh, 0, buf, 5, false).await.unwrap(), 5);
 ```
 
-- [ ] **Step 8: Run the whole gate**
+- [x] **Step 8: Run the whole gate**
 
 Run: `make check`
 Expected: PASS. This is the first point since Task 2 where the workspace compiles end to end.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/lbfs-server/src/fs/mod.rs crates/lbfs-server/src/fs/local/mod.rs \
@@ -1169,7 +1180,7 @@ git commit -m "feat(server): clear set-user-ID on a flagged write"
 - Consumes: Task 5's `stripped_mode` and `KillPrivPolicy`.
 - Produces: `apply_setattr(fd: &OwnedFd, write_fd: Option<&OwnedFd>, args: &SetattrArgs, killpriv: KillPrivPolicy) -> Result<(), Errno>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `mod tests` block in `crates/lbfs-server/src/fs/local/mod.rs`:
 
@@ -1237,12 +1248,12 @@ Add to the `mod tests` block in `crates/lbfs-server/src/fs/local/mod.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p lbfs-server a_truncate_clears a_chmod_without`
 Expected: `a_chmod_without_a_truncate_keeps_set_user_id` passes; `a_truncate_clears_set_user_id` passes too when the suite runs unprivileged, because the backing kernel already strips. Record that result — that run exercises the `Kernel` branch, and Step 3 adds the `Explicit` branch the same test covers under root.
 
-- [ ] **Step 3: Widen `apply_setattr`**
+- [x] **Step 3: Widen `apply_setattr`**
 
 In `crates/lbfs-server/src/fs/local/mod.rs`, change the signature at line 849:
 
@@ -1294,7 +1305,7 @@ Update the doc comment above `apply_setattr` so its numbered order still reads t
 ///    bump a truncate just caused.
 ```
 
-- [ ] **Step 4: Pass the policy in**
+- [x] **Step 4: Pass the policy in**
 
 In `LocalFs::setattr`, replace the `spawn_blocking` call:
 
@@ -1308,12 +1319,12 @@ In `LocalFs::setattr`, replace the `spawn_blocking` call:
         .map_err(join_errno)??;
 ```
 
-- [ ] **Step 5: Run the gate**
+- [x] **Step 5: Run the gate**
 
 Run: `make check`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-server/src/fs/local/mod.rs
@@ -1332,7 +1343,7 @@ git commit -m "feat(server): clear set-user-ID on truncate under a privileged se
 - Consumes: nothing from earlier tasks; independently reviewable.
 - Produces: `NodeTable::new(root_fd: OwnedFd, root_key: FileKey, file_type: u32)`, `NodeTable::register(fd: OwnedFd, key: FileKey, file_type: u32) -> (NodeId, u64, Arc<OwnedFd>)`, `NodeTable::file_type(&self, node: NodeId) -> Option<u32>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `mod tests` block in `crates/lbfs-server/src/fs/local/nodes.rs`:
 
@@ -1369,12 +1380,12 @@ Change `table_over_tempdir` in the same module to pass the root's type:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p lbfs-server a_node_remembers_its_file_type`
 Expected: FAIL — `this function takes 2 arguments but 3 arguments were supplied`.
 
-- [ ] **Step 3: Write the code**
+- [x] **Step 3: Write the code**
 
 In `crates/lbfs-server/src/fs/local/nodes.rs`, add the field to `Node`:
 
@@ -1437,7 +1448,7 @@ Add the accessor after `get`:
 
 Add `, libc::S_IFREG` to the `register` calls in the existing tests of that module — `register_get_forget_lifecycle`, `hardlinks_dedup_to_one_node_with_bumped_refcount`, `generations_differ_when_id_slot_recycles_a_key` and `a_recycled_key_after_full_forget_gets_a_fresh_id_and_generation`.
 
-- [ ] **Step 4: Feed the type from both registration sites**
+- [x] **Step 4: Feed the type from both registration sites**
 
 In `crates/lbfs-server/src/fs/local/mod.rs`, in `from_root_fd`, replace the `NodeTable::new` call:
 
@@ -1453,7 +1464,7 @@ In `lookup_impl`, replace the `register` call:
             .register(owned, key, u32::from(st.stx_mode) & libc::S_IFMT);
 ```
 
-- [ ] **Step 5: Drop the `fstat` from `xattr_fd`**
+- [x] **Step 5: Drop the `fstat` from `xattr_fd`**
 
 Replace the body of `xattr_fd`, keeping its existing doc comment and adding one paragraph to it:
 
@@ -1484,12 +1495,12 @@ Replace the body of `xattr_fd`, keeping its existing doc comment and adding one 
     }
 ```
 
-- [ ] **Step 6: Run the gate**
+- [x] **Step 6: Run the gate**
 
 Run: `make check`
 Expected: PASS, including the existing `getxattr_probes_the_length_and_refuses_a_short_buffer` and the symlink and FIFO xattr cases, which still see `EOPNOTSUPP`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/lbfs-server/src/fs/local/nodes.rs crates/lbfs-server/src/fs/local/mod.rs
@@ -1507,7 +1518,7 @@ git commit -m "perf(server): node table remembers the file type, xattr_fd drops 
 - Consumes: Tasks 3, 4, 6 and 7.
 - Produces: `fn privileged_bits_die_on_write(writeback: bool)` plus two `#[test]` wrappers, following the file's existing `file_content_round_trips(writeback: bool)` shape.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `tests/tests/loopback.rs`, beside the `file_content_round_trips` pair:
 
@@ -1598,17 +1609,17 @@ fn privileged_bits_die_on_write_without_the_writeback_cache() {
 
 Add `use std::os::unix::fs::PermissionsExt;` to the imports if `from_mode` does not already resolve. The file already imports `MetadataExt` at line 58, which supplies `mode()`.
 
-- [ ] **Step 2: Run the tests to verify they behave**
+- [x] **Step 2: Run the tests to verify they behave**
 
 Run: `cargo test -p lbfs-tests --test loopback privileged_bits -- --ignored --test-threads=1`
 Expected: PASS. Run this on the *pre-change* tree too if you want the contrast: it passes there as well, because an unprivileged server's own kernel does the strip. What it guards is the future — a `KillPrivPolicy` bug, a dropped wire flag, or a server that gains `CAP_FSETID`.
 
-- [ ] **Step 3: Run the whole loopback suite**
+- [x] **Step 3: Run the whole loopback suite**
 
 Run: `make test-loopback`
 Expected: PASS, no regressions in the existing cases.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/tests/loopback.rs
@@ -1626,12 +1637,12 @@ git commit -m "test(loopback): set-user-ID and set-group-ID die on write and tru
 - Consumes: every task above.
 - Produces: the acceptance evidence. No automated test — this one needs two guests and a quiet machine.
 
-- [ ] **Step 1: Build and deploy**
+- [x] **Step 1: Build and deploy**
 
 Run: `make build-guest && make vm-deploy`
 Expected: `deployed.` with `lbfs-server` active. If the pair is down, `make vm-up` first.
 
-- [ ] **Step 2: Confirm the kernel granted the capability**
+- [x] **Step 2: Confirm the kernel granted the capability**
 
 Run on the client guest, after mounting:
 
@@ -1649,7 +1660,7 @@ lbfs-client 192.168.77.10:9423 /srv/exports/data /mnt/lbfs 2>&1 | grep -i killpr
 
 Expected: no output. A line reading `capability=FUSE_HANDLE_KILLPRIV_V2 unsupported by this kernel` means the kernel refused the bit and the rest of this task measures nothing.
 
-- [ ] **Step 3: Count the server's syscalls under a write load**
+- [x] **Step 3: Count the server's syscalls under a write load**
 
 On the server guest, with a 4 KiB random-write job running against the mount from the client:
 
@@ -1659,7 +1670,7 @@ sudo timeout 12 strace -c -f -p "$(pgrep -x lbfs-server)"
 
 Expected: `openat`, `fstat` and `close` counts near zero — a handful for connection setup, not thousands. Compare against `writev`, which should now sit near one per write rather than two. Before this change the same window showed 6430 triples against 12872 `writev` calls.
 
-- [ ] **Step 4: Measure the four shapes**
+- [x] **Step 4: Measure the four shapes**
 
 Run the drained single-job driver used for the tables in the benchmark document: 4 KiB random write psync QD1, 4 KiB random read psync QD1, 4 KiB random read libaio QD16, and 1 MiB sequential read psync — each with `direct=1`, each after draining the server's dirty pages (`sync`, then poll `/proc/meminfo` until `Dirty + Writeback` falls under 8 MB).
 
@@ -1672,7 +1683,7 @@ Expected:
 | randread 4k libaio QD16 | 40290 IOPS, 393 µs | unchanged within run-to-run spread |
 | seq read 1M psync | 1580 MB/s, 632 µs | unchanged within run-to-run spread |
 
-- [ ] **Step 5: Record it**
+- [x] **Step 5: Record it**
 
 Append a section to `docs/benchmarks/2026-08-22-bottleneck-analysis.md`:
 
@@ -1698,7 +1709,7 @@ Syscall counts over a 12 s randwrite window: [counts from Step 3].
 
 A docs sweep on 2026-08-22 already renamed that section to "The per-write `GETXATTR`" and corrected its closing paragraph, so this step only appends the new Phase 8 section with the post-fix numbers.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/benchmarks/2026-08-22-bottleneck-analysis.md
