@@ -483,3 +483,73 @@ The Phase 8 run left the pair the same way:
 * `lbfs-server` now runs the `perf/kill-priv` build,
   `fb5066ce618ac0855c1d0fd3eca04a5d`, which supersedes the md5 above.
 * Both domains still running.
+
+## The fuser upgrade, measured (2026-08-27)
+
+0.15.1 → 0.16.0 (ABI 7.40, pure-Rust mount) → 0.18.0. No shape moved. That was
+the prediction and this is the check: the crate's own dispatch thread never
+exceeded 15.6% of a core in the Phase 6 attribution, so there was nothing for
+a newer session loop to relieve. The value of the two steps is the API, the
+dropped libfuse3 link and the road to the release that carries the kill-priv
+forwarding fix.
+
+The Phase 2/3 tables above are not the baseline for this A/B: the kill-priv
+work landed between them and this measurement, and it moved the write shapes
+on its own (randwrite 4k sat at 296 µs mean with the per-write
+`security.capability` probe and answers 165-172 µs without it). Both columns
+below come instead from the same day, the same guest pair and the same
+drained single-job driver — `main` at `341f6d3` (fuser 0.16.0) against the
+upgrade branch at `311f5a0` (fuser 0.18.0), direct=1, 512M, 15 s per job.
+
+| job | 0.16.0 (`341f6d3`) | 0.18.0 (`311f5a0`) | change |
+|---|---|---|---|
+| seq write 1M psync | 1304.1 MB/s, 803 µs | 1249.6 MB/s, 838 µs | −4.2%, inside spread |
+| seq read 1M psync | 1843.6 MB/s, 568 µs | 1734.8 MB/s, 604 µs | −5.9%, inside spread |
+| randread 4k psync QD1 | 8538 IOPS, 116.4 µs | 8513 IOPS, 116.7 µs | −0.3% |
+| randwrite 4k psync QD1 | 5776 IOPS, 172 µs | 6004 IOPS, 166 µs | +3.9%, inside spread |
+| randread 4k libaio QD16 | 43166 IOPS, 370 µs | 43251 IOPS, 369 µs | +0.2% |
+
+The 0.18.0 mount negotiated what it used to: `max_io=1048576`,
+`writeback=true`, both lifetimes at 1 s, and no `unsupported by this kernel`
+line — the `FUSE_HANDLE_KILLPRIV_V2` ask survived the bump, which the
+randwrite latency confirms from the outside.
+
+### Extra event loops, measured rather than assumed
+
+`Config { n_threads, clone_fd }` arrived with 0.17.0 and is reachable from
+0.18.0. The client exposes it as `--fuse-threads` and `--fuse-clone-fd`, off by
+default. Same five shapes, same drain, one, two and four event loops with
+private descriptors, all on the 0.18.0 build:
+
+| job | one loop | `--fuse-threads 2` | `--fuse-threads 4` |
+|---|---|---|---|
+| seq write 1M psync | 1249.6 MB/s, 838 µs | 1130.9 MB/s, 926 µs | 1023.3 MB/s, 1023 µs |
+| seq read 1M psync | 1734.8 MB/s, 604 µs | 1611.6 MB/s, 650 µs | 1833.8 MB/s, 571 µs |
+| randread 4k psync QD1 | 8513 IOPS, 117 µs | 7226 IOPS, 138 µs | 8265 IOPS, 120 µs |
+| randwrite 4k psync QD1 | 6004 IOPS, 166 µs | 6139 IOPS, 162 µs | 6033 IOPS, 165 µs |
+| randread 4k libaio QD16 | 43251 IOPS, 369 µs | 39952 IOPS, 400 µs | 40018 IOPS, 399 µs |
+
+No shape improves on either setting. The sequential-write column drifts down
+the table, but that is the shape this document already flags as swinging with
+server page-cache pressure, and the drift sits inside its spread.
+
+`ps -L` confirms the threads exist — `fuser-0` through `fuser-3` with
+`--fuse-threads 4` — and also that 0.18.0 names its single default loop
+`fuser-0`, so "no fuser-N threads" is not the signature of a missing flag; the
+count is.
+
+**The 16 MiB-per-thread cost is virtual, not resident.** Fresh mounts read
+5188 kB RSS with one loop, 5516 kB with two and 5788 kB with four — roughly
+150-300 kB per extra thread, nowhere near `BUFFER_SIZE`. After a sequential
+write and a QD16 random read: 7488 kB with one loop against 13680 kB with
+four, about 2 MB resident per extra thread. The allocation exists per thread,
+but its pages fault in only as far as requests touch them, and a 1 MiB
+negotiated `max_write` touches a sixteenth of each buffer. The prediction of
+16 MiB resident per thread came from reading the allocation; the measurement
+says an operator on this configuration pays an eighth of that.
+
+The reading matches the prediction otherwise: this guest has two vCPUs, one of
+them already carrying tokio workers, so a second reader of /dev/fuse competes
+for a core rather than finding an idle one. The knob stays worth keeping for a
+guest with four or more vCPUs running many files concurrently — the shape that
+scaled 2.66× in the Phase 4 ladder — and worth leaving off everywhere else.

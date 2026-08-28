@@ -222,6 +222,17 @@ lets a server-side size change show through. The mechanism under test is the
 TTL split, so the shipped case turns the writeback cache off and says why in
 place.
 
+**Task 10's expected column had gone stale before step two started.** Its
+Step 3 table quotes the Phase 2/3 figures, but the kill-priv work merged
+after that campaign and moved the write shapes by itself — randwrite 4k
+answers 165-172 µs today against the table's 296 µs. The measurement ran
+its own same-day baseline instead, `main` at `341f6d3` on 0.16.0, against
+the branch. Two smaller readings also differ from the steps: 0.18.0
+names its single default event loop `fuser-0`, so Step 5's "no fuser-N names"
+is not the absent-flag signature (the count is); and Step 4's 16 MiB-per-thread
+resident cost measured at about 2 MB, because the buffer's pages fault in only
+as far as requests touch them — the softening the step itself ordered.
+
 ---
 
 ## File Map
@@ -2412,12 +2423,12 @@ git commit -m "feat(client): --fuse-threads and --fuse-clone-fd, off by default"
 
 Two questions, and the second one is the reason the knob shipped. First: did the upgrade move anything? The expected answer is no, and a plan whose whole argument is "no measured change" owes a measurement. Second: what do extra event loops do on today's guest? The expected answer is also no change, and recording that is what stops somebody reopening the question from memory.
 
-- [ ] **Step 1: Build and deploy**
+- [x] **Step 1: Build and deploy**
 
 Run: `make build-guest && make vm-deploy`
 Expected: `deployed.` with `lbfs-server` active. If the pair is down, `make vm-up` first.
 
-- [ ] **Step 2: Confirm the mount still negotiates what it used to**
+- [x] **Step 2: Confirm the mount still negotiates what it used to**
 
 Mount from the client guest and read the client's own log:
 
@@ -2428,7 +2439,7 @@ lbfs-client 192.168.77.10:9423 /srv/exports/data /mnt/lbfs 2>&1 | \
 
 Expected: one `mount initialized` line carrying `max_io=1048576`, `writeback=true`, `attr_ttl=1s` and `entry_ttl=1s`, and no `unsupported by this kernel` line at all. A refusal naming `FUSE_HANDLE_KILLPRIV_V2` means the bump lost the capability and the write numbers below will regress by roughly 90 µs.
 
-- [ ] **Step 3: Measure the five standard shapes with the knob off**
+- [x] **Step 3: Measure the five standard shapes with the knob off**
 
 Run the drained single-job driver used for the tables in the benchmark document — each job `direct=1`, each preceded by a drain (`sync`, then poll `/proc/meminfo` until `Dirty + Writeback` falls under 8 MB).
 
@@ -2444,7 +2455,7 @@ Expected, against the figures already in the document:
 
 Run-to-run spread on this pair is about 20% on the write shapes and tighter on the reads; the document's own Phase 2/Phase 3 columns show the range. Anything outside that range counts as a regression and stops the task.
 
-- [ ] **Step 4: Run the A/B on event-loop threads**
+- [x] **Step 4: Run the A/B on event-loop threads**
 
 Same five shapes, same drain, three client builds of the same binary differing only in flags:
 
@@ -2467,7 +2478,7 @@ ps -o rss= -p "$(pgrep -x lbfs-client)"
 
 Expected: roughly 16 MiB more per extra thread. Note the reading whatever it says; if four threads do not cost about 48 MiB above the control, the crate allocates the buffer lazily and the memory argument in the README wants softening.
 
-- [ ] **Step 5: Confirm the threads exist**
+- [x] **Step 5: Confirm the threads exist**
 
 ```bash
 ps -L -o comm= -p "$(pgrep -x lbfs-client)" | sort | uniq -c
@@ -2475,7 +2486,7 @@ ps -L -o comm= -p "$(pgrep -x lbfs-client)" | sort | uniq -c
 
 Expected: with `--fuse-threads 4`, four threads named `fuser-0` through `fuser-3`; with the flag absent, one background session thread and no `fuser-N` names. A missing set means the flag never reached `Config` and Step 4 measured the control twice.
 
-- [ ] **Step 6: Record it**
+- [x] **Step 6: Record it**
 
 Append to `docs/benchmarks/2026-08-22-bottleneck-analysis.md`:
 
@@ -2510,12 +2521,12 @@ guest with four or more vCPUs running many files concurrently — the shape that
 scaled 2.66× in the Phase 4 ladder — and worth leaving off everywhere else.
 ```
 
-- [ ] **Step 7: Check the prose gate**
+- [x] **Step 7: Check the prose gate**
 
 Run: `vale --output=line docs/benchmarks/2026-08-22-bottleneck-analysis.md`
 Expected: no output.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add docs/benchmarks/2026-08-22-bottleneck-analysis.md

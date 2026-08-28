@@ -85,10 +85,11 @@ struct Cli {
     /// Off by default, and expected to stay off on a two-vCPU guest: the
     /// session thread peaks at 15.6% of a core under the heaviest shape
     /// measured, and a second event loop competes with the tokio workers for
-    /// the other core. Each thread holds a resident 16 MiB receive buffer that
-    /// does not shrink to the negotiated I/O size, so four threads cost 64 MiB.
-    /// Pair it with `--fuse-clone-fd` or most of the benefit stays behind a
-    /// shared descriptor. Linux only, 1 to 64.
+    /// the other core. Each thread allocates a 16 MiB receive buffer; the
+    /// measured resident cost is about 2 MB per thread under a 1 MiB
+    /// negotiated I/O size, since pages fault in only as far as requests
+    /// touch them. Pair it with `--fuse-clone-fd` or most of the benefit
+    /// stays behind a shared descriptor. Linux only, 1 to 64.
     #[arg(long)]
     fuse_threads: Option<usize>,
 

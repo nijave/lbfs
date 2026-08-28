@@ -481,8 +481,9 @@ fn kill_suidgid(write_flags: WriteFlags) -> bool {
 /// `docs/benchmarks/2026-08-22-bottleneck-analysis.md`, and the guest has two
 /// vCPUs with tokio workers already on one, so a second event loop competes
 /// rather than adds. The cost of turning them on is memory rather than risk —
-/// each thread holds its own receive buffer of `MAX_WRITE_SIZE + 4096`, which
-/// is 16 MiB and does not shrink to the negotiated `max_write`.
+/// each thread allocates its own receive buffer of `MAX_WRITE_SIZE + 4096`,
+/// 16 MiB virtual, of which the measured resident share is about 2 MB under a
+/// 1 MiB negotiated `max_write`.
 pub fn session_config(
     max_io_size: u32,
     allow_other: bool,
