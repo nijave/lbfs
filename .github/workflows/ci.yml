@@ -29,19 +29,20 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # Disabled, and two things have to clear before it comes back. The fuser
-  # advisory (RUSTSEC-2021-0154) is one, and pinning `=0.16.0` retires it. The
-  # other is RUSTSEC-2023-0089, which arrives through a dependency fuser has
-  # nothing to do with — see `deny.toml`. Re-enabling on the strength of the
-  # fuser bump alone leaves this job red.
-  # audit:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v7
-  #
-  #     - uses: EmbarkStudios/cargo-deny-action@v2
-  #       with:
-  #         command: check advisories
+  # Both advisories that kept this job off are gone at the root rather than
+  # ignored: RUSTSEC-2021-0154 fell to the fuser pin (>=0.16.0 is patched),
+  # and RUSTSEC-2023-0089 fell to dropping postcard's default `heapless-cas`
+  # feature, which was the only thing pulling the unmaintained atomic-polyfill
+  # into the lockfile. `deny.toml` carries no ignore list, so anything this
+  # job reports is new.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
 
   # Runs on pull requests too, unlike the release job below. Packaging breaks
   # in ways `check` cannot see — a bad asset path, a `cargo deb` flag that does
