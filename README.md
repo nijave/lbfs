@@ -125,6 +125,8 @@ mismatch prints a plain error instead of leaving an `EIO` mountpoint behind.
 | `--entry-timeout <seconds>` | same as `--attr-timeout` | How long the kernel may trust a cached name. Raise it alone for a workload that resolves the same paths often and reads their attributes rarely. Reaches `LOOKUP`, `MKDIR`, `SYMLINK` and `LINK`; a freshly created file and a name from a listing use `--attr-timeout` for both, because FUSE's reply for those carries one lifetime. |
 | `--allow-other` | off | Let other users on the client machine reach the mount. |
 | `--auto-unmount` | off | Ask `fusermount3` to unmount if the process dies uncleanly. Implies `--allow-other`, and needs `user_allow_other` in `/etc/fuse.conf`. |
+| `--fuse-threads N` | off (one) | Run N fuser event-loop threads. Off by default and expected to stay off on a two-vCPU guest: the session thread peaks at 15.6% of a core under the heaviest measured shape. Each thread reserves a resident 16 MiB receive buffer, so four cost 64 MiB. Pair with `--fuse-clone-fd`. Linux only, 1 to 64. |
+| `--fuse-clone-fd` | off | Give each event-loop thread its own `/dev/fuse` descriptor (`FUSE_DEV_IOC_CLONE`, Linux 4.5+). Without it the threads share one queue. Means nothing without `--fuse-threads`. |
 | `--no-writeback` | off | Write through to the server instead of letting the kernel batch dirty pages. |
 
 The writeback cache stays on by default because coalescing small writes is the

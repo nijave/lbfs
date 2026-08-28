@@ -79,6 +79,27 @@ struct Cli {
     /// the only place that knows.
     #[arg(long)]
     no_writeback: bool,
+
+    /// Run this many fuser event-loop threads instead of one.
+    ///
+    /// Off by default, and expected to stay off on a two-vCPU guest: the
+    /// session thread peaks at 15.6% of a core under the heaviest shape
+    /// measured, and a second event loop competes with the tokio workers for
+    /// the other core. Each thread holds a resident 16 MiB receive buffer that
+    /// does not shrink to the negotiated I/O size, so four threads cost 64 MiB.
+    /// Pair it with `--fuse-clone-fd` or most of the benefit stays behind a
+    /// shared descriptor. Linux only, 1 to 64.
+    #[arg(long)]
+    fuse_threads: Option<usize>,
+
+    /// Give each event-loop thread its own `/dev/fuse` descriptor.
+    ///
+    /// `FUSE_DEV_IOC_CLONE`, Linux 4.5 and up. Without it every thread reads
+    /// one descriptor and one kernel queue, which is the serialisation extra
+    /// threads exist to remove. Means nothing on its own — pass
+    /// `--fuse-threads` too.
+    #[arg(long)]
+    fuse_clone_fd: bool,
 }
 
 /// Everything that can go wrong before the mount exists.
@@ -93,6 +114,8 @@ enum StartupError {
     NoAddress(String),
     #[error("--attr-timeout must be a non-negative, finite number of seconds")]
     AttrTimeout,
+    #[error("--fuse-threads must be between 1 and 64")]
+    FuseThreads,
     #[error("the remote path must be absolute")]
     RelativeRemotePath,
     #[error("starting the runtime: {0}")]
@@ -159,7 +182,14 @@ fn run() -> Result<(), StartupError> {
     // nothing for as long as a silent server can hold the handshake open.
     let mut signals = rt.block_on(async { Signals::install() })?;
 
-    let cfg = session_config(limits.max_io_size, cli.allow_other, cli.auto_unmount);
+    let n_threads = event_loop_threads(cli.fuse_threads)?;
+    let cfg = session_config(
+        limits.max_io_size,
+        cli.allow_other,
+        cli.auto_unmount,
+        n_threads,
+        cli.fuse_clone_fd,
+    );
     let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, entry_ttl, writeback);
     let session =
         fuser::spawn_mount(fs, &cli.mountpoint, &cfg).map_err(|source| StartupError::Mount {
@@ -263,6 +293,21 @@ fn attr_timeout(secs: f64) -> Result<Duration, StartupError> {
     Duration::try_from_secs_f64(secs).map_err(|_| StartupError::AttrTimeout)
 }
 
+/// One to sixty-four event loops, or none named at all.
+///
+/// Zero is the value worth catching here rather than downstream: `Session::run`
+/// answers a zero with `io::Error::other("n_threads")`, which reaches the
+/// operator as a mount failure with no explanation in it. The upper bound is
+/// arbitrary and generous — sixty-four threads would reserve a gigabyte of
+/// receive buffer, which is more than the guests have.
+fn event_loop_threads(n: Option<usize>) -> Result<Option<usize>, StartupError> {
+    match n {
+        None => Ok(None),
+        Some(n) if (1..=64).contains(&n) => Ok(Some(n)),
+        Some(_) => Err(StartupError::FuseThreads),
+    }
+}
+
 /// The name lifetime, falling back to the attribute lifetime when the operator
 /// named only one.
 ///
@@ -362,6 +407,15 @@ mod tests {
         ]);
         assert_eq!(split.attr_timeout, 0.5);
         assert_eq!(split.entry_timeout, Some(60.0));
+    }
+
+    #[test]
+    fn event_loop_threads_refuses_zero_and_absurd_counts() {
+        assert_eq!(event_loop_threads(None).unwrap(), None);
+        assert_eq!(event_loop_threads(Some(1)).unwrap(), Some(1));
+        assert_eq!(event_loop_threads(Some(64)).unwrap(), Some(64));
+        assert!(event_loop_threads(Some(0)).is_err());
+        assert!(event_loop_threads(Some(65)).is_err());
     }
 
     #[test]

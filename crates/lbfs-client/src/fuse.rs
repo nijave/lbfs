@@ -474,7 +474,22 @@ fn kill_suidgid(write_flags: WriteFlags) -> bool {
 /// `Config` is `#[non_exhaustive]`, so it cannot be written as a struct
 /// expression from this crate at all — not even with `..Default::default()`.
 /// Start from the default and assign.
-pub fn session_config(max_io_size: u32, allow_other: bool, auto_unmount: bool) -> Config {
+///
+/// `n_threads` and `clone_fd` are off unless a caller says otherwise, and the
+/// measurements say to leave them that way for now: the session thread never
+/// exceeds 15.6% of a core in any run in
+/// `docs/benchmarks/2026-08-22-bottleneck-analysis.md`, and the guest has two
+/// vCPUs with tokio workers already on one, so a second event loop competes
+/// rather than adds. The cost of turning them on is memory rather than risk —
+/// each thread holds its own receive buffer of `MAX_WRITE_SIZE + 4096`, which
+/// is 16 MiB and does not shrink to the negotiated `max_write`.
+pub fn session_config(
+    max_io_size: u32,
+    allow_other: bool,
+    auto_unmount: bool,
+    n_threads: Option<usize>,
+    clone_fd: bool,
+) -> Config {
     let mut mount_options = vec![
         MountOption::FSName("lbfs".to_string()),
         MountOption::DefaultPermissions,
@@ -506,6 +521,8 @@ pub fn session_config(max_io_size: u32, allow_other: bool, auto_unmount: bool) -
     } else {
         SessionACL::Owner
     };
+    config.n_threads = n_threads;
+    config.clone_fd = clone_fd;
     config
 }
 
@@ -1767,7 +1784,7 @@ mod tests {
     /// reads the multiplexer answers with `EINVAL`.
     #[test]
     fn the_mount_pins_max_read_to_the_negotiated_size() {
-        let cfg = session_config(4096, false, false);
+        let cfg = session_config(4096, false, false, None, false);
         assert!(cfg
             .mount_options
             .contains(&MountOption::CUSTOM("max_read=4096".to_string())));
@@ -1784,7 +1801,8 @@ mod tests {
     #[test]
     fn the_mount_never_honours_setuid_bits_or_device_nodes() {
         for (allow_other, auto_unmount) in [(false, false), (true, true)] {
-            let opts = session_config(1 << 20, allow_other, auto_unmount).mount_options;
+            let opts =
+                session_config(1 << 20, allow_other, auto_unmount, None, false).mount_options;
             assert!(opts.contains(&MountOption::NoSuid));
             assert!(opts.contains(&MountOption::NoDev));
             assert!(!opts.contains(&MountOption::Suid));
@@ -1797,11 +1815,11 @@ mod tests {
     /// ACL implicitly, so the two are still opt-in together.
     #[test]
     fn access_widening_is_opt_in() {
-        let plain = session_config(1 << 20, false, false);
+        let plain = session_config(1 << 20, false, false, None, false);
         assert_eq!(plain.acl, SessionACL::Owner);
         assert!(!plain.mount_options.contains(&MountOption::AutoUnmount));
 
-        let wide = session_config(1 << 20, true, true);
+        let wide = session_config(1 << 20, true, true, None, false);
         assert_eq!(wide.acl, SessionACL::All);
         assert!(wide.mount_options.contains(&MountOption::AutoUnmount));
     }
@@ -1812,7 +1830,7 @@ mod tests {
     #[test]
     fn the_root_and_owner_acl_is_never_chosen() {
         for (allow_other, auto_unmount) in [(false, false), (true, false), (true, true)] {
-            let cfg = session_config(1 << 20, allow_other, auto_unmount);
+            let cfg = session_config(1 << 20, allow_other, auto_unmount, None, false);
             assert_ne!(cfg.acl, SessionACL::RootAndOwner);
         }
     }
@@ -1822,20 +1840,33 @@ mod tests {
     #[test]
     fn the_option_list_holds_no_duplicates() {
         for (allow_other, auto_unmount) in [(false, false), (true, false), (true, true)] {
-            let opts = session_config(1 << 20, allow_other, auto_unmount).mount_options;
+            let opts =
+                session_config(1 << 20, allow_other, auto_unmount, None, false).mount_options;
             let unique: std::collections::HashSet<_> = opts.iter().collect();
             assert_eq!(unique.len(), opts.len(), "{opts:?}");
         }
     }
 
-    /// One event loop and one shared descriptor, until somebody measures
-    /// otherwise on a guest with cores to spare. Each extra thread costs a
-    /// resident 16 MiB receive buffer.
+    /// One event loop and one shared descriptor unless somebody asks
+    /// otherwise. Each extra thread reserves a resident 16 MiB receive buffer
+    /// (`MAX_WRITE_SIZE + 4096`, one per thread, never shrunk to the negotiated
+    /// `max_write`), which on a 1962 MB guest is 3% per four threads.
     #[test]
     fn the_session_runs_one_event_loop_by_default() {
-        let cfg = session_config(1 << 20, false, false);
+        let cfg = session_config(1 << 20, false, false, None, false);
         assert_eq!(cfg.n_threads, None);
         assert!(!cfg.clone_fd);
+    }
+
+    /// And both travel through when asked. `clone_fd` is what gives each
+    /// worker its own `/dev/fuse` descriptor through `FUSE_DEV_IOC_CLONE`;
+    /// without it extra threads share one queue and one kernel-side read lock,
+    /// which is most of what makes them worth having.
+    #[test]
+    fn the_thread_settings_reach_the_session() {
+        let cfg = session_config(1 << 20, false, false, Some(4), true);
+        assert_eq!(cfg.n_threads, Some(4));
+        assert!(cfg.clone_fd);
     }
 
     /// fuser names bit 2 `FUSE_WRITE_KILL_PRIV`; the current kernel uapi calls

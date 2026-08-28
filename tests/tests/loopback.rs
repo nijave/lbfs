@@ -343,9 +343,12 @@ impl Loopback {
         // The same option list the binary builds, from the same negotiated
         // ceiling: `max_read` has to agree with what the multiplexer will
         // accept or the kernel issues reads that come back `EINVAL`.
-        let session =
-            fuser::spawn_mount(fs, &mnt, &session_config(limits.max_io_size, false, false))
-                .expect("the mount succeeds");
+        let session = fuser::spawn_mount(
+            fs,
+            &mnt,
+            &session_config(limits.max_io_size, false, false, None, false),
+        )
+        .expect("the mount succeeds");
 
         let mounted = Loopback {
             session: Some(session),

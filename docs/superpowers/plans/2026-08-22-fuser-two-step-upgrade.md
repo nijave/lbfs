@@ -2217,7 +2217,7 @@ git commit -m "feat(client): --entry-timeout, separate from the attribute timeou
 
 Off by default and expected to stay off. Section 8 of Design and Context has the argument: the session thread peaks at 15.6% of a core across the whole bottleneck campaign, the guest has two vCPUs with tokio workers already on one, and each extra thread reserves a resident 16 MiB receive buffer that never shrinks to the negotiated `max_write`. The knob exists so a four-vCPU guest earns a measurement without another code change, and Task 10 records what it does today.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/lbfs-client/src/fuse.rs`, replace `the_session_runs_one_event_loop_by_default` and add its companion:
 
@@ -2258,12 +2258,12 @@ In `crates/lbfs-client/src/main.rs`, add beside `attr_timeout_accepts_zero_and_f
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p lbfs-client --lib event_loop thread_settings`
 Expected: FAIL — `this function takes 3 arguments but 5 arguments were supplied`, and `cannot find function 'event_loop_threads'`.
 
-- [ ] **Step 3: Widen `session_config`**
+- [x] **Step 3: Widen `session_config`**
 
 Add two parameters and two assignments, and extend the doc comment:
 
@@ -2293,7 +2293,7 @@ with the two new lines beside the others:
     config
 ```
 
-- [ ] **Step 4: Add the flags and the check**
+- [x] **Step 4: Add the flags and the check**
 
 In `crates/lbfs-client/src/main.rs`, add to `Cli` after `no_writeback`:
 
@@ -2359,7 +2359,7 @@ and the call in `run()`, replacing the `session_config` line:
     );
 ```
 
-- [ ] **Step 5: Repair the loopback fixture**
+- [x] **Step 5: Repair the loopback fixture**
 
 One call site, at `tests/tests/loopback.rs:341`:
 
@@ -2372,12 +2372,12 @@ One call site, at `tests/tests/loopback.rs:341`:
         .expect("the mount succeeds");
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `cargo test -p lbfs-client --lib event_loop thread_settings one_event_loop`
 Expected: PASS, all three.
 
-- [ ] **Step 7: Document the flags**
+- [x] **Step 7: Document the flags**
 
 Add two rows to the client flag table in `README.md`:
 
@@ -2386,12 +2386,12 @@ Add two rows to the client flag table in `README.md`:
 | `--fuse-clone-fd` | off | Give each event-loop thread its own `/dev/fuse` descriptor (`FUSE_DEV_IOC_CLONE`, Linux 4.5+). Without it the threads share one queue. Means nothing without `--fuse-threads`. |
 ```
 
-- [ ] **Step 8: Run the whole gate**
+- [x] **Step 8: Run the whole gate**
 
 Run: `make check && make test-loopback`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs crates/lbfs-client/src/main.rs \
