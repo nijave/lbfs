@@ -31,6 +31,17 @@ container and leaves them in `target/guest/release`:
 make build-guest               # GUEST_IMAGE=docker.io/library/rust:1-trixie
 ```
 
+The `fuser` dependency pins an exact version rather than a range, and
+`cargo update` must not move it on its own. Releases after 0.18.0 come
+primarily from a coding agent under a review the maintainer describes as
+cursory, and the project no longer takes pull requests, so a patch nobody here
+has read could otherwise reach a guest binary through routine housekeeping. The
+practice for moving it: read the release diff first, land the crate bump and
+any ABI change as separate commits, and run `make test-loopback` either side of
+the move — the set-user-ID cases in it are what catch a release that stops
+forwarding a kill signal. The reasoning is in
+`docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
+
 ### Why a container and not a musl target
 
 A distro-packaged rustc has no musl std to build against, so a static musl
@@ -264,6 +275,9 @@ independently; until then the node id wins where it must.
 **Pre-epoch timestamps come back wrong.** fuser's `time_from_system_time`
 mangles a time before 1970 on its way to the kernel. Files dated before the
 epoch are rare and the client fixes nothing here.
+The 0.18.0 pin repairs the outbound half of this — replies now carry a
+fractional pre-1970 time intact — while the inbound half (`utimensat` through
+`system_time_from_time`) still waits on a later fuser release.
 
 **`fsync = "ignore"` is a durability trade, not an optimisation.** See the
 warning under the configuration reference. The server acknowledges syncs it

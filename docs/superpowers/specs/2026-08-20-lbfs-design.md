@@ -430,6 +430,20 @@ path, running `fusermount3` from the guests' `fuse3` package instead of
 linking `libfuse3.so`. The original static-musl plan died on one host
 fact that still holds: Fedora's packaged Rust ships no musl std.
 
+**The `fuser` pin is exact on purpose.** `Cargo.toml` reads
+`fuser = { version = "=0.18.0" }`, not a caret range. Releases after 0.18.0
+come primarily from a coding agent with, in the maintainer's own words, "at
+least a cursory review from a human", and the project stopped accepting pull
+requests in July 2026 — so the only routes for anything upstream does not
+choose to build are an issue and a fork. For a filesystem client a protocol
+bug is a data bug, so the practice is: pin the exact version, read the release
+diff before moving it (`src/ll/request.rs`, `src/ll/reply.rs` and the
+`add_capabilities` list, where every hazard found so far has lived), land the
+crate bump and any ABI-declaration change as separate commits, and run the
+set-user-ID loopback cases either side of the move. The sizing, the hazards and
+the pre-bump diff record live in
+`docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
+
 ## 10. Testing Strategy
 
 TDD throughout. Layers:

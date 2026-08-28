@@ -12,15 +12,14 @@
 
 **Assessment this plan executes:** `docs/notes/2026-08-22-fuser-upgrade-assessment.md`
 
-**Status:** Step one merged to `main` as PR #9 (`22b64e8`) — Tasks 1 through
-4, each its own commit, with `make check` and `make test-loopback` green
-before every one and `make vm-test` green on the live guest pair at the end.
-The client now pins `=0.16.0` with `abi-7-40`, links no FUSE library, and
-mounts by running `fusermount3`. Step two — Tasks 5 through 11, the `=0.18.0`
-pin and the three things it makes reachable — has not started. Section 9
-records what step one's execution found that the tasks below did not predict;
-read it before starting Task 5, because one of the two changes what Task 11
-has to amend.
+**Status:** Complete. Step one merged to `main` as PR #9 (`22b64e8`) — Tasks
+1 through 4. Step two — Tasks 5 through 11, the `=0.18.0` pin and the three
+things it makes reachable — ran on branch `deps/fuser-0.18`, with `make check`
+and `make test-loopback` green before every commit and `make vm-test` green on
+the live guest pair at the end, plus the Task 10 measurement recorded in
+`docs/benchmarks/2026-08-22-bottleneck-analysis.md`. Section 9 records what
+execution found that the tasks below did not predict, for both steps; read it
+before trusting any task's wording over the code.
 
 ## Global Constraints
 
@@ -2547,7 +2546,7 @@ git commit -m "docs(bench): the fuser upgrade moves nothing, and neither do extr
 
 An exact pin with no explanation beside it invites somebody to relax it. One short paragraph in each of the two documents an operator reads, both pointing at the assessment note for the argument.
 
-- [ ] **Step 1: Amend the spec**
+- [x] **Step 1: Amend the spec**
 
 Add to `docs/superpowers/specs/2026-08-20-lbfs-design.md` §9, after the deployment paragraph Task 4 rewrote:
 
@@ -2567,7 +2566,7 @@ the pre-bump diff record live in
 `docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
 ```
 
-- [ ] **Step 2: Amend the README**
+- [x] **Step 2: Amend the README**
 
 Add to `README.md` at the end of the Build section, before "Why a container and not a musl target":
 
@@ -2584,7 +2583,7 @@ forwarding a kill signal. The reasoning is in
 `docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
 ```
 
-- [ ] **Step 3: Update the pre-epoch limitation**
+- [x] **Step 3: Update the pre-epoch limitation**
 
 In `README.md`, find the known-limitations paragraph on pre-1970 timestamps
 (near line 211) and append one sentence:
@@ -2595,17 +2594,17 @@ fractional pre-1970 time intact — while the inbound half (`utimensat` through
 `system_time_from_time`) still waits on a later fuser release.
 ```
 
-- [ ] **Step 4: Check the prose gate**
+- [x] **Step 4: Check the prose gate**
 
 Run: `vale --output=line README.md docs/superpowers/specs/2026-08-20-lbfs-design.md`
 Expected: no output.
 
-- [ ] **Step 5: Run the whole gate one last time**
+- [x] **Step 5: Run the whole gate one last time**
 
 Run: `make check && make test-loopback && make vm-test`
 Expected: PASS throughout.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add README.md docs/superpowers/specs/2026-08-20-lbfs-design.md
