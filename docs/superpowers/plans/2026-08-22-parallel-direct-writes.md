@@ -2,17 +2,36 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to execute this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Not started — no task below has run. The plan first targeted fuser
+0.15.1; a 2026-08-27 revision retargeted it at fuser 0.18.0 (ABI 7.40), which
+reached `main` through the two-step upgrade plan. Three things to know before
+executing:
+
+- fuser 0.18.0 names `FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES` and can
+  negotiate `FUSE_DIRECT_IO_ALLOW_MMAP`, so the plan no longer declares a
+  constant by hand and the `mmap(MAP_SHARED)` cost turned from a hard limit
+  into a deliberate choice. §2, §3, Task 2, and the Open Risks carry the
+  details.
+- The kill-priv plan and the fuser upgrade both landed after the benchmark
+  tables below got their numbers. The absolute "today" figures run stale —
+  single-thread 4 KiB random write now costs ~166 µs, not 300 µs — while the
+  lock signature they show still stands. Task 6 takes its own same-day control
+  pass, and the acceptance bars read against that pass as multipliers.
+- Line numbers into `crates/lbfs-client/src/fuse.rs` predate the 0.18
+  migration; search by name. Kernel `fs/fuse/*` citations name Linux v7.0 and
+  still hold.
+
 **Goal:** Let two threads write one file at the same time, by answering an application's `O_DIRECT` open with `FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES` so the client kernel takes `i_rwsem` shared instead of exclusive across each write round trip.
 
 **Architecture:** One function in the client bridge grows an argument. `open_flags()` reads the application's own open flags — which fuser hands to both the `open` and the `create` callback — and returns the cached reply for an ordinary open and the direct reply for an `O_DIRECT` one. Nothing crosses the wire, nothing changes on the server, and the protocol version stays where the previous plan left it.
 
-**Tech Stack:** Rust (edition 2021), tokio 1, fuser 0.15.1 (`abi-7-31`), io-uring 0.7, rustix 1, postcard 1.1 + serde/serde_bytes, libc, tracing, tempfile; Linux 7.0 guests under libvirt; fio 3.41 for the acceptance run.
+**Tech Stack:** Rust (edition 2021), tokio 1, fuser 0.18.0 (ABI 7.40, exact-pinned), io-uring 0.7, rustix 1, postcard 1.1 + serde/serde_bytes, libc, tracing, tempfile; Linux 7.0 guests under libvirt; fio 3.41 for the acceptance run.
 
 **Spec:** `docs/superpowers/specs/2026-08-20-lbfs-design.md`
 
 ## Global Constraints
 
-- **This plan assumes `docs/superpowers/plans/2026-08-22-per-write-getattr-elimination.md` landed first.** The working protocol version is `2`, `WriteRequest` carries `kill_suidgid`, the client asks for `FUSE_HANDLE_KILLPRIV_V2` at bit 28, and `crates/lbfs-server/src/fs/local/killpriv.rs` holds `KillPrivPolicy`. Every line number and every code block below describes that end state.
+- **`docs/superpowers/plans/2026-08-22-per-write-getattr-elimination.md` landed first (`356f68e..1fe14cc`), as this plan requires.** The working protocol version is `2`, `WriteRequest` carries `kill_suidgid`, the client asks for `FUSE_HANDLE_KILLPRIV_V2`, and `crates/lbfs-server/src/fs/local/killpriv.rs` holds `KillPrivPolicy`. Every code block below describes that end state on fuser 0.18.0.
 - Frame header: exactly 24 bytes, little-endian, layout per spec §3.1.
 - Protocol magic `LBFS`, version `2`, exact match on both ends. **No task here touches the version.** This change adds no wire field and no opcode.
 - Defaults: port `9423`, window `128` (clamp 8..=1024), max body `64 KiB`.
@@ -29,7 +48,7 @@
 
 ## Design and Context
 
-Read this whole section before Task 1. It answers four questions from Linux **v7.0** sources — the version both guests run — and from the vendored fuser 0.15.1 at `/home/nick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fuser-0.15.1/`. Every `fs/fuse/*` line number below cites v7.0 and nothing else.
+Read this whole section before Task 1. It answers four questions from Linux **v7.0** sources — the version both guests run — and from the vendored fuser 0.18.0 at `/home/nick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fuser-0.18.0/`. Every `fs/fuse/*` line number below cites v7.0 and nothing else.
 
 ### The measurement this plan answers
 
@@ -86,7 +105,7 @@ Four writers on one file deliver 0.98 × one writer at 4 × the latency — the 
 
 ### 2. Where the decision lives: the client, alone
 
-The client already holds everything the decision needs. fuser hands the application's flags to both callbacks — `fn open(&mut self, _req, ino: u64, flags: i32, reply: ReplyOpen)` at `fuse.rs:796` and `fn create(..., flags: i32, reply: ReplyCreate)` at `fuse.rs:807-816` — and `O_DIRECT` survives the trip. The kernel masks `fuse_open_in.flags` down to `open_flags & ~(O_CREAT | O_EXCL | O_NOCTTY)` and then drops `O_TRUNC` because lbfs withholds `FUSE_ATOMIC_O_TRUNC` (`file.c:34-36`); `fuse_create_open` masks `flags & ~O_NOCTTY` (`dir.c:844-847`). Neither touches `O_DIRECT`.
+The client already holds everything the decision needs. fuser hands the application's flags to both callbacks — `fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen)` and `fn create(..., flags: i32, reply: ReplyCreate)` in `fuse.rs` — and `O_DIRECT` survives the trip. The asymmetry is fuser 0.18's, not lbfs's: `open` gets the `OpenFlags` newtype, a transparent wrapper over the same `i32` with a public field (`src/open_flags.rs:21`), while `create` still gets the bare integer. The kernel masks `fuse_open_in.flags` down to `open_flags & ~(O_CREAT | O_EXCL | O_NOCTTY)` and then drops `O_TRUNC` because lbfs withholds `FUSE_ATOMIC_O_TRUNC` (`file.c:34-36`); `fuse_create_open` masks `flags & ~O_NOCTTY` (`dir.c:844-847`). Neither touches `O_DIRECT`.
 
 **Create needs the same treatment as open, for a mechanical reason.** `fuse_create_open` stores the reply's flags on the new handle at `dir.c:887` and then runs the identical `fuse_finish_open` path at `dir.c:905`. A `create` that answered with the cached reply would leave every freshly created file on the serialised path until something closed and reopened it — which is precisely the fio and database shape this plan exists for.
 
@@ -96,9 +115,9 @@ The client already holds everything the decision needs. fuser hands the applicat
 - The server already receives the information and throws it away on purpose. `OpenRequest.flags` and `CreateRequest.flags` carry the application's flags verbatim, and `LocalFs::mask_open_flags` (`crates/lbfs-server/src/fs/local/mod.rs:490-511`) drops `O_DIRECT` from its own descriptor because the buffer pool offers no alignment guarantee. Round-tripping a decision the client can make locally would add a field, a protocol version 3, and a lock-step deploy for zero new facts.
 - The client's "direct" and the server's "direct" are different words. `FOPEN_DIRECT_IO` means "do not use the client's page cache for this handle" and carries no alignment demand — `fs/fuse/file.c` contains no alignment check anywhere. `O_DIRECT` on the server's descriptor would mean aligned block I/O against the export, which v1 declines. Stripping one and setting the other is coherent, not contradictory, and Task 1 writes that sentence into the spec so nobody reads it as a bug.
 
-**fuser 0.15.1 passes the bits through untouched, and no negotiation applies.** `ReplyOpen::opened(self, fh: u64, flags: u32)` (`src/reply.rs:273-276`) forwards `flags` to `ll::Response::new_open`, which drops it straight into `fuse_open_out.open_flags` (`src/ll/reply.rs:122-129`). `ReplyCreate::created(...)` does the same through `ll::Response::new_create` (`src/reply.rs:371-379`, `src/ll/reply.rs:185-209`). No mask, no allowlist, no `Result` — `fuse_open_out` is a plain `#[repr(C)]` struct with a `u32` field (`src/ll/fuse_abi.rs:715-721`). Because these are per-open reply flags rather than `INIT` capabilities, `KernelConfig::add_capabilities` never sees them and nothing can refuse them at mount time.
+**fuser 0.18.0 passes the bits through untouched, and no negotiation applies.** `ReplyOpen::opened(self, fh: ll::FileHandle, flags: FopenFlags)` (`src/reply.rs:361`) forwards `flags` into `fuse_open_out.open_flags`, and `ReplyCreate::created(...)` (`src/reply.rs:502-519`) does the same. The one check either makes is an assertion refusing `FOPEN_PASSTHROUGH`, a bit this plan never sets. Because these are per-open reply flags rather than `INIT` capabilities, `KernelConfig::add_capabilities` never sees them and nothing can refuse them at mount time.
 
-**fuser lacks a name for bit 6, so lbfs declares one.** `fuser::consts` carries `FOPEN_DIRECT_IO` (1<<0), `FOPEN_KEEP_CACHE` (1<<1), `FOPEN_NONSEEKABLE` (1<<2), `FOPEN_CACHE_DIR` (1<<3), `FOPEN_STREAM` (1<<4), then jumps to `FOPEN_PURGE_ATTR` (1<<30) and `FOPEN_PURGE_UBC` (1<<31) — `src/ll/fuse_abi.rs:170-182`. Bit 6 is absent. The value comes from `include/uapi/linux/fuse.h:393`:
+**fuser 0.18.0 names bit 6, so no local constant exists.** `FopenFlags` carries `FOPEN_PARALLEL_DIRECT_WRITES = 1 << 6` (`src/ll/flags/fopen_flags.rs:22`), matching the kernel's `include/uapi/linux/fuse.h:393`:
 
 ```c
 #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
@@ -114,7 +133,7 @@ The client already holds everything the decision needs. fuser hands the applicat
 
 **What lbfs promises:** on one inode a direct descriptor and a cached descriptor stay coherent at page granularity, and neither reads bytes the other already wrote. The pair gives up speed instead: while any cached descriptor stays open, direct writes serialise exactly as they do today. Task 5 pins the coherence half with a loopback test.
 
-**mmap on a direct descriptor — out of scope, and forced.** `fuse_file_mmap` refuses `MAP_SHARED` on an `FOPEN_DIRECT_IO` file with `-ENODEV` unless the connection negotiated `FUSE_DIRECT_IO_ALLOW_MMAP` (`file.c:2393-2399`). `MAP_PRIVATE` still works through `generic_file_mmap` (`file.c:2403-2405`). That capability is `(1ULL << 36)` (`uapi/linux/fuse.h:489`), and fuser 0.15.1 cannot reach it: `fuse_init_in` has only `flags: u32` (`src/ll/fuse_abi.rs:863-868`), `fuse_init_out` has no `flags2` (`:872-894`), and fuser never sets `FUSE_INIT_EXT`. This is not a preference the plan expresses — no code in this repository can turn that bit on without a fuser fork. The user-visible change: an application that opens a file `O_DIRECT` and then `mmap`s that same descriptor `MAP_SHARED` gets `ENODEV` where it used to get a mapping. Task 1 records it in the spec, Task 6 observes it on the VM pair, and §11 carries the follow-up.
+**mmap on a direct descriptor — out of scope, by choice.** `fuse_file_mmap` refuses `MAP_SHARED` on an `FOPEN_DIRECT_IO` file with `-ENODEV` unless the connection negotiated `FUSE_DIRECT_IO_ALLOW_MMAP` (`file.c:2393-2399`). `MAP_PRIVATE` still works through `generic_file_mmap` (`file.c:2403-2405`). That capability is `(1ULL << 36)` (`uapi/linux/fuse.h:489`), and fuser 0.18.0 can reach it: `InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP` exists (`src/ll/flags/init_flags.rs:82`), and fuser negotiates `FUSE_INIT_EXT` with the `flags2` split itself (`src/ll/request.rs:999-1014`). The earlier revision of this plan called the bit unreachable inside fuser 0.15.1, whose `fuse_init_in` stopped at one `u32`; on 0.18 the mechanism is one more `Capability` entry in `capabilities()`. This plan still declines it, because a shared mapping beside parallel direct writes raises coherence questions v1 has no answer for. The user-visible change: an application that opens a file `O_DIRECT` and then `mmap`s that same descriptor `MAP_SHARED` gets `ENODEV` where it used to get a mapping. Task 1 records it in the spec, Task 6 observes it on the VM pair, and §11 carries the follow-up.
 
 **`O_APPEND` with `O_DIRECT` — nothing changes, and here is why both mount shapes still hold.** `mask_open_flags` already treats append as a two-case problem (`crates/lbfs-server/src/fs/local/mod.rs:472-489`): with the writeback cache on it clears `O_APPEND` from the server's descriptor, because the client computes offsets and a flushed page must not append twice; with the cache off it keeps `O_APPEND`, because server-side append is what makes the operation atomic against a stale client `i_size`. Both survive:
 
@@ -166,9 +185,17 @@ Four probes, all on the two-guest pair (server `192.168.77.10`, client `192.168.
 | D | randwrite 4k psync QD1, `direct=0` | not yet measured | far above the direct figure; the page cache absorbs it, and this proves buffered opens kept the cached reply |
 | D | second buffered `dd` read of a warm file | not yet measured | gigabytes per second, proving `FOPEN_KEEP_CACHE` survived |
 
-Where probe B's expectation comes from: randread at QD16 reaches 40290 IOPS against a 119 µs QD1 latency, so the depth-16 machinery multiplies the single-operation rate by about 4.8. A 4 KiB write costs roughly 205 µs at QD1 once the previous plan lands, which puts the same multiplier near 23000. Below 15000 means something else still serialises; the bpftrace check in Task 6 Step 4 says what.
+Where probe B's expectation comes from: randread at QD16 reaches 40290 IOPS against a 119 µs QD1 latency, so the depth-16 machinery multiplies the single-operation rate by about 4.8. A 4 KiB write costs roughly 166 µs at QD1 on the merged tree — the kill-priv plan's measured result — which puts the same multiplier near 29000. Below three times the same-day QD16 control means something else still serialises; the bpftrace check in Task 6 Step 4 says what.
 
 The reference points either side: kernel NFS `async` reaches 30390 IOPS on this shape and lbfs's raw RPC layer serves 48766 reads at the same depth, so 20000-25000 would put the mount inside the range the transport can support rather than at a lock's mercy.
+
+**(2026-08-27)** Every absolute number in the table above predates the
+kill-priv change and the fuser 0.18 upgrade — single-thread 4 KiB random write
+now runs near 6000 IOPS, not 3325 — so the "today" column is shape evidence,
+not a prediction. Task 6 Step 2 measures every row fresh on the control build,
+and the two acceptance bars read as multipliers against that same-day pass:
+probe A above 2 × its own four-thread one-file control, probe B above 3 × its
+own QD16 control.
 
 ---
 
@@ -177,7 +204,7 @@ The reference points either side: kernel NFS `async` reaches 30390 IOPS on this 
 | Path | Change |
 |---|---|
 | `docs/superpowers/specs/2026-08-20-lbfs-design.md` | §6 clarifies client-side versus server-side "direct"; §7 gains the per-open direct-I/O bullet; §11 gains two follow-ups |
-| `crates/lbfs-client/src/fuse.rs` | `FOPEN_PARALLEL_DIRECT_WRITES` constant, `open_flags(app_flags: i32)`, both call sites, four unit tests |
+| `crates/lbfs-client/src/fuse.rs` | `open_flags(app_flags: OpenFlags)`, both call sites, three unit tests |
 | `tests/tests/loopback.rs` | six new cases: concurrent direct writers, append with direct, mixed cached and direct |
 | `docs/benchmarks/2026-08-22-bottleneck-analysis.md` | records the measured result |
 
@@ -258,10 +285,11 @@ they did before this behaviour existed.
 
   **What it costs.** `mmap(MAP_SHARED)` on a descriptor the application opened
 `O_DIRECT` now fails `ENODEV`. The kernel allows that combination only under
-`FUSE_DIRECT_IO_ALLOW_MMAP`, which is bit 36 of the `INIT` flags and out of
-reach of fuser 0.15.1, whose `fuse_init_in` carries a single `u32`.
-`MAP_PRIVATE` on such a descriptor still works, and `mmap` on an ordinary open
-is untouched. §11 carries the follow-up.
+`FUSE_DIRECT_IO_ALLOW_MMAP`, an `INIT` capability this mount chooses not to
+negotiate — a shared mapping beside parallel direct writes raises coherence
+questions v1 leaves unanswered. `MAP_PRIVATE` on such a descriptor still
+works, and `mmap` on an ordinary open keeps its behaviour. §11 carries the
+follow-up.
 ```
 
 - [ ] **Step 3: Add the two follow-ups to §11**
@@ -270,9 +298,11 @@ At the end of the "Future work" list in §11, add:
 
 ```text
 - **`FUSE_DIRECT_IO_ALLOW_MMAP`.** Would restore `mmap(MAP_SHARED)` on an
-  `O_DIRECT` descriptor (§7). The bit is `1ULL << 36`, so reaching it means
-  `FUSE_INIT_EXT` and a `flags2` field, and fuser 0.15.1 has neither — this
-  needs a fuser upgrade or a fork, not a line of lbfs.
+  `O_DIRECT` descriptor (§7). fuser 0.18 reaches the bit — `FUSE_INIT_EXT`
+  and `flags2` both ship — so the mechanism is one more `Capability` entry
+  in `capabilities()`. Take it only after answering what a shared mapping
+  means for coherence beside parallel direct writes; the kernel gate exists
+  because that combination is subtle, not because the bit was hard to set.
 - **A server-decided `OPEN` reply.** `OpenReply` carries only `fh` today, and
   the client picks its own FUSE reply flags (§7). A server that wanted to force
   or veto direct I/O per file — a policy engine, or a backend that knows a file
@@ -298,13 +328,11 @@ git commit -m "docs(spec): per-open direct I/O for O_DIRECT opens"
 ### Task 2: Client — decide the reply flags from the application's open flags
 
 **Files:**
-- Edit: `crates/lbfs-client/src/fuse.rs` (the `fuser::consts` import at line 52, a new constant above `fn open_flags`, `fn open_flags` at line 403, `fn open` at line 796, `fn create` at line 807, the `mod tests` block near line 1575)
+- Edit: `crates/lbfs-client/src/fuse.rs` (`fn open_flags`, the `open` and `create` callbacks, and the `mod tests` block — search by name)
 
 **Interfaces:**
-- Consumes: nothing from the previous plan beyond its end state — the import block it left at lines 52-55, and `fn open_flags()` unchanged in place.
-- Produces: `const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;` and `fn open_flags(app_flags: i32) -> u32` in `crates/lbfs-client/src/fuse.rs`. Both `open` and `create` call it with the `flags: i32` fuser handed them.
-
-Line numbers above describe the tree after the per-write-getattr-elimination plan landed; that plan inserts a constant before `capabilities()` and a helper after `open_flags()`, so search by name rather than trusting the number.
+- Consumes: fuser 0.18's names — `FopenFlags` with its `FOPEN_PARALLEL_DIRECT_WRITES` variant and the `OpenFlags` newtype, both already in the file's import block, and in scope for the tests through `use super::*`.
+- Produces: `fn open_flags(app_flags: OpenFlags) -> FopenFlags`. Both `open` and `create` call it with the flags fuser handed them; `create` wraps its bare `i32` in `OpenFlags` at the call site.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -320,7 +348,7 @@ Add to the `mod tests` block at the bottom of `crates/lbfs-client/src/fuse.rs`, 
     /// `O_DIRECT` write serialises today.
     #[test]
     fn only_an_o_direct_open_gets_the_direct_io_reply() {
-        const DIRECT: u32 = FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES;
+        let direct = FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES;
 
         for plain in [
             libc::O_RDONLY,
@@ -330,22 +358,23 @@ Add to the `mod tests` block at the bottom of `crates/lbfs-client/src/fuse.rs`, 
             libc::O_WRONLY | libc::O_SYNC,
             libc::O_RDONLY | libc::O_NONBLOCK,
         ] {
-            assert_eq!(open_flags(plain), FOPEN_KEEP_CACHE, "flags {plain:#o}");
-            assert_eq!(open_flags(plain) & DIRECT, 0, "flags {plain:#o}");
+            let reply = open_flags(OpenFlags(plain));
+            assert_eq!(reply, FopenFlags::FOPEN_KEEP_CACHE, "flags {plain:#o}");
+            assert!(!reply.intersects(direct), "flags {plain:#o}");
         }
 
         // `O_APPEND | O_DIRECT` belongs in the direct set even though every
         // append takes the exclusive lock anyway (`file.c:1412-1413`): the
         // reply describes the handle, and the kernel decides per write.
-        for direct in [
+        for flags in [
             libc::O_RDONLY | libc::O_DIRECT,
             libc::O_WRONLY | libc::O_DIRECT,
             libc::O_RDWR | libc::O_DIRECT,
             libc::O_RDWR | libc::O_DIRECT | libc::O_APPEND,
             libc::O_WRONLY | libc::O_DIRECT | libc::O_SYNC,
         ] {
-            let want = FOPEN_KEEP_CACHE | DIRECT;
-            assert_eq!(open_flags(direct), want, "flags {direct:#o}");
+            let want = FopenFlags::FOPEN_KEEP_CACHE | direct;
+            assert_eq!(open_flags(OpenFlags(flags)), want, "flags {flags:#o}");
         }
     }
 
@@ -362,34 +391,19 @@ Add to the `mod tests` block at the bottom of `crates/lbfs-client/src/fuse.rs`, 
             libc::O_RDWR | libc::O_APPEND,
             libc::O_RDWR | libc::O_DIRECT | libc::O_SYNC,
         ] {
-            let reply = open_flags(flags);
-            if reply & FOPEN_PARALLEL_DIRECT_WRITES != 0 {
-                assert_eq!(reply & FOPEN_DIRECT_IO, FOPEN_DIRECT_IO, "{flags:#o}");
+            let reply = open_flags(OpenFlags(flags));
+            if reply.contains(FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES) {
+                assert!(reply.contains(FopenFlags::FOPEN_DIRECT_IO), "{flags:#o}");
             }
         }
     }
-
-    /// Bit 6, per `include/uapi/linux/fuse.h:393`. fuser 0.15.1 names bits 0-4
-    /// and then jumps to 30 and 31 (`src/ll/fuse_abi.rs:170-182`), so this
-    /// constant is local and this test is the only thing pinning it. The
-    /// collision checks matter because a wrong value would land on a flag with
-    /// entirely different meaning and nothing would report an error.
-    #[test]
-    fn the_parallel_write_bit_is_bit_six() {
-        assert_eq!(FOPEN_PARALLEL_DIRECT_WRITES, 1 << 6);
-        assert_eq!(FOPEN_DIRECT_IO, 1 << 0);
-        assert_eq!(FOPEN_KEEP_CACHE, 1 << 1);
-        for named in [
-            FOPEN_DIRECT_IO,
-            FOPEN_KEEP_CACHE,
-            fuser::consts::FOPEN_NONSEEKABLE,
-            fuser::consts::FOPEN_CACHE_DIR,
-            fuser::consts::FOPEN_STREAM,
-        ] {
-            assert_eq!(FOPEN_PARALLEL_DIRECT_WRITES & named, 0);
-        }
-    }
 ```
+
+An earlier revision of this plan added a third test pinning a hand-declared
+bit-6 constant against collisions with fuser's named flags. fuser 0.18 names
+`FOPEN_PARALLEL_DIRECT_WRITES` itself (`src/ll/flags/fopen_flags.rs:22`), so
+the constant and its pin test no longer exist — the exact-pinned dependency
+owns that value now.
 
 Then replace the existing `opens_keep_the_page_cache` test in the same block:
 
@@ -405,7 +419,7 @@ Then replace the existing `opens_keep_the_page_cache` test in the same block:
     #[test]
     fn opens_keep_the_page_cache() {
         for flags in [libc::O_RDONLY, libc::O_RDWR | libc::O_DIRECT] {
-            assert_eq!(open_flags(flags) & FOPEN_KEEP_CACHE, FOPEN_KEEP_CACHE);
+            assert!(open_flags(OpenFlags(flags)).contains(FopenFlags::FOPEN_KEEP_CACHE));
         }
     }
 ```
@@ -413,42 +427,9 @@ Then replace the existing `opens_keep_the_page_cache` test in the same block:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p lbfs-client --lib open_flags direct_io parallel_write`
-Expected: FAIL to compile — `cannot find value 'FOPEN_PARALLEL_DIRECT_WRITES' in this scope`, `cannot find value 'FOPEN_DIRECT_IO' in this scope`, and `this function takes 0 arguments but 1 argument was supplied` on every `open_flags(...)` call.
+Expected: FAIL to compile — `this function takes 0 arguments but 1 argument was supplied` on every `open_flags(...)` call. The flag names themselves resolve, because fuser 0.18 supplies them.
 
-- [ ] **Step 3: Widen the `fuser::consts` import**
-
-In `crates/lbfs-client/src/fuse.rs`, replace the import block at lines 52-55 — which the previous plan left carrying `FUSE_WRITE_KILL_PRIV` — with:
-
-```rust
-use fuser::consts::{
-    FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FUSE_ASYNC_DIO, FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO,
-    FUSE_WRITE_KILL_PRIV, FUSE_WRITEBACK_CACHE,
-};
-```
-
-- [ ] **Step 4: Declare the constant fuser does not name**
-
-In `crates/lbfs-client/src/fuse.rs`, add immediately above `fn open_flags(`:
-
-```rust
-/// `FOPEN_PARALLEL_DIRECT_WRITES`, which fuser 0.15.1 does not name.
-///
-/// fuser's `consts` carries bits 0-4 and then jumps to 30 and 31
-/// (`src/ll/fuse_abi.rs:170-182`); bit 6 is missing. Nothing negotiates this
-/// one — it rides `fuse_open_out.open_flags`, and fuser copies that word out
-/// of its `flags` argument with no mask (`src/reply.rs:273` →
-/// `src/ll/reply.rs:122-129` for `OPEN`, `src/reply.rs:371` →
-/// `src/ll/reply.rs:185-209` for `CREATE`) — so a local constant is the whole
-/// mechanism.
-///
-/// Value from `include/uapi/linux/fuse.h:393`. The flag arrived with ABI 7.36
-/// in Linux 6.2; both guests run 7.0. A kernel older than 6.2 stores the bit
-/// and never tests it (`fs/fuse/file.c:161`), which costs today's serialised
-/// behaviour rather than an error, so nothing here needs a version check.
-const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
-```
-
-- [ ] **Step 5: Give `open_flags` the application's flags**
+- [ ] **Step 3: Give `open_flags` the application's flags**
 
 In `crates/lbfs-client/src/fuse.rs`, replace `fn open_flags()` and its doc comment:
 
@@ -489,25 +470,26 @@ In `crates/lbfs-client/src/fuse.rs`, replace `fn open_flags()` and its doc comme
 /// descriptor, which is a different question — the FUSE flag means "keep this
 /// handle out of the client's page cache" and demands no alignment from
 /// anybody. Spec §6 and §7 say it at length.
-fn open_flags(app_flags: i32) -> u32 {
-    let mut flags = FOPEN_KEEP_CACHE;
-    if app_flags & libc::O_DIRECT != 0 {
-        flags |= FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES;
+fn open_flags(app_flags: OpenFlags) -> FopenFlags {
+    let mut flags = FopenFlags::FOPEN_KEEP_CACHE;
+    if app_flags.0 & libc::O_DIRECT != 0 {
+        flags |= FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES;
     }
     flags
 }
 ```
 
-- [ ] **Step 6: Hand the decision to both call sites**
+- [ ] **Step 4: Hand the decision to both call sites**
 
 In `crates/lbfs-client/src/fuse.rs`, replace the `open` callback:
 
 ```rust
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
-            match conn.open(ino, flags as u32).await {
-                Ok(fh) => reply.opened(fh, open_flags(flags)),
+            match conn.open(ino, flags.0 as u32).await {
+                Ok(fh) => reply.opened(FileHandle(fh), open_flags(flags)),
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -520,25 +502,25 @@ and the `created` arm of the `create` callback:
                 Ok((e, fh)) => reply.created(
                     &ttl,
                     &to_fuse_attr(e.node, &e.attr),
-                    e.generation,
-                    fh,
-                    open_flags(flags),
+                    Generation(e.generation),
+                    FileHandle(fh),
+                    open_flags(OpenFlags(flags)),
                 ),
 ```
 
-`create` needs this as much as `open` does: `fuse_create_open` stores the reply's flags on the new handle (`fs/fuse/dir.c:887`) and runs the same `fuse_finish_open` path (`dir.c:905`), so a `create` answering with the cached reply would leave every freshly made file on the serialised path until something closed and reopened it. Note that `flags: i32` is the only value in either callback that `open_flags` accepts — `mode` and `umask` are `u32` — so a call site that forgets to pass it does not compile.
+`create` needs this as much as `open` does: `fuse_create_open` stores the reply's flags on the new handle (`fs/fuse/dir.c:887`) and runs the same `fuse_finish_open` path (`dir.c:905`), so a `create` answering with the cached reply would leave every freshly made file on the serialised path until something closed and reopened it. In `open` the compiler enforces the plumbing — `flags` is the only `OpenFlags` in the callback. In `create` fuser hands a bare `i32`, and the `OpenFlags(flags)` wrap is the one place this plan constructs the newtype; `mode` and `umask` are `u32`, so handing the wrong integer still fails to compile.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p lbfs-client --lib open_flags direct_io parallel_write page_cache`
-Expected: PASS — `only_an_o_direct_open_gets_the_direct_io_reply`, `the_parallel_write_bit_never_travels_alone`, `the_parallel_write_bit_is_bit_six`, `opens_keep_the_page_cache`.
+Expected: PASS — `only_an_o_direct_open_gets_the_direct_io_reply`, `the_parallel_write_bit_never_travels_alone`, `opens_keep_the_page_cache`.
 
-- [ ] **Step 8: Run the whole gate**
+- [ ] **Step 6: Run the whole gate**
 
 Run: `make check`
-Expected: PASS. `open_flags` has exactly two callers and both moved in Step 6, so nothing else in the workspace mentions it.
+Expected: PASS. `open_flags` has exactly two callers and both moved in Step 4, so nothing else in the workspace mentions it.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs
@@ -1056,7 +1038,7 @@ dd if=/mnt/lbfs/seq.dat of=/dev/null bs=1M count=256
 dd if=/mnt/lbfs/seq.dat of=/dev/null bs=1M count=256
 ```
 
-Record every number. Expected on the control build: the figures in the plan's "today" column, within the usual spread.
+Record every number. This control pass is the baseline every acceptance bar reads against — the "today" figures earlier in the plan predate the kill-priv change and the fuser 0.18 upgrade, so expect the write shapes to come in well above them (single-thread randwrite near 6000 IOPS rather than 3325) and treat any resemblance as coincidence, not confirmation.
 
 - [ ] **Step 3: Deploy the change and run the same pass**
 
@@ -1064,20 +1046,20 @@ Record every number. Expected on the control build: the figures in the plan's "t
 make build-guest && make vm-deploy
 ```
 
-Then repeat Step 2's jobs, drain and all. Expected:
+Then repeat Step 2's jobs, drain and all. Expected, with "control" meaning Step 2's same-day figure for the same shape:
 
-| probe | job | control | with the change |
-|---|---|---|---|
-| A | randwrite 4k psync QD1, 4 threads, 1 file | ~3275 IOPS, ~1220 µs | **above 6600 IOPS**; 7000-8800 if it reaches the four-file control |
-| A | randwrite 4k psync QD1, 1 thread, 1 file | ~3325 IOPS, ~300 µs | unchanged within spread |
-| A | randwrite 4k psync QD1, 4 threads, 4 files | ~8840 IOPS, ~451 µs | unchanged within spread |
-| B | randwrite 4k libaio QD16 | ~4963 IOPS, ~3023 µs | **above 15000 IOPS**; 20000-25000 if writes track reads |
-| C | randread 4k psync QD1 | ~8322 IOPS, ~119 µs | unchanged within spread |
-| C | randread 4k libaio QD16 | ~40290 IOPS, ~393 µs | unchanged within spread |
-| C | seq read 1M psync | ~1580 MB/s | unchanged within spread |
-| C | seq write 1M psync | ~361 MB/s | unchanged within spread |
-| D | randwrite 4k psync QD1, `direct=0` | whatever it measures | unchanged within spread |
-| D | second `dd` read of a warm file | gigabytes per second | unchanged — `FOPEN_KEEP_CACHE` survived |
+| probe | job | with the change |
+|---|---|---|
+| A | randwrite 4k psync QD1, 4 threads, 1 file | **above 2 × its control**; near the four-file control if the lock was the whole story |
+| A | randwrite 4k psync QD1, 1 thread, 1 file | unchanged within spread |
+| A | randwrite 4k psync QD1, 4 threads, 4 files | unchanged within spread |
+| B | randwrite 4k libaio QD16 | **above 3 × its control**; near 29000 IOPS if writes track reads |
+| C | randread 4k psync QD1 | unchanged within spread |
+| C | randread 4k libaio QD16 | unchanged within spread |
+| C | seq read 1M psync | unchanged within spread |
+| C | seq write 1M psync | unchanged within spread |
+| D | randwrite 4k psync QD1, `direct=0` | unchanged within spread |
+| D | second `dd` read of a warm file | unchanged — gigabytes per second, `FOPEN_KEEP_CACHE` survived |
 
 The two bold rows are the acceptance bars. Everything else is a no-regression check.
 
@@ -1152,10 +1134,10 @@ the exclusive lock, by the kernel's choice.
 [table from Step 3]
 
 `mmap(MAP_SHARED)` on an `O_DIRECT` descriptor now returns ENODEV, which is
-also how this run confirmed the kernel took the flag; `FUSE_DIRECT_IO_ALLOW_MMAP`
-is bit 36 and out of reach of fuser 0.15.1. Buffered opens are untouched: they
-still get `FOPEN_KEEP_CACHE` alone and the writeback cache still aggregates
-them.
+also how this run confirmed the kernel took the flag; the mount declines to
+negotiate `FUSE_DIRECT_IO_ALLOW_MMAP` on purpose, and spec §11 carries the
+follow-up. Buffered opens keep today's behaviour: `FOPEN_KEEP_CACHE` alone,
+with the writeback cache still aggregating them.
 ```
 
 Then correct the closing paragraph of "The exclusive inode lock" section — the sentence reading "Only separate files scale" — so it points at this new section instead of leaving a conclusion standing that is no longer true.
@@ -1174,8 +1156,8 @@ git commit -m "docs(bench): per-inode write serialisation lifted for O_DIRECT op
 1. `make check` passes: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 2. `make test-loopback` passes, including all six new cases across both mount shapes.
 3. `make vm-test` passes, including the fio crc32c verify job.
-4. Through the VM mount, 4 KiB random write psync QD1 with four threads on **one** file exceeds 6600 IOPS, against 3275 on the control build — more than twice, where today's figure is 0.98 × the single-thread rate.
-5. 4 KiB random write libaio QD16 exceeds 15000 IOPS, against 4963 on the control build.
+4. Through the VM mount, 4 KiB random write psync QD1 with four threads on **one** file exceeds twice the control build's same-day figure for the same shape — the shape whose four-thread rate measured 0.98 × its single-thread rate when the lock had it.
+5. 4 KiB random write libaio QD16 exceeds three times the control build's same-day figure.
 6. Single-thread randwrite psync QD1, four-thread four-file randwrite, randread psync QD1, randread libaio QD16, sequential 1 MiB read and sequential 1 MiB write all land inside their run-to-run spread.
 7. Buffered jobs hold their ground: `direct=0` randwrite matches the control build, and a second `dd` read of a warm file still comes out of the page cache at gigabytes per second.
 8. `mmap(MAP_SHARED)` succeeds on an ordinary descriptor and returns `ENODEV` on an `O_DIRECT` one — the observation that proves the kernel took `FOPEN_DIRECT_IO`.
@@ -1184,8 +1166,8 @@ git commit -m "docs(bench): per-inode write serialisation lifted for O_DIRECT op
 ## Open Risks
 
 - **The kernel may keep taking the exclusive lock for a reason the plan did not foresee.** `fuse_dio_wr_exclusive_lock` has four branches and probe A cannot say which one fired. Task 6 Step 4's bpftrace answers that, and the likeliest cause is the least interesting one: a working file that was not laid out at full size, so every write runs past the end. Lay the files out first.
-- **Probe B may fall short of 15000 IOPS.** The arithmetic behind that number assumes the write path's queued behaviour tracks the read path's, and a 4 KiB write carries its payload in the *request* — copied off `/dev/fuse` by fuser's single reader thread (`session.rs:144-177`) — where a read carries it in the reply. If B disappoints while A succeeds, the remaining bound is that single reader thread rather than the inode lock, which calls for a different plan.
-- **`mmap(MAP_SHARED)` on an `O_DIRECT` descriptor stops working.** Recorded in spec §7 as a deliberate cost rather than a bug, and unavoidable inside fuser 0.15.1, whose `fuse_init_in` has no room for bit 36. No workload in this repository does it, and applications that open `O_DIRECT` overwhelmingly do not map the same descriptor shared. If a real workload trips over it, the honest fixes are a fuser upgrade for `FUSE_DIRECT_IO_ALLOW_MMAP` or a CLI flag that turns the direct reply off — and rolling back is simply deploying the previous client build, since nothing on the wire changed.
+- **Probe B may fall short of its 3 × bar.** The arithmetic behind that number assumes the write path's queued behaviour tracks the read path's, and a 4 KiB write carries its payload in the *request* — copied off `/dev/fuse` by the event loop — where a read carries it in the reply. fuser 0.18 runs one event-loop thread by default (`fuser-0`), and `--fuse-threads` raises that; the upgrade benchmark measured no win from extra threads *without* this change, which says nothing about the picture once writes overlap. If B disappoints while A succeeds, re-run the thread A/B with this change deployed before concluding a different plan is due.
+- **`mmap(MAP_SHARED)` on an `O_DIRECT` descriptor stops working.** Recorded in spec §7 as a deliberate cost rather than a bug. No workload in this repository does it, and applications that open `O_DIRECT` overwhelmingly do not map the same descriptor shared. If a real workload trips over it, the honest fixes are negotiating `FUSE_DIRECT_IO_ALLOW_MMAP` — one `Capability` entry on fuser 0.18, once the coherence questions in §3 have answers — or a CLI flag that turns the direct reply off; and rolling back is simply deploying the previous client build, since nothing on the wire changed.
 - **Mixed cached and direct access loses the parallelism without warning.** One buffered descriptor anywhere on the inode sets `FUSE_I_CACHE_IO_MODE` and pushes every direct write back to the exclusive lock. Correct, but silent: a workload that opens a file both ways will see none of this plan's win and no message saying why. `/sys/kernel/debug/tracing` and the bpftrace probe are the only diagnostics.
 - **A kernel older than 6.2 gets `FOPEN_DIRECT_IO` and not the parallelism.** Such a kernel stores the bit and never tests it, so writes take the exclusive lock through `fuse_direct_write_iter` instead of through `fuse_cache_write_iter` — correct, no faster, and the page-cache bypass still applies. Both guests run 7.0, so this only matters for a deployment elsewhere.
 - **The direct path skips `file_update_time`.** A direct write no longer dirties the client's inode timestamps, so the background `SETATTR` that used to follow does not happen and `stat` reports the server's own mtime. That is a better answer, and still a change: a test or a workload that depended on the client's timestamp arriving first would notice.
