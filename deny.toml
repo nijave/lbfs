@@ -1,11 +1,9 @@
-# The `audit` job in `.github/workflows/ci.yml` stays commented out while
-# RUSTSEC-2023-0089 has no answer here. `atomic-polyfill 1.0.3` is
-# unmaintained, and it reaches us as `postcard 1.1.3 -> heapless 0.7.17`.
-# No version bump clears it: `postcard` 1.1.3 is the current release and it
-# still pins the `heapless` 0.7 line, which 0.9 has long left behind. The
-# advisory reports no vulnerability, only an unmaintained crate, so the
-# choices are an `ignore` entry below or moving off `postcard` — a wire-format
-# decision, not a lint one. Pick one before turning the job back on.
+# No ignore list, on purpose: the two advisories that ever fired here were
+# both cleared at the root. RUSTSEC-2021-0154 fell to pinning fuser at a
+# patched release, and RUSTSEC-2023-0089 fell to dropping postcard's default
+# `heapless-cas` feature (see the comment on the pin in `Cargo.toml`). Prefer
+# that shape for the next one too: an entry here is a standing suppression
+# somebody has to remember to revisit.
 
 [advisories]
 version = 2
