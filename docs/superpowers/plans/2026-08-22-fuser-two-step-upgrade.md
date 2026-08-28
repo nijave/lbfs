@@ -12,15 +12,14 @@
 
 **Assessment this plan executes:** `docs/notes/2026-08-22-fuser-upgrade-assessment.md`
 
-**Status:** Step one landed on PR #9, where it now awaits review — Tasks 1
-through 4, each its own commit, with `make check` and `make test-loopback`
-green before every one and `make vm-test` green on the live guest pair at the
-end. The client now pins `=0.16.0` with `abi-7-40`, links no FUSE library, and
-mounts by running `fusermount3`. Step two — Tasks 5 through 11, the `=0.18.0`
-pin and the three things it makes reachable — has not started. Section 9
-records what step one's execution found that the tasks below did not predict;
-read it before starting Task 5, because one of the two changes what Task 11
-has to amend.
+**Status:** Complete. Step one merged to `main` as PR #9 (`22b64e8`) — Tasks
+1 through 4. Step two — Tasks 5 through 11, the `=0.18.0` pin and the three
+things it makes reachable — ran on branch `deps/fuser-0.18`, with `make check`
+and `make test-loopback` green before every commit and `make vm-test` green on
+the live guest pair at the end, plus the Task 10 measurement recorded in
+`docs/benchmarks/2026-08-22-bottleneck-analysis.md`. Section 9 records what
+execution found that the tasks below did not predict, for both steps; read it
+before trusting any task's wording over the code.
 
 ## Global Constraints
 
@@ -203,6 +202,35 @@ prediction was never sound: a lockfile records resolved versions, not the
 features that select them, so a feature flag alone moves nothing there. The
 claim the step actually needed — that the ABI bump adds no crate — held, and
 `cargo tree` is what shows it.
+
+**Task 6 describes an `open_flags` this tree never had.** Steps 6 and 13
+assume the parallel-writes plan left `open_flags(app_flags)` requesting
+`FOPEN_PARALLEL_DIRECT_WRITES` on `O_DIRECT` opens. That plan's client-side
+change never merged — `main`'s `open_flags()` takes no arguments and asks for
+`FOPEN_KEEP_CACHE` alone — so the migration kept that shape, retyped to
+`FopenFlags`, rather than introduce a behaviour change inside a commit that
+promises none. Task 7 accordingly has two hand-declared constants to retire
+(`FUSE_HANDLE_KILLPRIV_V2` and the local `FUSE_WRITE_KILL_PRIV` the removal of
+`fuser::consts` forced), not three; `FOPEN_PARALLEL_DIRECT_WRITES` becomes the
+parallel-writes plan's business on the day its client change lands.
+
+**Task 8's loopback case cannot pass as written.** Its `Opts` keep the
+fixture's `writeback: true`, and under the writeback cache the kernel owns
+`i_size` for a file the mount wrote — no attribute lifetime, short or long,
+lets a server-side size change show through. The mechanism under test is the
+TTL split, so the shipped case turns the writeback cache off and says why in
+place.
+
+**Task 10's expected column had gone stale before step two started.** Its
+Step 3 table quotes the Phase 2/3 figures, but the kill-priv work merged
+after that campaign and moved the write shapes by itself — randwrite 4k
+answers 165-172 µs today against the table's 296 µs. The measurement ran
+its own same-day baseline instead, `main` at `341f6d3` on 0.16.0, against
+the branch. Two smaller readings also differ from the steps: 0.18.0
+names its single default event loop `fuser-0`, so Step 5's "no fuser-N names"
+is not the absent-flag signature (the count is); and Step 4's 16 MiB-per-thread
+resident cost measured at about 2 MB, because the buffer's pages fault in only
+as far as requests touch them — the softening the step itself ordered.
 
 ---
 
@@ -699,7 +727,7 @@ git commit -m "build: drop the libfuse3 link, and say so everywhere it was claim
 
 This is the Global Constraint made into a step. The record matters more than usual here, because the note it appends to is the document the next bump takes its pricing from, and its A2 table carries five claims that do not survive contact with the tag.
 
-- [ ] **Step 1: Read the three areas that matter**
+- [x] **Step 1: Read the three areas that matter**
 
 ```bash
 cd /tmp/fuser-review
@@ -710,11 +738,11 @@ git show v0.18.0:src/lib.rs | sed -n '/pub fn add_capabilities/,/^    }/p'
 git show v0.18.0:Cargo.toml | sed -n '/^\[dependencies\]/,/^\[/p'
 ```
 
-- [ ] **Step 2: Confirm each line of the record below against what you just read**
+- [x] **Step 2: Confirm each line of the record below against what you just read**
 
 Writing this plan meant checking every statement in Step 3's block against tag `v0.18.0`. Read the diff yourself and confirm each one; correct any that upstream has since changed, and if a correction lands, re-price Task 6 before starting it.
 
-- [ ] **Step 3: Append the record**
+- [x] **Step 3: Append the record**
 
 Add to the end of `docs/notes/2026-08-22-fuser-upgrade-assessment.md`:
 
@@ -769,12 +797,12 @@ event-loop thread. `InitFlags::FUSE_HANDLE_KILLPRIV_V2` (bit 28),
 values the two earlier plans declare by hand.
 ```
 
-- [ ] **Step 4: Check the prose gate**
+- [x] **Step 4: Check the prose gate**
 
 Run: `vale --output=line docs/notes/2026-08-22-fuser-upgrade-assessment.md`
 Expected: no output.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/notes/2026-08-22-fuser-upgrade-assessment.md
@@ -797,12 +825,12 @@ git commit -m "docs: record the 0.18.0 diff read before the bump"
 
 One commit, and one behaviour change: none. Everything the new API makes possible waits for Tasks 7 through 9, so a reviewer reading this diff is checking a translation and nothing else.
 
-- [ ] **Step 1: Run the tripwire on the pre-bump tree**
+- [x] **Step 1: Run the tripwire on the pre-bump tree**
 
 Run: `cargo test -p lbfs-tests --test loopback privileged_bits -- --ignored --test-threads=1`
 Expected: PASS, both cases.
 
-- [ ] **Step 2: Pin the crate**
+- [x] **Step 2: Pin the crate**
 
 In `Cargo.toml`, replace the comment block and pin from Task 3 with:
 
@@ -820,12 +848,12 @@ In `Cargo.toml`, replace the comment block and pin from Task 3 with:
 fuser = { version = "=0.18.0" }
 ```
 
-- [ ] **Step 3: Read the wall of errors once, before editing**
+- [x] **Step 3: Read the wall of errors once, before editing**
 
 Run: `cargo check -p lbfs-client 2>&1 | grep -c "^error"`
 Expected: a three-digit number. Read the first twenty with `cargo check -p lbfs-client 2>&1 | head -80` so the shapes below are recognisable rather than surprising.
 
-- [ ] **Step 4: Replace the import block**
+- [x] **Step 4: Replace the import block**
 
 In `crates/lbfs-client/src/fuse.rs`, replace lines 47-67 — the whole `use` block, `fuser::consts` included — with:
 
@@ -857,7 +885,7 @@ use lbfs_proto::Errno;
 use crate::conn::Connection;
 ```
 
-- [ ] **Step 5: Retype the two local constants and the capability list**
+- [x] **Step 5: Retype the two local constants and the capability list**
 
 The two constants keep their raw values for this commit; Task 7 is where the question of trusting the crate's own names gets asked. Replace the declaration the kill-priv plan left:
 
@@ -901,7 +929,7 @@ struct Capability {
 | `FUSE_HANDLE_KILLPRIV_V2` | `FUSE_HANDLE_KILLPRIV_V2` | unchanged — the local constant is an `InitFlags` now |
 | `FUSE_WRITEBACK_CACHE` | `FUSE_WRITEBACK_CACHE` | `InitFlags::FUSE_WRITEBACK_CACHE` |
 
-- [ ] **Step 6: Rewrite `open_flags`**
+- [x] **Step 6: Rewrite `open_flags`**
 
 Replace the signature and body the parallel-writes plan left, keeping its doc comment word for word above it:
 
@@ -917,7 +945,7 @@ fn open_flags(app_flags: OpenFlags) -> FopenFlags {
 
 `OpenFlags` is `pub struct OpenFlags(pub i32)`, so `.0` is the application's own flag word, unchanged in meaning from the `i32` the callback used to receive.
 
-- [ ] **Step 7: Replace `mount_options` with `session_config`**
+- [x] **Step 7: Replace `mount_options` with `session_config`**
 
 Replace `pub fn mount_options(...)` at line 426 and its doc comment entirely:
 
@@ -982,7 +1010,7 @@ pub fn session_config(max_io_size: u32, allow_other: bool, auto_unmount: bool) -
 }
 ```
 
-- [ ] **Step 8: Rewrite the error and reply helpers**
+- [x] **Step 8: Rewrite the error and reply helpers**
 
 Replace `fn errno` and the six `reply_*` helpers at lines 492-549:
 
@@ -1054,7 +1082,7 @@ fn reply_statfs(reply: ReplyStatfs, r: Result<StatfsReply, Errno>) {
 }
 ```
 
-- [ ] **Step 9: Wrap the node id in `to_fuse_attr`**
+- [x] **Step 9: Wrap the node id in `to_fuse_attr`**
 
 One line inside `to_fuse_attr` at line 147, doc comment unchanged:
 
@@ -1062,7 +1090,7 @@ One line inside `to_fuse_attr` at line 147, doc comment unchanged:
         ino: INodeNo(node),
 ```
 
-- [ ] **Step 10: Rewrite `init` and `destroy`**
+- [x] **Step 10: Rewrite `init` and `destroy`**
 
 Replace the `init` signature and its two error returns; every comment inside the body stays as written:
 
@@ -1078,7 +1106,7 @@ The two `return Err(libc::EPROTO);` lines at 566 and 605 become:
 
 `destroy(&mut self)` keeps its signature; both callbacks run once, outside the concurrent phase, which is why they alone still take `&mut self`.
 
-- [ ] **Step 11: Delete the `batch_forget` override**
+- [x] **Step 11: Delete the `batch_forget` override**
 
 Remove the whole method at lines 639-643. The trait's default loops the slice and calls `forget`, which is what the override did per node, so the deletion changes nothing observable. Correction c in Design and Context explains why the migration is a deletion: `ForgetOne` names a private type and no outside crate can write the signature.
 
@@ -1097,7 +1125,7 @@ Then rewrite `forget` itself:
     }
 ```
 
-- [ ] **Step 12: Sweep the callbacks that only change shape**
+- [x] **Step 12: Sweep the callbacks that only change shape**
 
 For each callback below, apply the same three edits and nothing else: `&mut self` becomes `&self`, `Request<'_>` becomes `Request`, and the newtyped parameters get unwrapped on the first line of the body so every existing body line survives untouched.
 
@@ -1129,7 +1157,7 @@ For each callback below, apply the same three edits and nothing else: `&mut self
 
 `mknod`'s single statement becomes `reply.error(FuseErrno::ENOSYS);`.
 
-- [ ] **Step 13: Rewrite the eleven callbacks that change more than shape**
+- [x] **Step 13: Rewrite the eleven callbacks that change more than shape**
 
 ```rust
     /// `flags` carries `RENAME_NOREPLACE` and `RENAME_EXCHANGE` straight
@@ -1417,7 +1445,7 @@ The doc comment above `readdir` gains one sentence, because half of what it expl
     }
 ```
 
-- [ ] **Step 14: Repair the test module**
+- [x] **Step 14: Repair the test module**
 
 `fn requested` returns a flag set now:
 
@@ -1657,7 +1685,7 @@ in `attr_conversion_preserves_fields`, and
 
 in `attr_conversion_reports_the_node_id_not_the_servers_inode`. `attr_conversion_keeps_setuid_setgid_and_sticky` reads `perm` only and needs no edit.
 
-- [ ] **Step 15: Repair the binary**
+- [x] **Step 15: Repair the binary**
 
 In `crates/lbfs-client/src/main.rs`, replace lines 148-155:
 
@@ -1673,7 +1701,7 @@ In `crates/lbfs-client/src/main.rs`, replace lines 148-155:
 
 and update the import at the top of the file from `mount_options` to `session_config`. The comment at line 141 mentioning `spawn_mount2` becomes `spawn_mount`; the drain comment at lines 164-171 stays word for word, because the behaviour it describes does not change — `BackgroundSession` still has no `Drop` of its own and the `Mount` it holds still unmounts when dropped.
 
-- [ ] **Step 16: Repair the loopback fixture**
+- [x] **Step 16: Repair the loopback fixture**
 
 In `tests/tests/loopback.rs`, change the import at line 64:
 
@@ -1713,22 +1741,22 @@ That last change is the one to read twice. `join()` still exists on 0.18.0 and s
 
 Also update the two `spawn_mount2` mentions in the comments at lines 359 and 362.
 
-- [ ] **Step 17: Run the gate**
+- [x] **Step 17: Run the gate**
 
 Run: `cargo fmt --all && make check`
 Expected: PASS. If clippy reports `clippy::field_reassign_with_default` on `session_config`, that lint fires on a `Default` followed by field assignment — the pattern `#[non_exhaustive]` forces here. Add `#[allow(clippy::field_reassign_with_default)]` to the function with a one-line comment naming E0639 as the reason, rather than reaching for a struct expression that cannot compile.
 
-- [ ] **Step 18: Run both loopback suites, tripwire and drain included**
+- [x] **Step 18: Run both loopback suites, tripwire and drain included**
 
 Run: `make test-loopback`
 Expected: PASS, every case in both suites. Watch for `privileged_bits_die_on_write_*` and `writes_reach_the_export_on_unmount_*` by name. A timeout in the second pair means Step 16's join is wrong.
 
-- [ ] **Step 19: Deploy and run the end-to-end suite**
+- [x] **Step 19: Deploy and run the end-to-end suite**
 
 Run: `make build-guest && make vm-deploy && make vm-test`
 Expected: every PASS line.
 
-- [ ] **Step 20: Commit**
+- [x] **Step 20: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/lbfs-client/src/fuse.rs \
@@ -1766,7 +1794,7 @@ its guard."
 
 A separate commit because it asks a separate question. The bits are the same either way; what changes is whose constant the client trusts. Trusting the crate's is right here — writing this plan meant checking all three values against `include/uapi/linux/fuse.h` — and a hand-declared constant that silently disagrees with the crate's own name is worse than either.
 
-- [ ] **Step 1: Rewrite the three pin-tests first**
+- [x] **Step 1: Rewrite the three pin-tests first**
 
 Replace `killpriv_v2_is_always_requested_at_bit_twenty_eight`, `the_parallel_write_bit_is_bit_six` and add one for the write flag:
 
@@ -1793,7 +1821,7 @@ Replace `killpriv_v2_is_always_requested_at_bit_twenty_eight`, `the_parallel_wri
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Step 1 replaces the two old tests rather than adding beside them, so nothing
 duplicates a name.
@@ -1801,11 +1829,11 @@ duplicates a name.
 Run: `cargo test -p lbfs-client --lib hand_checked_flag_bits killpriv_v2`
 Expected: PASS on the two rewritten cases, because the crate's constants carry the right values already. The failure arrives in Step 3, the moment the local constants go: `cargo check -p lbfs-client` then reports `cannot find value 'FUSE_HANDLE_KILLPRIV_V2' in this scope` at `capabilities()`, at `killpriv_v2_is_optional` and at `the_only_high_capability_asked_for_is_killpriv_v2`, plus the same for `FOPEN_PARALLEL_DIRECT_WRITES` and `FUSE_WRITE_KILL_PRIV`. Step 4 answers every one of them.
 
-- [ ] **Step 3: Delete the three local constants**
+- [x] **Step 3: Delete the three local constants**
 
 Remove `const FUSE_HANDLE_KILLPRIV_V2: InitFlags = ...`, `const FOPEN_PARALLEL_DIRECT_WRITES: FopenFlags = ...` and the `const FUSE_WRITE_KILL_PRIV: u32 = 1 << 2;` Task 6 Step 13 introduced. Their doc comments go with them; the reasoning they carried — why bit 28 works on a client declaring 7.40, and why bit 6 needs no negotiation — moves into the capability entry and the `open_flags` doc comment respectively, both of which already say most of it.
 
-- [ ] **Step 4: Point the four use sites at the crate**
+- [x] **Step 4: Point the four use sites at the crate**
 
 In `capabilities()`:
 
@@ -1831,17 +1859,17 @@ In `write`:
 
 In `killpriv_v2_is_optional` and `the_only_high_capability_asked_for_is_killpriv_v2`, replace the bare `FUSE_HANDLE_KILLPRIV_V2` with `InitFlags::FUSE_HANDLE_KILLPRIV_V2`, and in the four `open_flags` tests replace the bare `FOPEN_PARALLEL_DIRECT_WRITES` with `FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES`.
 
-- [ ] **Step 5: Confirm no local constant survives**
+- [x] **Step 5: Confirm no local constant survives**
 
 Run: `grep -n "^const FUSE_\|^const FOPEN_" crates/lbfs-client/src/fuse.rs`
 Expected: no output.
 
-- [ ] **Step 6: Run the gate and both loopback suites**
+- [x] **Step 6: Run the gate and both loopback suites**
 
 Run: `cargo fmt --all && make check && make test-loopback`
 Expected: PASS. The tripwire pair is the one to watch: `WriteFlags::FUSE_WRITE_KILL_SUIDGID` is now the name the strip depends on, and a wrong bit there would leak set-user-ID silently.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs
@@ -1867,7 +1895,7 @@ Spec §7 has always written this as two knobs — "`entry_timeout`/`attr_timeout
 
 The split reaches `lookup`, `mkdir`, `symlink` and `link`. `ReplyCreate::created` and `ReplyDirectoryPlus::add` still send one lifetime as both, so a freshly created file and a name learned from a listing use the attribute lifetime for their dentry. That is the conservative direction — a shorter name lifetime costs round trips, never correctness — and it wants saying in the field's doc comment so nobody reads the flag as covering more than it does.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The defaulting rule is the only branch worth a unit test, and it belongs in
 `crates/lbfs-client/src/main.rs` beside `attr_timeout`, which it mirrors. The
@@ -1895,12 +1923,12 @@ Add to the `mod tests` block in `crates/lbfs-client/src/main.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p lbfs-client --lib entry_lifetime`
 Expected: FAIL — `cannot find function 'entry_timeout' in this scope`.
 
-- [ ] **Step 3: Give the bridge two lifetimes**
+- [x] **Step 3: Give the bridge two lifetimes**
 
 Replace the struct, its constructor and `ctx`:
 
@@ -1956,7 +1984,7 @@ impl LbfsFuse {
 }
 ```
 
-- [ ] **Step 4: Widen `reply_entry` and its four callers**
+- [x] **Step 4: Widen `reply_entry` and its four callers**
 
 ```rust
 fn reply_entry(
@@ -1993,7 +2021,7 @@ The `tracing::info!` at the end of `init` gains the second number:
         );
 ```
 
-- [ ] **Step 5: Add the CLI flag**
+- [x] **Step 5: Add the CLI flag**
 
 In `crates/lbfs-client/src/main.rs`, add after `attr_timeout`:
 
@@ -2037,7 +2065,7 @@ and in `run()`, after `let ttl = attr_timeout(cli.attr_timeout)?;`:
 
 then pass it: `LbfsFuse::new(conn, rt.handle().clone(), ttl, entry_ttl, writeback)`.
 
-- [ ] **Step 6: Add the CLI test**
+- [x] **Step 6: Add the CLI test**
 
 In the `mod tests` block of `main.rs`, extend `cli_parses_the_documented_invocation` with one line and add one case:
 
@@ -2075,7 +2103,7 @@ In the `mod tests` block of `main.rs`, extend `cli_parses_the_documented_invocat
     }
 ```
 
-- [ ] **Step 7: Repair the loopback fixture**
+- [x] **Step 7: Repair the loopback fixture**
 
 In `tests/tests/loopback.rs`, add a field to `Opts` and its default:
 
@@ -2104,7 +2132,7 @@ and pass it at the construction site near line 331:
 
 Every existing `Opts { ttl: Duration::ZERO, ..Opts::default() }` in the file keeps a one-second entry lifetime after this change, which would defeat any case that sets `ttl` to zero to force a round trip. Find them with `grep -n "ttl:" tests/tests/loopback.rs` and set `entry_ttl: Duration::ZERO` beside each one.
 
-- [ ] **Step 8: Add the loopback case**
+- [x] **Step 8: Add the loopback case**
 
 ```rust
 /// A long name lifetime beside a short attribute lifetime, end to end.
@@ -2141,12 +2169,12 @@ fn a_long_name_lifetime_does_not_hold_a_stale_size() {
 }
 ```
 
-- [ ] **Step 9: Run the tests**
+- [x] **Step 9: Run the tests**
 
 Run: `cargo test -p lbfs-client --lib entry_lifetime entry_timeout_flag && cargo test -p lbfs-tests --test loopback a_long_name_lifetime -- --ignored --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 10: Document the flag**
+- [x] **Step 10: Document the flag**
 
 In `README.md`, add a row to the client flag table beside `--attr-timeout`:
 
@@ -2170,12 +2198,12 @@ and update the CLI line further down the same section:
   [--entry-timeout N] [--allow-other] [--auto-unmount] [--no-writeback]`.
 ```
 
-- [ ] **Step 11: Run the whole gate**
+- [x] **Step 11: Run the whole gate**
 
 Run: `make check && make test-loopback`
 Expected: PASS.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs crates/lbfs-client/src/main.rs \
@@ -2199,7 +2227,7 @@ git commit -m "feat(client): --entry-timeout, separate from the attribute timeou
 
 Off by default and expected to stay off. Section 8 of Design and Context has the argument: the session thread peaks at 15.6% of a core across the whole bottleneck campaign, the guest has two vCPUs with tokio workers already on one, and each extra thread reserves a resident 16 MiB receive buffer that never shrinks to the negotiated `max_write`. The knob exists so a four-vCPU guest earns a measurement without another code change, and Task 10 records what it does today.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/lbfs-client/src/fuse.rs`, replace `the_session_runs_one_event_loop_by_default` and add its companion:
 
@@ -2240,12 +2268,12 @@ In `crates/lbfs-client/src/main.rs`, add beside `attr_timeout_accepts_zero_and_f
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p lbfs-client --lib event_loop thread_settings`
 Expected: FAIL — `this function takes 3 arguments but 5 arguments were supplied`, and `cannot find function 'event_loop_threads'`.
 
-- [ ] **Step 3: Widen `session_config`**
+- [x] **Step 3: Widen `session_config`**
 
 Add two parameters and two assignments, and extend the doc comment:
 
@@ -2275,7 +2303,7 @@ with the two new lines beside the others:
     config
 ```
 
-- [ ] **Step 4: Add the flags and the check**
+- [x] **Step 4: Add the flags and the check**
 
 In `crates/lbfs-client/src/main.rs`, add to `Cli` after `no_writeback`:
 
@@ -2341,7 +2369,7 @@ and the call in `run()`, replacing the `session_config` line:
     );
 ```
 
-- [ ] **Step 5: Repair the loopback fixture**
+- [x] **Step 5: Repair the loopback fixture**
 
 One call site, at `tests/tests/loopback.rs:341`:
 
@@ -2354,12 +2382,12 @@ One call site, at `tests/tests/loopback.rs:341`:
         .expect("the mount succeeds");
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `cargo test -p lbfs-client --lib event_loop thread_settings one_event_loop`
 Expected: PASS, all three.
 
-- [ ] **Step 7: Document the flags**
+- [x] **Step 7: Document the flags**
 
 Add two rows to the client flag table in `README.md`:
 
@@ -2368,12 +2396,12 @@ Add two rows to the client flag table in `README.md`:
 | `--fuse-clone-fd` | off | Give each event-loop thread its own `/dev/fuse` descriptor (`FUSE_DEV_IOC_CLONE`, Linux 4.5+). Without it the threads share one queue. Means nothing without `--fuse-threads`. |
 ```
 
-- [ ] **Step 8: Run the whole gate**
+- [x] **Step 8: Run the whole gate**
 
 Run: `make check && make test-loopback`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs crates/lbfs-client/src/main.rs \
@@ -2394,12 +2422,12 @@ git commit -m "feat(client): --fuse-threads and --fuse-clone-fd, off by default"
 
 Two questions, and the second one is the reason the knob shipped. First: did the upgrade move anything? The expected answer is no, and a plan whose whole argument is "no measured change" owes a measurement. Second: what do extra event loops do on today's guest? The expected answer is also no change, and recording that is what stops somebody reopening the question from memory.
 
-- [ ] **Step 1: Build and deploy**
+- [x] **Step 1: Build and deploy**
 
 Run: `make build-guest && make vm-deploy`
 Expected: `deployed.` with `lbfs-server` active. If the pair is down, `make vm-up` first.
 
-- [ ] **Step 2: Confirm the mount still negotiates what it used to**
+- [x] **Step 2: Confirm the mount still negotiates what it used to**
 
 Mount from the client guest and read the client's own log:
 
@@ -2410,7 +2438,7 @@ lbfs-client 192.168.77.10:9423 /srv/exports/data /mnt/lbfs 2>&1 | \
 
 Expected: one `mount initialized` line carrying `max_io=1048576`, `writeback=true`, `attr_ttl=1s` and `entry_ttl=1s`, and no `unsupported by this kernel` line at all. A refusal naming `FUSE_HANDLE_KILLPRIV_V2` means the bump lost the capability and the write numbers below will regress by roughly 90 µs.
 
-- [ ] **Step 3: Measure the five standard shapes with the knob off**
+- [x] **Step 3: Measure the five standard shapes with the knob off**
 
 Run the drained single-job driver used for the tables in the benchmark document — each job `direct=1`, each preceded by a drain (`sync`, then poll `/proc/meminfo` until `Dirty + Writeback` falls under 8 MB).
 
@@ -2426,7 +2454,7 @@ Expected, against the figures already in the document:
 
 Run-to-run spread on this pair is about 20% on the write shapes and tighter on the reads; the document's own Phase 2/Phase 3 columns show the range. Anything outside that range counts as a regression and stops the task.
 
-- [ ] **Step 4: Run the A/B on event-loop threads**
+- [x] **Step 4: Run the A/B on event-loop threads**
 
 Same five shapes, same drain, three client builds of the same binary differing only in flags:
 
@@ -2449,7 +2477,7 @@ ps -o rss= -p "$(pgrep -x lbfs-client)"
 
 Expected: roughly 16 MiB more per extra thread. Note the reading whatever it says; if four threads do not cost about 48 MiB above the control, the crate allocates the buffer lazily and the memory argument in the README wants softening.
 
-- [ ] **Step 5: Confirm the threads exist**
+- [x] **Step 5: Confirm the threads exist**
 
 ```bash
 ps -L -o comm= -p "$(pgrep -x lbfs-client)" | sort | uniq -c
@@ -2457,7 +2485,7 @@ ps -L -o comm= -p "$(pgrep -x lbfs-client)" | sort | uniq -c
 
 Expected: with `--fuse-threads 4`, four threads named `fuser-0` through `fuser-3`; with the flag absent, one background session thread and no `fuser-N` names. A missing set means the flag never reached `Config` and Step 4 measured the control twice.
 
-- [ ] **Step 6: Record it**
+- [x] **Step 6: Record it**
 
 Append to `docs/benchmarks/2026-08-22-bottleneck-analysis.md`:
 
@@ -2492,12 +2520,12 @@ guest with four or more vCPUs running many files concurrently — the shape that
 scaled 2.66× in the Phase 4 ladder — and worth leaving off everywhere else.
 ```
 
-- [ ] **Step 7: Check the prose gate**
+- [x] **Step 7: Check the prose gate**
 
 Run: `vale --output=line docs/benchmarks/2026-08-22-bottleneck-analysis.md`
 Expected: no output.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add docs/benchmarks/2026-08-22-bottleneck-analysis.md
@@ -2518,7 +2546,7 @@ git commit -m "docs(bench): the fuser upgrade moves nothing, and neither do extr
 
 An exact pin with no explanation beside it invites somebody to relax it. One short paragraph in each of the two documents an operator reads, both pointing at the assessment note for the argument.
 
-- [ ] **Step 1: Amend the spec**
+- [x] **Step 1: Amend the spec**
 
 Add to `docs/superpowers/specs/2026-08-20-lbfs-design.md` §9, after the deployment paragraph Task 4 rewrote:
 
@@ -2538,7 +2566,7 @@ the pre-bump diff record live in
 `docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
 ```
 
-- [ ] **Step 2: Amend the README**
+- [x] **Step 2: Amend the README**
 
 Add to `README.md` at the end of the Build section, before "Why a container and not a musl target":
 
@@ -2555,7 +2583,7 @@ forwarding a kill signal. The reasoning is in
 `docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
 ```
 
-- [ ] **Step 3: Update the pre-epoch limitation**
+- [x] **Step 3: Update the pre-epoch limitation**
 
 In `README.md`, find the known-limitations paragraph on pre-1970 timestamps
 (near line 211) and append one sentence:
@@ -2566,17 +2594,17 @@ fractional pre-1970 time intact — while the inbound half (`utimensat` through
 `system_time_from_time`) still waits on a later fuser release.
 ```
 
-- [ ] **Step 4: Check the prose gate**
+- [x] **Step 4: Check the prose gate**
 
 Run: `vale --output=line README.md docs/superpowers/specs/2026-08-20-lbfs-design.md`
 Expected: no output.
 
-- [ ] **Step 5: Run the whole gate one last time**
+- [x] **Step 5: Run the whole gate one last time**
 
 Run: `make check && make test-loopback && make vm-test`
 Expected: PASS throughout.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add README.md docs/superpowers/specs/2026-08-20-lbfs-design.md

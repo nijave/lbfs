@@ -31,6 +31,17 @@ container and leaves them in `target/guest/release`:
 make build-guest               # GUEST_IMAGE=docker.io/library/rust:1-trixie
 ```
 
+The `fuser` dependency pins an exact version rather than a range, and
+`cargo update` must not move it on its own. Releases after 0.18.0 come
+primarily from a coding agent under a review the maintainer describes as
+cursory, and the project no longer takes pull requests, so a patch nobody here
+has read could otherwise reach a guest binary through routine housekeeping. The
+practice for moving it: read the release diff first, land the crate bump and
+any ABI change as separate commits, and run `make test-loopback` either side of
+the move — the set-user-ID cases in it are what catch a release that stops
+forwarding a kill signal. The reasoning is in
+`docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
+
 ### Why a container and not a musl target
 
 A distro-packaged rustc has no musl std to build against, so a static musl
@@ -122,8 +133,11 @@ mismatch prints a plain error instead of leaving an `EIO` mountpoint behind.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--attr-timeout <seconds>` | `1.0` | How long the kernel may trust a cached name or attribute. `0` turns both caches off. Fractions are fine. |
+| `--entry-timeout <seconds>` | same as `--attr-timeout` | How long the kernel may trust a cached name. Raise it alone for a workload that resolves the same paths often and reads their attributes rarely. Reaches `LOOKUP`, `MKDIR`, `SYMLINK` and `LINK`; a freshly created file and a name from a listing use `--attr-timeout` for both, because FUSE's reply for those carries one lifetime. |
 | `--allow-other` | off | Let other users on the client machine reach the mount. |
 | `--auto-unmount` | off | Ask `fusermount3` to unmount if the process dies uncleanly. Implies `--allow-other`, and needs `user_allow_other` in `/etc/fuse.conf`. |
+| `--fuse-threads N` | off (one) | Run N fuser event-loop threads. Off by default and expected to stay off on a two-vCPU guest: the session thread peaks at 15.6% of a core under the heaviest measured shape, and the A/B in `docs/benchmarks/2026-08-22-bottleneck-analysis.md` moved nothing. Each thread allocates a 16 MiB receive buffer, of which about 2 MB turns resident under a 1 MiB negotiated I/O size. Pair with `--fuse-clone-fd`. Linux only, 1 to 64. |
+| `--fuse-clone-fd` | off | Give each event-loop thread its own `/dev/fuse` descriptor (`FUSE_DEV_IOC_CLONE`, Linux 4.5+). Without it the threads share one queue. Means nothing without `--fuse-threads`. |
 | `--no-writeback` | off | Write through to the server instead of letting the kernel batch dirty pages. |
 
 The writeback cache stays on by default because coalescing small writes is the
@@ -261,6 +275,9 @@ independently; until then the node id wins where it must.
 **Pre-epoch timestamps come back wrong.** fuser's `time_from_system_time`
 mangles a time before 1970 on its way to the kernel. Files dated before the
 epoch are rare and the client fixes nothing here.
+The 0.18.0 pin repairs the outbound half of this — replies now carry a
+fractional pre-1970 time intact — while the inbound half (`utimensat` through
+`system_time_from_time`) still waits on a later fuser release.
 
 **`fsync = "ignore"` is a durability trade, not an optimisation.** See the
 warning under the configuration reference. The server acknowledges syncs it

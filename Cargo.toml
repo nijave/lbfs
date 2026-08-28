@@ -27,22 +27,17 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-# The ABI level is a claim about what this client understands, and fuser gates
-# its own constants on it. Every kernel-cache knob spec §7 asks for lives above
-# the 7.8 default: `FUSE_DO_READDIRPLUS`/`FUSE_READDIRPLUS_AUTO` are 7.21,
-# `FUSE_WRITEBACK_CACHE` is 7.23, `batch_forget` is 7.16, and `max_pages` (what
-# carries a negotiated `max_write` past 128 KiB) is 7.28. 7.40 is the highest
-# level 0.16.0 offers, and it costs nothing above 7.31 today: the release names
-# no constant between bits 26 and 36, and a feature nobody asks for is one the
-# kernel leaves off. `the_only_high_capability_asked_for_is_killpriv_v2` in
-# `fuse.rs` is what keeps that true. The kernel negotiates down to whatever it
-# supports, so asking for 7.40 costs nothing on an older one.
+# Pinned exactly, never as a range. Releases after 0.18.0 come primarily from a
+# coding agent under, in the maintainer's own words, "at least a cursory review
+# from a human", and for a filesystem client a protocol bug is a data bug. Read
+# the diff before moving this number; see the governance section and the
+# pre-bump addendum in `docs/notes/2026-08-22-fuser-upgrade-assessment.md`.
 #
-# `libfuse` is deliberately absent from the feature list. 0.16.0 made it opt-in
-# (`default = []`), and leaving it off selects fuser's pure-Rust mount, which
-# runs `fusermount3` instead of linking `libfuse3.so`. See README "Why a
-# container and not a musl target".
-fuser = { version = "=0.16.0", features = ["abi-7-40"] }
+# The `abi-7-*` features are gone as of this release — the ABI level is 7.40,
+# fixed, with compatibility settled at run time against what the kernel offers.
+# `libfuse` stays off, which selects the crate's pure-Rust mount: it runs
+# `fusermount3` as a child process instead of linking `libfuse3.so`.
+fuser = { version = "=0.18.0" }
 proptest = "1"
 tempfile = "3"
 futures = "0.3"

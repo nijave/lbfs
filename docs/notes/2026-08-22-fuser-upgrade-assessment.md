@@ -709,3 +709,53 @@ waits.
   branch in B3 becomes the cheaper option.
 - Would a four-vCPU guest change the `n_threads` answer? Every measurement here
   comes from two vCPUs with tokio workers already on one of them.
+
+## Addendum, pre-bump: the 0.18.0 diff read
+
+Recorded before pinning `=0.18.0`, per the dependency-governance practice above.
+Eight things in Part A did not survive contact with the tag. Two of them are
+blockers rather than adjustments.
+
+**Blockers.**
+
+- `ForgetOne` is not nameable downstream. `src/lib.rs:34` imports it privately
+  and `src/lib.rs:90` declares `mod forget_one;` private, so both
+  `fuser::ForgetOne` and `fuser::forget_one::ForgetOne` are `error[E0603]`. The
+  type appears in a public trait signature that no outside crate can write.
+  Deleting our `batch_forget` override, rather than migrating it, is the only
+  move available; the trait's default body loops the slice calling `forget`,
+  which is what the override did.
+- `BackgroundSession::join()` no longer unmounts. At 0.15.1 it dropped the
+  `Mount` first and then joined (`src/session.rs:273-282`); at 0.18.0 it joins
+  only, leaving the session thread parked on `/dev/fuse`. `umount_and_join()`
+  is the replacement (`src/session.rs:571-576`).
+
+**Adjustments.**
+
+- `Config` is `#[non_exhaustive]`, so a struct expression from another crate is
+  `error[E0639]` — `..Default::default()` does not help. Build it from
+  `Config::default()` and assign each field.
+- `lseek` keeps `offset: i64`, and `ReplyLseek::offset` keeps it too. Four
+  `u64::try_from` guards go, not five.
+- `rename` takes `RenameFlags`, `copy_file_range` takes `CopyFileRangeFlags`,
+  and `setattr`'s trailing flags become `Option<BsdFileFlags>`. `RenameFlags`
+  decodes with `from_bits_retain`, so unknown `renameat2` bits still reach the
+  server verbatim.
+- The dependency arrivals are here, not at 0.16.0, whose table is identical to
+  0.15.1's. New to the tree: `num_enum`, `ref-cast`. Moved: `nix` 0.29 → 0.31
+  with `poll`, `socket`, `uio`, `mount`, `process` and `ioctl` added.
+- `entry_with_ttls` covers `ReplyEntry` only. `ReplyCreate::created` and
+  `ReplyDirectoryPlus::add` still send one lifetime as both.
+- This release leaves the nodeid-versus-`st_ino` conflation at
+  `crates/lbfs-client/src/fuse.rs:29` in place: `entry_with_ttls` still
+  derives the nodeid from `attr.ino`. The README limitation about `ls -i`
+  stands.
+
+**Unchanged and relied upon.** `add_capabilities` still checks the ask against
+the kernel's advertised bits and nothing else — there is no refusal list on this
+tag — so the `FUSE_HANDLE_KILLPRIV_V2` ask survives the bump. `MAX_WRITE_SIZE`
+is still 16 MiB and `BUFFER_SIZE` is still `MAX_WRITE_SIZE + 4096`, one per
+event-loop thread. `InitFlags::FUSE_HANDLE_KILLPRIV_V2` (bit 28),
+`WriteFlags::FUSE_WRITE_KILL_SUIDGID` (bit 2) and
+`FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES` (bit 6) all exist and match the
+values the two earlier plans declare by hand.

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use lbfs_client::conn::{ConnectError, Connection};
-use lbfs_client::fuse::{mount_options, LbfsFuse};
+use lbfs_client::fuse::{session_config, LbfsFuse};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -45,6 +45,19 @@ struct Cli {
     #[arg(long, default_value_t = 1.0)]
     attr_timeout: f64,
 
+    /// How long the kernel may trust a cached name, in seconds.
+    ///
+    /// Defaults to `--attr-timeout`, which is what this client did before the
+    /// two became separable. Raising it alone suits a workload that resolves
+    /// the same paths repeatedly and reads their attributes rarely — a build
+    /// tree is the case in point. Zero disables dentry caching. It reaches
+    /// `LOOKUP`, `MKDIR`, `SYMLINK` and `LINK` replies; a file this mount
+    /// created, and a name it learned from a directory listing, use
+    /// `--attr-timeout` for both lifetimes because FUSE's reply for those
+    /// carries only one.
+    #[arg(long)]
+    entry_timeout: Option<f64>,
+
     /// Let other users on this machine reach the mount.
     #[arg(long)]
     allow_other: bool,
@@ -66,6 +79,28 @@ struct Cli {
     /// the only place that knows.
     #[arg(long)]
     no_writeback: bool,
+
+    /// Run this many fuser event-loop threads instead of one.
+    ///
+    /// Off by default, and expected to stay off on a two-vCPU guest: the
+    /// session thread peaks at 15.6% of a core under the heaviest shape
+    /// measured, and a second event loop competes with the tokio workers for
+    /// the other core. Each thread allocates a 16 MiB receive buffer; the
+    /// measured resident cost is about 2 MB per thread under a 1 MiB
+    /// negotiated I/O size, since pages fault in only as far as requests
+    /// touch them. Pair it with `--fuse-clone-fd` or most of the benefit
+    /// stays behind a shared descriptor. Linux only, 1 to 64.
+    #[arg(long)]
+    fuse_threads: Option<usize>,
+
+    /// Give each event-loop thread its own `/dev/fuse` descriptor.
+    ///
+    /// `FUSE_DEV_IOC_CLONE`, Linux 4.5 and up. Without it every thread reads
+    /// one descriptor and one kernel queue, which is the serialisation extra
+    /// threads exist to remove. Means nothing on its own — pass
+    /// `--fuse-threads` too.
+    #[arg(long)]
+    fuse_clone_fd: bool,
 }
 
 /// Everything that can go wrong before the mount exists.
@@ -80,6 +115,8 @@ enum StartupError {
     NoAddress(String),
     #[error("--attr-timeout must be a non-negative, finite number of seconds")]
     AttrTimeout,
+    #[error("--fuse-threads must be between 1 and 64")]
+    FuseThreads,
     #[error("the remote path must be absolute")]
     RelativeRemotePath,
     #[error("starting the runtime: {0}")]
@@ -119,6 +156,7 @@ fn run() -> Result<(), StartupError> {
 
     let cli = Cli::parse();
     let ttl = attr_timeout(cli.attr_timeout)?;
+    let entry_ttl = entry_timeout(cli.entry_timeout, ttl)?;
     if !cli.remote_path.is_absolute() {
         // The server matches the path against its allowlist after resolving it
         // from its own working directory, so a relative one is at best a
@@ -137,7 +175,7 @@ fn run() -> Result<(), StartupError> {
         .map_err(|source| StartupError::Connect { addr, source })?;
 
     // Before the mount, not after. A signal arriving in the window between
-    // `spawn_mount2` returning and the handlers being installed would take its
+    // `spawn_mount` returning and the handlers being installed would take its
     // default action and kill this process with a mount already on the
     // directory and nothing left to unmount it. Not before `connect`, though:
     // registering a handler suppresses the default action whether or not
@@ -145,10 +183,17 @@ fn run() -> Result<(), StartupError> {
     // nothing for as long as a silent server can hold the handshake open.
     let mut signals = rt.block_on(async { Signals::install() })?;
 
-    let opts = mount_options(limits.max_io_size, cli.allow_other, cli.auto_unmount);
-    let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, writeback);
+    let n_threads = event_loop_threads(cli.fuse_threads)?;
+    let cfg = session_config(
+        limits.max_io_size,
+        cli.allow_other,
+        cli.auto_unmount,
+        n_threads,
+        cli.fuse_clone_fd,
+    );
+    let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, entry_ttl, writeback);
     let session =
-        fuser::spawn_mount2(fs, &cli.mountpoint, &opts).map_err(|source| StartupError::Mount {
+        fuser::spawn_mount(fs, &cli.mountpoint, &cfg).map_err(|source| StartupError::Mount {
             path: cli.mountpoint.display().to_string(),
             source,
         })?;
@@ -214,7 +259,7 @@ const SESSION_POLL: Duration = Duration::from_millis(200);
 /// answers `EIO` until somebody unmounts it (spec §7). A dead *session* is,
 /// because there is no mount left to serve — and the `init` path that refuses a
 /// kernel without the writeback cache reaches exactly this state, having
-/// already returned `Ok` from `spawn_mount2`. Without this the process would
+/// already returned `Ok` from `spawn_mount`. Without this the process would
 /// wait for a signal that is not coming, holding the runtime, the socket and an
 /// `ENOTCONN` mountpoint.
 ///
@@ -247,6 +292,34 @@ fn attr_timeout(secs: f64) -> Result<Duration, StartupError> {
         return Err(StartupError::AttrTimeout);
     }
     Duration::try_from_secs_f64(secs).map_err(|_| StartupError::AttrTimeout)
+}
+
+/// One to sixty-four event loops, or none named at all.
+///
+/// Zero is the value worth catching here rather than downstream: `Session::run`
+/// answers a zero with `io::Error::other("n_threads")`, which reaches the
+/// operator as a mount failure with no explanation in it. The upper bound is
+/// arbitrary and generous — sixty-four threads would reserve a gigabyte of
+/// receive buffer, which is more than the guests have.
+fn event_loop_threads(n: Option<usize>) -> Result<Option<usize>, StartupError> {
+    match n {
+        None => Ok(None),
+        Some(n) if (1..=64).contains(&n) => Ok(Some(n)),
+        Some(_) => Err(StartupError::FuseThreads),
+    }
+}
+
+/// The name lifetime, falling back to the attribute lifetime when the operator
+/// named only one.
+///
+/// A fallback rather than a constant default, so `--attr-timeout 0` keeps
+/// disabling both caches the way it always did, and a mount that names neither
+/// flag behaves as every mount did before the two became separable.
+fn entry_timeout(entry: Option<f64>, attr: Duration) -> Result<Duration, StartupError> {
+    match entry {
+        None => Ok(attr),
+        Some(secs) => attr_timeout(secs),
+    }
 }
 
 /// `host:port` to one address.
@@ -286,9 +359,64 @@ mod tests {
         assert_eq!(cli.mountpoint, PathBuf::from("/mnt/lbfs"));
         // Spec §7: caching on, writeback on, mount private to its owner.
         assert_eq!(cli.attr_timeout, 1.0);
+        assert_eq!(cli.entry_timeout, None);
         assert!(!cli.no_writeback);
         assert!(!cli.allow_other);
         assert!(!cli.auto_unmount);
+    }
+
+    /// Absent means "the same as the attribute lifetime", which is what every
+    /// mount did before `entry_with_ttls` made the two separable. Present
+    /// means what it says, including zero, which disables dentry caching on
+    /// its own.
+    #[test]
+    fn the_entry_lifetime_falls_back_to_the_attribute_lifetime() {
+        let attr = Duration::from_millis(500);
+        assert_eq!(entry_timeout(None, attr).unwrap(), attr);
+        assert_eq!(
+            entry_timeout(Some(60.0), attr).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(entry_timeout(Some(0.0), attr).unwrap(), Duration::ZERO);
+        assert!(entry_timeout(Some(-1.0), attr).is_err());
+        assert!(entry_timeout(Some(f64::NAN), attr).is_err());
+    }
+
+    /// The flag parses, and its absence parses as absence rather than as a
+    /// number somebody has to remember the meaning of.
+    #[test]
+    fn the_entry_timeout_flag_parses() {
+        let cli = Cli::parse_from([
+            "lbfs-client",
+            "--attr-timeout",
+            "0.5",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(cli.entry_timeout, None);
+
+        let split = Cli::parse_from([
+            "lbfs-client",
+            "--attr-timeout",
+            "0.5",
+            "--entry-timeout",
+            "60",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(split.attr_timeout, 0.5);
+        assert_eq!(split.entry_timeout, Some(60.0));
+    }
+
+    #[test]
+    fn event_loop_threads_refuses_zero_and_absurd_counts() {
+        assert_eq!(event_loop_threads(None).unwrap(), None);
+        assert_eq!(event_loop_threads(Some(1)).unwrap(), Some(1));
+        assert_eq!(event_loop_threads(Some(64)).unwrap(), Some(64));
+        assert!(event_loop_threads(Some(0)).is_err());
+        assert!(event_loop_threads(Some(65)).is_err());
     }
 
     #[test]

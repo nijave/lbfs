@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use lbfs_client::conn::Connection;
-use lbfs_client::fuse::{mount_options, LbfsFuse};
+use lbfs_client::fuse::{session_config, LbfsFuse};
 use lbfs_proto::frame::{DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE};
 use lbfs_server::config::{Allowlist, Config, FsyncPolicy};
 use rustix::fs::{StatVfsMountFlags, XattrFlags};
@@ -221,10 +221,13 @@ struct Opts {
     /// tuning knob.
     writeback: bool,
     fsync: FsyncPolicy,
-    /// Entry and attribute lifetime. Zero makes every name and every `stat` a
-    /// round trip, which is what a test about a *dead* server needs — with the
-    /// default second, the kernel would answer from cache and prove nothing.
+    /// Attribute lifetime. Zero makes every `stat` a round trip, which is
+    /// what a test about a *dead* server needs — with the default second, the
+    /// kernel would answer from cache and prove nothing.
     ttl: Duration,
+    /// Name lifetime. Defaults to `ttl`, which is what the shipped client does
+    /// when `--entry-timeout` is absent.
+    entry_ttl: Duration,
 }
 
 impl Default for Opts {
@@ -234,6 +237,7 @@ impl Default for Opts {
             writeback: true,
             fsync: FsyncPolicy::Honor,
             ttl: Duration::from_secs(1),
+            entry_ttl: Duration::from_secs(1),
         }
     }
 }
@@ -333,14 +337,18 @@ impl Loopback {
             Arc::clone(&conn),
             client_rt.handle().clone(),
             opts.ttl,
+            opts.entry_ttl,
             opts.writeback,
         );
         // The same option list the binary builds, from the same negotiated
         // ceiling: `max_read` has to agree with what the multiplexer will
         // accept or the kernel issues reads that come back `EINVAL`.
-        let session =
-            fuser::spawn_mount2(fs, &mnt, &mount_options(limits.max_io_size, false, false))
-                .expect("the mount succeeds");
+        let session = fuser::spawn_mount(
+            fs,
+            &mnt,
+            &session_config(limits.max_io_size, false, false, None, false),
+        )
+        .expect("the mount succeeds");
 
         let mounted = Loopback {
             session: Some(session),
@@ -357,10 +365,10 @@ impl Loopback {
 
     /// Wait until the mount answers, or say why it never will.
     ///
-    /// `spawn_mount2` returns once the mount syscall is done, but `INIT` runs
+    /// `spawn_mount` returns once the mount syscall is done, but `INIT` runs
     /// afterwards on the session thread — and `init` is allowed to refuse,
     /// which ends the session and leaves an `ENOTCONN` mountpoint behind a
-    /// perfectly successful `spawn_mount2`. Watching the session thread turns
+    /// perfectly successful `spawn_mount`. Watching the session thread turns
     /// that into a named failure instead of a twenty-second timeout.
     fn wait_ready(&self) {
         let session = self.session.as_ref().expect("just mounted");
@@ -420,8 +428,8 @@ impl Loopback {
     /// The same, reporting rather than asserting, so [`Loopback::drop`] can use
     /// it. A panic raised while unwinding aborts the whole test binary and
     /// takes every other case's diagnostics with it, and
-    /// `BackgroundSession::join` unwraps both the thread result and the
-    /// session's `io::Result`.
+    /// `BackgroundSession::umount_and_join` returns an `io::Result` that a
+    /// failed unmount fills in.
     fn try_unmount(&mut self) -> bool {
         let Some(session) = self.session.take() else {
             return !is_fuse_mount(&self.mnt);
@@ -432,8 +440,9 @@ impl Loopback {
         // down rather than being left behind.
         let (done, ended) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || session.join()));
-            let _ = done.send(outcome.is_ok());
+            let outcome =
+                std::panic::catch_unwind(AssertUnwindSafe(move || session.umount_and_join()));
+            let _ = done.send(matches!(outcome, Ok(Ok(()))));
         });
         match ended.recv_timeout(UNMOUNT_TIMEOUT) {
             Ok(true) => true,
@@ -711,6 +720,44 @@ fn writes_reach_the_export_on_unmount_with_the_writeback_cache() {
 #[ignore = "mounts a real filesystem; run with `make test-loopback`"]
 fn writes_reach_the_export_on_unmount_without_the_writeback_cache() {
     writes_reach_the_export_by_the_time_the_unmount_returns(false);
+}
+
+/// A long name lifetime beside a short attribute lifetime, end to end.
+///
+/// The point of separating them is that a path can stay resolved while its
+/// attributes go stale, so this asserts both halves: a `stat` past the
+/// attribute lifetime sees a size the server changed behind the mount's back,
+/// and the name itself never had to be looked up again for that to happen.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn a_long_name_lifetime_does_not_hold_a_stale_size() {
+    let lb = Loopback::start(Opts {
+        ttl: Duration::from_millis(50),
+        entry_ttl: Duration::from_secs(3600),
+        // With the writeback cache on, the kernel owns `i_size` for a file
+        // this mount wrote and never refetches it, so no attribute lifetime —
+        // short or long — would let the server's change show through. The
+        // subject here is the TTL split, so the cache that overrides both
+        // lifetimes stays off.
+        writeback: false,
+        ..Opts::default()
+    });
+
+    let seen = lb.mnt().join("grows");
+    let real = lb.export().join("grows");
+    std::fs::write(&seen, b"one").unwrap();
+    assert_eq!(std::fs::metadata(&seen).unwrap().len(), 3);
+
+    // Behind the mount's back, so only an expired attribute lifetime can
+    // reveal it.
+    std::fs::write(&real, b"four-plus").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        std::fs::metadata(&seen).unwrap().len(),
+        9,
+        "the attribute lifetime did not expire, or the entry lifetime pinned it"
+    );
 }
 
 /// The promise `FUSE_HANDLE_KILLPRIV_V2` buys, checked end to end.
@@ -1556,6 +1603,7 @@ fn a_dead_server_leaves_an_eio_mount_that_still_unmounts() {
     // nothing about the connection underneath.
     let mut lb = Loopback::start(Opts {
         ttl: Duration::ZERO,
+        entry_ttl: Duration::ZERO,
         ..Opts::default()
     });
     let mnt = lb.mnt().to_path_buf();
