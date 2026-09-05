@@ -446,9 +446,18 @@ operations — the VFS rule, now on the server's side of the wire.
 ## Environment notes and follow-ups
 
 * Kernel 7.0.0-28-generic on both guests. `fs.fuse.max_pages_limit = 256`,
-  which is 1 MiB — the same ceiling the handshake negotiates. Raising both
+  which is 1 MiB — the same ceiling the handshake negotiates. ~~Raising both
   together is a follow-up worth trying, since fuser's `set_max_write` accepts
-  up to 16 MiB and the streaming shapes are per-operation-cost bound.
+  up to 16 MiB and the streaming shapes are per-operation-cost bound.~~
+  **Tried and refuted the same day** on `perf/big-requests` (`00f1672`), which
+  raised the constant to 4 MiB and the sysctl to 4096 pages: sequential writes
+  lost about 30% and reads gained at most 14%. The premise above is the part
+  that was wrong — `2026-08-22-big-requests.md` measures cost per megabyte as
+  flat across request sizes, so the fixed per-request part is small next to the
+  per-byte part, and a larger request buys nothing while trading away the
+  pipelining depth that does pay. A 16 MiB ceiling remains untried in the
+  literal sense, but the trend runs against it: at `bs=16M` the *smaller*
+  request won both directions. Do not re-run this without a new reason.
 * The kernel caps `set_max_readahead` at the bdi's `read_ahead_kb`, which
   reads 128 on the client's FUSE mount. lbfs asks for 1 MiB of readahead and
   gets 128 KiB. Buffered sequential reads thus fetch in 128 KiB steps
