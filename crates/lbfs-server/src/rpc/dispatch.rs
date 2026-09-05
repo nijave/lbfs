@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use lbfs_proto::frame::{MAX_BODY_SIZE, STATUS_OK};
+use lbfs_proto::frame::{FLAG_FORCE_SYNC, MAX_BODY_SIZE, STATUS_OK};
 use lbfs_proto::ops::*;
 use lbfs_proto::types::XattrReply;
 use lbfs_proto::Errno;
@@ -47,9 +47,17 @@ impl DataPayload {
     }
 }
 
-/// `(status, body, data)` — exactly what the writer task needs to build a
-/// frame. `status` is `STATUS_OK` or a raw errno.
-pub type Reply = (u16, Vec<u8>, Option<DataPayload>);
+/// Exactly what the writer task needs to build a frame.
+pub struct Reply {
+    /// `STATUS_OK` or a raw errno.
+    pub status: u16,
+    /// The reply frame's flags. Zero for everything but a forced sync this
+    /// server performed, which echoes `FLAG_FORCE_SYNC` — see
+    /// [`force_sync_ack`].
+    pub flags: u16,
+    pub body: Vec<u8>,
+    pub data: Option<DataPayload>,
+}
 
 /// Decode the request body or answer `EINVAL`.
 ///
@@ -66,7 +74,12 @@ macro_rules! decode {
 
 fn ok<T: Serialize>(v: &T) -> Reply {
     match postcard::to_allocvec(v) {
-        Ok(body) => (STATUS_OK, body, None),
+        Ok(body) => Reply {
+            status: STATUS_OK,
+            flags: 0,
+            body,
+            data: None,
+        },
         // Unreachable for every type in `ops`: postcard's allocating writer
         // has no failure mode for plain data. `EIO` rather than an `unwrap`
         // because a panic here would kill the request task and strand the
@@ -77,11 +90,21 @@ fn ok<T: Serialize>(v: &T) -> Reply {
 
 /// A reply that carries nothing but its status.
 fn done() -> Reply {
-    (STATUS_OK, Vec::new(), None)
+    Reply {
+        status: STATUS_OK,
+        flags: 0,
+        body: Vec::new(),
+        data: None,
+    }
 }
 
 fn err(e: Errno) -> Reply {
-    (e.0, Vec::new(), None)
+    Reply {
+        status: e.0,
+        flags: 0,
+        body: Vec::new(),
+        data: None,
+    }
 }
 
 /// Turn `FsResult<()>` into a reply, for the many ops that answer only success
@@ -93,11 +116,32 @@ fn unit(r: Result<(), Errno>) -> Reply {
     }
 }
 
+/// The same, for the two sync opcodes, marking a forced sync that succeeded.
+///
+/// The acknowledgement rides only a success, and only when the client asked for
+/// one: a failure means no sync happened, and an unforced call means the
+/// durability policy decided rather than the flag. That precision is the whole
+/// value of the bit — a client reads its absence as "this server does not know
+/// the control", so a server that over-claimed would be worse than one that
+/// never answered at all (spec §3.1, §6).
+fn force_sync_ack(r: Result<(), Errno>, force: bool) -> Reply {
+    let mut reply = unit(r);
+    if force && reply.status == STATUS_OK {
+        reply.flags |= FLAG_FORCE_SYNC;
+    }
+    reply
+}
+
 /// An xattr get or list: the length in the body, the bytes in the data segment.
 fn xattr(r: Result<(u32, Vec<u8>), Errno>) -> Reply {
     match r {
         Ok((size, bytes)) => match postcard::to_allocvec(&XattrReply { size }) {
-            Ok(body) => (STATUS_OK, body, Some(DataPayload::Owned(bytes))),
+            Ok(body) => Reply {
+                status: STATUS_OK,
+                flags: 0,
+                body,
+                data: Some(DataPayload::Owned(bytes)),
+            },
             Err(_) => err(Errno::EIO),
         },
         Err(e) => err(e),
@@ -109,12 +153,19 @@ fn xattr(r: Result<(u32, Vec<u8>), Errno>) -> Reply {
 /// `data` is the frame's data segment: a pooled buffer for `WRITE`, an owned
 /// vector for `SETXATTR`, and `None` for everything else — the read loop
 /// refuses a data segment on any other opcode.
+///
+/// `flags` is the request frame's own flags, and only the two sync opcodes read
+/// it. Every other arm ignores it on purpose: the server has never masked flag
+/// bits or refused an unknown one, and preserving that is what let
+/// `FLAG_FORCE_SYNC` go live without a protocol version (spec §3.1).
 pub(crate) async fn dispatch(
     op: Opcode,
+    flags: u16,
     body: &[u8],
     data: Option<DataPayload>,
     fs: &Arc<dyn FileSystem>,
 ) -> Reply {
+    let force = flags & FLAG_FORCE_SYNC != 0;
     match op {
         Opcode::Lookup => {
             let req = decode!(LookupRequest, body);
@@ -205,7 +256,12 @@ pub(crate) async fn dispatch(
             // The read loop has already refused a `size` past the negotiated
             // maximum, so the pooled buffer this fills is within its capacity.
             match fs.read(req.node, req.fh, req.offset, req.size).await {
-                Ok(buf) => (STATUS_OK, Vec::new(), Some(DataPayload::Pooled(buf))),
+                Ok(buf) => Reply {
+                    status: STATUS_OK,
+                    flags: 0,
+                    body: Vec::new(),
+                    data: Some(DataPayload::Pooled(buf)),
+                },
                 Err(e) => err(e),
             }
         }
@@ -240,7 +296,7 @@ pub(crate) async fn dispatch(
         }
         Opcode::Fsync => {
             let req = decode!(FsyncRequest, body);
-            unit(fs.fsync(req.node, req.fh, req.datasync, false).await)
+            force_sync_ack(fs.fsync(req.node, req.fh, req.datasync, force).await, force)
         }
         Opcode::Fallocate => {
             let req = decode!(FallocateRequest, body);
@@ -307,7 +363,10 @@ pub(crate) async fn dispatch(
         }
         Opcode::Fsyncdir => {
             let req = decode!(FsyncdirRequest, body);
-            unit(fs.fsyncdir(req.node, req.dh, req.datasync, false).await)
+            force_sync_ack(
+                fs.fsyncdir(req.node, req.dh, req.datasync, force).await,
+                force,
+            )
         }
         Opcode::Statfs => {
             let req = decode!(StatfsRequest, body);
