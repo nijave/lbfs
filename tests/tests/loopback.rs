@@ -54,7 +54,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -658,6 +658,307 @@ fn file_content_round_trips_with_the_writeback_cache() {
 #[ignore = "mounts a real filesystem; run with `make test-loopback`"]
 fn file_content_round_trips_without_the_writeback_cache() {
     file_content_round_trips(false);
+}
+
+/// Two threads, two `O_DIRECT` descriptors, one file, one moment.
+///
+/// This is the shape the mount used to serialise. With only `FOPEN_KEEP_CACHE`
+/// on the reply, every `O_DIRECT` write went through `fuse_cache_write_iter`,
+/// which holds `inode_lock` from `fs/fuse/file.c:1494` to `file.c:1525` —
+/// across the whole round trip, because a `pwrite` is a synchronous iocb — and
+/// four threads on one file measured 0.98 × one thread. With
+/// `FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES` the same writes take
+/// `inode_lock_shared` (`file.c:1432-1450`) and overlap.
+///
+/// **A loopback mount cannot prove they overlapped.** One host, one runtime,
+/// and no honest timing floor to compare against. What it proves is that
+/// nothing was lost, torn or misplaced once the kernel let them run together,
+/// which is the failure this change could actually introduce. The parallelism
+/// itself is a VM measurement; see the plan's acceptance section.
+///
+/// Three shapes ride along, because each reaches a different branch of
+/// `fuse_dio_wr_exclusive_lock`:
+///
+/// * the file gets its size through an `O_DIRECT` `CREATE`, so the create path
+///   answers with the same reply the open path does (`fs/fuse/dir.c:887`);
+/// * the concurrent pair writes inside that size, which is the only case the
+///   kernel runs shared (`file.c:1419-1421`);
+/// * a second pair writes past the end, which the kernel keeps exclusive, and
+///   which must still land both blocks.
+fn two_direct_writers_on_one_file_both_land(writeback: bool) {
+    const BLOCK: usize = 64 * 1024;
+
+    let mut lb = Loopback::start(Opts {
+        writeback,
+        ..Opts::default()
+    });
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+    let path = mnt.join("shared.dat");
+
+    // Created and sized through an `O_DIRECT` descriptor, so this half
+    // exercises the `CREATE` reply rather than the `OPEN` reply. Zeros rather
+    // than `set_len`, so the concurrent writes below land on real blocks.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+            .unwrap();
+        f.write_all(&vec![0u8; 2 * BLOCK]).unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        2 * BLOCK as u64,
+        "the O_DIRECT create did not reach its full size"
+    );
+
+    // Inside the end of file: the shared-lock case.
+    std::thread::scope(|s| {
+        for (mark, offset) in [(b'b', 0u64), (b'c', BLOCK as u64)] {
+            let path = path.clone();
+            s.spawn(move || {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .unwrap();
+                f.write_all_at(&vec![mark; BLOCK], offset).unwrap();
+            });
+        }
+    });
+
+    // Past the end of file: the exclusive fallback. Both must still land, and
+    // the file must end up exactly twice as long.
+    std::thread::scope(|s| {
+        for (mark, offset) in [(b'd', 2 * BLOCK as u64), (b'e', 3 * BLOCK as u64)] {
+            let path = path.clone();
+            s.spawn(move || {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .unwrap();
+                f.write_all_at(&vec![mark; BLOCK], offset).unwrap();
+            });
+        }
+    });
+
+    // Read the export directly, behind the mount's back: a mount that only
+    // agrees with itself would pass every assertion made through it.
+    let landed = std::fs::read(export.join("shared.dat")).unwrap();
+    assert_eq!(landed.len(), 4 * BLOCK, "the export has the wrong length");
+    for (i, mark) in (*b"bcde").into_iter().enumerate() {
+        let block = &landed[i * BLOCK..(i + 1) * BLOCK];
+        assert!(
+            block.iter().all(|&b| b == mark),
+            "block {i} is not a solid run of {:?}; first wrong byte at {:?}",
+            mark as char,
+            block.iter().position(|&b| b != mark)
+        );
+    }
+
+    lb.unmount();
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn two_direct_writers_on_one_file_both_land_with_the_writeback_cache() {
+    two_direct_writers_on_one_file_both_land(true);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn two_direct_writers_on_one_file_both_land_without_the_writeback_cache() {
+    two_direct_writers_on_one_file_both_land(false);
+}
+
+/// Two appenders, one file, both `O_DIRECT`, both mount shapes.
+///
+/// Append is the one write shape this change deliberately leaves alone, and
+/// the reason is a single line: `fuse_dio_wr_exclusive_lock` returns true for
+/// `IOCB_APPEND` before it looks at anything else
+/// (`fs/fuse/file.c:1412-1413`), because an append has to know the eventual end
+/// of the file. So two appenders serialise, and this test says so by insisting
+/// that each block arrives whole.
+///
+/// Both mount shapes, because the server reads `O_APPEND` differently in each
+/// and only one of them can be wrong at a time:
+///
+/// * **writeback on** — the server strips `O_APPEND` from its own descriptor,
+///   and the client's kernel picks the offset itself through
+///   `generic_write_checks` (`file.c:1792` on the direct path, `file.c:1496` on
+///   the cached one) while holding the exclusive lock. Two appends that raced
+///   would overwrite one another and the file would come out short.
+/// * **writeback off** — the server keeps `O_APPEND`, and the export's own
+///   kernel places the bytes at the true end of the file, so a stale client
+///   `i_size` costs nothing.
+///
+/// The direct path also skips the `fuse_update_attributes(STATX_SIZE |
+/// STATX_MODE)` that opens `fuse_cache_write_iter` (`file.c:1482-1486`). That
+/// is exactly the refresh the writeback cache already answered locally, so the
+/// offset arithmetic must come out the same. This test is what says it did.
+fn appends_stay_whole_with_direct_io(writeback: bool) {
+    const BLOCK: usize = 64 * 1024;
+
+    let mut lb = Loopback::start(Opts {
+        writeback,
+        ..Opts::default()
+    });
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+    let path = mnt.join("appended.dat");
+
+    std::fs::write(&path, vec![b'a'; BLOCK]).unwrap();
+
+    std::thread::scope(|s| {
+        for mark in *b"bc" {
+            let path = path.clone();
+            s.spawn(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .unwrap();
+                f.write_all(&vec![mark; BLOCK]).unwrap();
+            });
+        }
+    });
+
+    let landed = std::fs::read(export.join("appended.dat")).unwrap();
+    assert_eq!(
+        landed.len(),
+        3 * BLOCK,
+        "two appends of {BLOCK} bytes onto {BLOCK} bytes must give 3 blocks; \
+         a short file means the two appends chose the same offset"
+    );
+    assert!(landed[..BLOCK].iter().all(|&b| b == b'a'));
+
+    // Order is nobody's business — the exclusive lock says one goes first, not
+    // which. Wholeness is: neither block may carry a byte of the other.
+    let second = &landed[BLOCK..2 * BLOCK];
+    let third = &landed[2 * BLOCK..];
+    let mut marks = [second[0], third[0]];
+    marks.sort_unstable();
+    assert_eq!(marks, [b'b', b'c'], "one appender's block never arrived");
+    assert!(second.iter().all(|&b| b == second[0]), "block two is torn");
+    assert!(third.iter().all(|&b| b == third[0]), "block three is torn");
+
+    // One more append through an ordinary descriptor, to prove the cached path
+    // still agrees with the direct one about where the end of the file is.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"tail").unwrap();
+        f.sync_all().unwrap();
+    }
+    let landed = std::fs::read(export.join("appended.dat")).unwrap();
+    assert_eq!(landed.len(), 3 * BLOCK + 4);
+    assert_eq!(&landed[3 * BLOCK..], b"tail");
+
+    lb.unmount();
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn appends_stay_whole_with_direct_io_and_the_writeback_cache() {
+    appends_stay_whole_with_direct_io(true);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn appends_stay_whole_with_direct_io_without_the_writeback_cache() {
+    appends_stay_whole_with_direct_io(false);
+}
+
+/// One file, two descriptors, one of them direct — the mixed-access promise of
+/// spec §7, checked in both directions.
+///
+/// Opening the cached descriptor puts the inode into caching mode
+/// (`fs/fuse/iomode.c:238`, `iomode.c:63-65`), which sends every direct write
+/// back to the exclusive lock (`fs/fuse/file.c:1416-1417`). That costs the
+/// parallelism and buys back today's behaviour, so nothing here can regress
+/// into a race. What it must not cost is coherence, and coherence comes from
+/// the direct path doing its own page work: a flush before the transfer
+/// (`file.c:1667-1673`), an invalidate before a write (`file.c:1682-1688`) and
+/// another after it (`file.c:1741-1748`).
+///
+/// So: a direct write must be visible to a cached reader with no flush, and a
+/// cached write must be visible to a direct reader with no `fsync`. Neither
+/// test calls `sync_all`, on purpose — an explicit flush would prove nothing.
+fn cached_and_direct_descriptors_stay_coherent(writeback: bool) {
+    const BLOCK: usize = 64 * 1024;
+
+    let mut lb = Loopback::start(Opts {
+        writeback,
+        ..Opts::default()
+    });
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+    let path = mnt.join("mixed.dat");
+
+    std::fs::write(&path, vec![b'a'; 2 * BLOCK]).unwrap();
+
+    let cached = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let direct = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&path)
+        .unwrap();
+
+    // Direct write, cached read. The direct path invalidated the range, so the
+    // cached descriptor has to go back to the server for it.
+    direct.write_all_at(&vec![b'b'; BLOCK], 0).unwrap();
+    let mut seen = vec![0u8; BLOCK];
+    cached.read_exact_at(&mut seen, 0).unwrap();
+    assert!(
+        seen.iter().all(|&b| b == b'b'),
+        "the cached descriptor served stale pages after a direct write"
+    );
+
+    // Cached write, direct read, no flush in between. The direct read's own
+    // `filemap_write_and_wait_range` is what has to push the dirty page out.
+    cached
+        .write_all_at(&vec![b'c'; BLOCK], BLOCK as u64)
+        .unwrap();
+    let mut seen = vec![0u8; BLOCK];
+    direct.read_exact_at(&mut seen, BLOCK as u64).unwrap();
+    assert!(
+        seen.iter().all(|&b| b == b'c'),
+        "the direct descriptor read around a dirty page instead of flushing it"
+    );
+
+    // Both descriptors closed before the export is inspected: the second block
+    // only has to reach the server by the time the cached handle is gone.
+    drop(direct);
+    drop(cached);
+
+    let landed = std::fs::read(export.join("mixed.dat")).unwrap();
+    assert_eq!(landed.len(), 2 * BLOCK);
+    assert!(landed[..BLOCK].iter().all(|&b| b == b'b'));
+    assert!(landed[BLOCK..].iter().all(|&b| b == b'c'));
+
+    lb.unmount();
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn cached_and_direct_descriptors_stay_coherent_with_the_writeback_cache() {
+    cached_and_direct_descriptors_stay_coherent(true);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn cached_and_direct_descriptors_stay_coherent_without_the_writeback_cache() {
+    cached_and_direct_descriptors_stay_coherent(false);
 }
 
 /// Unmounting is the drain, and the drain is what the shipped binary leans on.

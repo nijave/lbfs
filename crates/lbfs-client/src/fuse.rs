@@ -423,15 +423,48 @@ fn capabilities(writeback: bool) -> Vec<Capability> {
     caps
 }
 
-/// Flags on an `OPEN`/`CREATE` reply.
+/// Flags on an `OPEN`/`CREATE` reply, decided from the application's own open
+/// flags.
 ///
-/// `FOPEN_KEEP_CACHE` unconditionally (spec §7): without it the kernel throws
+/// `FOPEN_KEEP_CACHE` on every reply (spec §7): without it the kernel throws
 /// away an inode's cached pages on every open, so a file read twice is fetched
 /// twice. One client owns the export, so nothing can invalidate that cache
 /// behind the mount's back, and this holds whether or not writes are cached —
-/// `--no-writeback` turns off dirty-page aggregation, not reading.
-fn open_flags() -> FopenFlags {
-    FopenFlags::FOPEN_KEEP_CACHE
+/// `--no-writeback` turns off dirty-page aggregation, not reading. It holds on
+/// the direct reply too, because the bit governs the inode's pages rather than
+/// this handle's, and a buffered reader on the same file still wants them.
+///
+/// `FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES` when the application asked
+/// for `O_DIRECT`, and only then. `fuse_file_write_iter` routes on this reply
+/// rather than on the application's flag (`fs/fuse/file.c:1843-1849`), so
+/// without the first bit even an `O_DIRECT` write goes through
+/// `fuse_cache_write_iter`, which holds `i_rwsem` exclusively from
+/// `file.c:1494` to `file.c:1525` — across the whole round trip, since a
+/// `pwrite` is a synchronous iocb. That is why four threads writing one file
+/// measure 0.98 × one thread. The second bit is the one that relaxes the lock:
+/// `fuse_dio_wr_exclusive_lock` returns false only for a reply that carries it
+/// (`file.c:1405-1406`), and `fuse_dio_lock` then takes `inode_lock_shared`
+/// (`file.c:1436`). The kernel keeps three shapes exclusive whatever this
+/// function says — appends (`file.c:1412-1413`), writes past the end of file
+/// (`file.c:1419-1421`), and any inode that also has a cached descriptor open
+/// (`file.c:1416-1417`) — which is what makes the relaxation safe rather than
+/// merely fast.
+///
+/// The two direct bits ship as a pair because the kernel demands it:
+/// `fuse_file_io_open` deletes the parallel bit from any reply lacking
+/// `FOPEN_DIRECT_IO` (`fs/fuse/iomode.c:220-221`).
+///
+/// The server sees none of this. It receives the same flags in
+/// `OpenRequest`/`CreateRequest` and goes on stripping `O_DIRECT` from its own
+/// descriptor, which is a different question — the FUSE flag means "keep this
+/// handle out of the client's page cache" and demands no alignment from
+/// anybody. Spec §6 and §7 say it at length.
+fn open_flags(app_flags: OpenFlags) -> FopenFlags {
+    let mut flags = FopenFlags::FOPEN_KEEP_CACHE;
+    if app_flags.0 & libc::O_DIRECT != 0 {
+        flags |= FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES;
+    }
+    flags
 }
 
 /// Whether this `WRITE` must clear set-user-ID and set-group-ID first.
@@ -941,7 +974,7 @@ impl fuser::Filesystem for LbfsFuse {
         let (conn, _) = self.ctx();
         self.rt.spawn(async move {
             match conn.open(ino, flags.0 as u32).await {
-                Ok(fh) => reply.opened(FileHandle(fh), open_flags()),
+                Ok(fh) => reply.opened(FileHandle(fh), open_flags(flags)),
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -968,7 +1001,7 @@ impl fuser::Filesystem for LbfsFuse {
                     &to_fuse_attr(e.node, &e.attr),
                     Generation(e.generation),
                     FileHandle(fh),
-                    open_flags(),
+                    open_flags(OpenFlags(flags)),
                 ),
                 Err(e) => reply.error(errno(e)),
             }
@@ -1779,12 +1812,78 @@ mod tests {
         assert!(capabilities(false).iter().all(|c| !c.required));
     }
 
+    /// The whole change, stated as a table.
+    ///
+    /// An open carrying `O_DIRECT` comes back on the kernel's direct path with
+    /// the parallel-write bit; every other open keeps the cached reply it has
+    /// always had. `fuse_file_write_iter` routes on this reply and not on the
+    /// application's own flag (`fs/fuse/file.c:1843-1849`), which is why an
+    /// `O_DIRECT` write serialises today.
+    #[test]
+    fn only_an_o_direct_open_gets_the_direct_io_reply() {
+        let direct = FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES;
+
+        for plain in [
+            libc::O_RDONLY,
+            libc::O_WRONLY,
+            libc::O_RDWR,
+            libc::O_RDWR | libc::O_APPEND,
+            libc::O_WRONLY | libc::O_SYNC,
+            libc::O_RDONLY | libc::O_NONBLOCK,
+        ] {
+            let reply = open_flags(OpenFlags(plain));
+            assert_eq!(reply, FopenFlags::FOPEN_KEEP_CACHE, "flags {plain:#o}");
+            assert!(!reply.intersects(direct), "flags {plain:#o}");
+        }
+
+        // `O_APPEND | O_DIRECT` belongs in the direct set even though every
+        // append takes the exclusive lock anyway (`file.c:1412-1413`): the
+        // reply describes the handle, and the kernel decides per write.
+        for flags in [
+            libc::O_RDONLY | libc::O_DIRECT,
+            libc::O_WRONLY | libc::O_DIRECT,
+            libc::O_RDWR | libc::O_DIRECT,
+            libc::O_RDWR | libc::O_DIRECT | libc::O_APPEND,
+            libc::O_WRONLY | libc::O_DIRECT | libc::O_SYNC,
+        ] {
+            let want = FopenFlags::FOPEN_KEEP_CACHE | direct;
+            assert_eq!(open_flags(OpenFlags(flags)), want, "flags {flags:#o}");
+        }
+    }
+
+    /// `FOPEN_PARALLEL_DIRECT_WRITES` means nothing on its own. The kernel
+    /// deletes it from any reply that did not also carry `FOPEN_DIRECT_IO`
+    /// (`fs/fuse/iomode.c:220-221`), and the only code that reads it sits
+    /// behind `fuse_direct_write_iter` (`file.c:1405`, reached from
+    /// `file.c:1844-1845`). The two bits travel together or not at all.
+    #[test]
+    fn the_parallel_write_bit_never_travels_alone() {
+        for flags in [
+            libc::O_RDONLY,
+            libc::O_WRONLY | libc::O_DIRECT,
+            libc::O_RDWR | libc::O_APPEND,
+            libc::O_RDWR | libc::O_DIRECT | libc::O_SYNC,
+        ] {
+            let reply = open_flags(OpenFlags(flags));
+            if reply.contains(FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES) {
+                assert!(reply.contains(FopenFlags::FOPEN_DIRECT_IO), "{flags:#o}");
+            }
+        }
+    }
+
     /// Re-reads stay local whether or not writes are cached: `--no-writeback`
     /// turns off dirty-page aggregation, not the page cache.
+    ///
+    /// The direct reply keeps the bit too. `FOPEN_KEEP_CACHE` governs the
+    /// *inode's* pages rather than the handle's, and `fuse_open` invalidates
+    /// the whole mapping when a reply omits it (`fs/fuse/file.c:292-293`), so
+    /// dropping it here would let one `O_DIRECT` open throw away the cache a
+    /// buffered reader on the same file is still using.
     #[test]
     fn opens_keep_the_page_cache() {
-        assert!(open_flags().contains(FopenFlags::FOPEN_KEEP_CACHE));
-        assert!(!open_flags().contains(FopenFlags::FOPEN_DIRECT_IO));
+        for flags in [libc::O_RDONLY, libc::O_RDWR | libc::O_DIRECT] {
+            assert!(open_flags(OpenFlags(flags)).contains(FopenFlags::FOPEN_KEEP_CACHE));
+        }
     }
 
     /// `fuser` has no `set_max_read`, so the negotiated ceiling can only reach

@@ -315,7 +315,14 @@ is narrower than v1 shipped with, so the design accepts the window.
   option exists to remove). The same trade as an NFS `async` export: latency
   for crash-durability. Documented loudly.
 
-Writes otherwise land in the server page cache (no `O_DIRECT` in v1).
+Writes otherwise land in the server page cache: the server never puts
+`O_DIRECT` on its own descriptor, because the buffer pool offers no alignment
+guarantee (§5.1). That is a statement about the *server's* file, and it does
+not conflict with §7's per-open direct I/O on the client. The two words mean
+different things — `FOPEN_DIRECT_IO` tells the client's kernel to keep one
+handle out of its page cache and demands no alignment of anybody, while
+`O_DIRECT` on the export would demand aligned block I/O. Setting the first and
+stripping the second is one coherent position.
 A future control message will force a real sync regardless of this setting;
 §3.1 reserves frame flag bit 1 for it now (§11).
 
@@ -338,6 +345,41 @@ A future control message will force a real sync regardless of this setting;
   **writeback cache** on (kernel aggregates small writes — the biggest win
   for build workloads); `keep_cache` so re-reads stay local; `readdirplus`
   on; `max_write`/`max_readahead` = negotiated max I/O size.
+- **Per-open direct I/O:** an `OPEN` or `CREATE` whose flags carry `O_DIRECT`
+  comes back with `FOPEN_KEEP_CACHE | FOPEN_DIRECT_IO |
+  FOPEN_PARALLEL_DIRECT_WRITES`; every other open comes back with
+  `FOPEN_KEEP_CACHE` alone. The client decides this by itself from the flags
+  fuser hands its `open` and `create` callbacks; nothing crosses the wire and
+  the server's view of the open never changes.
+
+  Without `FOPEN_DIRECT_IO` the kernel routes even an `O_DIRECT` write
+  through `fuse_cache_write_iter`, which holds the exclusive `i_rwsem` across
+  the whole round trip, so four threads writing one file measure 0.98 × one
+  thread. With both bits, a write that stays inside the file's current size
+  takes the shared lock and overlaps its neighbours. Three shapes stay
+  exclusive because the kernel keeps them so: appends, writes past the end of
+  file, and any inode that also has a non-direct descriptor open.
+
+  `FOPEN_KEEP_CACHE` rides the direct reply as well. The bit governs the
+  *inode's* page cache rather than the handle's, so dropping it would make
+  every `O_DIRECT` open discard pages a buffered reader on the same file is
+  still using. Coherence between the two comes from the direct path itself,
+  which flushes and invalidates the page range it touches before the transfer
+  and again after.
+
+  **What the mount promises about mixed access.** A direct descriptor and a
+  cached descriptor on one inode stay coherent at page granularity, and
+  neither reads bytes the other has already written. The pair gives up speed
+  instead: while any cached descriptor stays open, direct writes serialise
+  exactly as they did before this behaviour existed.
+
+  **What it costs.** `mmap(MAP_SHARED)` on a descriptor the application
+  opened `O_DIRECT` now fails `ENODEV`. The kernel allows that combination
+  only under `FUSE_DIRECT_IO_ALLOW_MMAP`, an `INIT` capability this mount
+  chooses not to negotiate — a shared mapping beside parallel direct writes
+  raises coherence questions v1 leaves unanswered. `MAP_PRIVATE` on such a
+  descriptor still works, and `mmap` on an ordinary open keeps its behaviour.
+  §11 carries the follow-up.
 - **Kill-priv capability:** beside those cache flags the client requests one
   more capability at FUSE `INIT`: `FUSE_HANDLE_KILLPRIV_V2` (§5.3).
 
@@ -600,6 +642,18 @@ Future work:
   using `fallocate` keeps suid bits it promised to clear. Same shape as the
   `copy_file_range` fix on the kill-priv branch — the strip call and a
   forced-policy test.
+- **`FUSE_DIRECT_IO_ALLOW_MMAP`.** Would restore `mmap(MAP_SHARED)` on an
+  `O_DIRECT` descriptor (§7). fuser 0.18 reaches the bit — `FUSE_INIT_EXT`
+  and `flags2` both ship — so the mechanism is one more `Capability` entry
+  in `capabilities()`. Take it only after answering what a shared mapping
+  means for coherence beside parallel direct writes; the kernel gate exists
+  because that combination is subtle, not because the bit was hard to set.
+- **A server-decided `OPEN` reply.** `OpenReply` carries only `fh` today, and
+  the client picks its own FUSE reply flags (§7). A server that wanted to force
+  or veto direct I/O per file — a policy engine, or a backend that knows a file
+  is on tape — would add a `flags` field there and a protocol version bump. The
+  field does not exist yet because nothing has needed it, and inventing it
+  would put FUSE vocabulary inside the `FileSystem` trait (§5.1).
 
 Noted and deferred:
 

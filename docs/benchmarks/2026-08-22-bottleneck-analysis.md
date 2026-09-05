@@ -293,7 +293,12 @@ clearing the privileged mode bits itself — would be worth about 90 µs on a
 
 **Concurrent writers to one file gain nothing at all.** The per-inode
 exclusive lock in the kernel's write path pins throughput at the single-writer
-rate no matter how many threads push. Only separate files scale.
+rate no matter how many threads push. Only separate files scale. (Phase 9
+below lifts this for opens that ask for `O_DIRECT`: answering them with
+`FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES` moves those writes to the
+shared lock, and four writers on one file then reach 89 % of four writers on
+four files. Every other open still measures exactly what this paragraph
+says.)
 
 **Per-megabyte software cost bounds streaming reads and writes, rather than
 concurrency or the network.** Raw RPC tops out near 2.3 GB/s read and
@@ -553,3 +558,84 @@ them already carrying tokio workers, so a second reader of /dev/fuse competes
 for a core rather than finding an idle one. The knob stays worth keeping for a
 guest with four or more vCPUs running many files concurrently — the shape that
 scaled 2.66× in the Phase 4 ladder — and worth leaving off everywhere else.
+
+## Phase 9: the per-inode write lock, lifted
+
+The mount answered every `OPEN` with `FOPEN_KEEP_CACHE` alone, so
+`fuse_file_write_iter` sent even an `O_DIRECT` write to
+`fuse_cache_write_iter` (`fs/fuse/file.c:1843-1849`), which holds `inode_lock`
+across the whole round trip (`file.c:1494`, `file.c:1525`). That is the lock
+behind "four writers on one file deliver 0.98 × one writer" above.
+
+The client now answers an `O_DIRECT` open with `FOPEN_DIRECT_IO |
+FOPEN_PARALLEL_DIRECT_WRITES`, which routes those writes to
+`fuse_direct_write_iter` and lets `fuse_dio_lock` take the shared lock
+(`file.c:1405-1406`, `file.c:1432-1450`) for any write that stays inside the
+file. Appends, extending writes and inodes with a cached descriptor open keep
+the exclusive lock, by the kernel's choice.
+
+Measured on the two-guest pair, both builds carrying the window-permit fix
+that precedes this change. Three rounds, alternating builds round by round
+rather than running one pass after the other, with a server-side drain before
+every job; the figures are medians of three. The interleaving is not
+ceremony — a straight before-then-after pass had the sequential write at
+1065 MB/s in the first pass and 66 MB/s in the second, and re-measuring the
+first build reproduced the second number. That row tracks the host's page
+cache, not the mount, and only alternating separates the two.
+
+| probe | job | control | with the change | |
+|---|---|---|---|---|
+| A | randwrite 4k psync QD1, 4 threads, **1 file** | 6938 IOPS, 576 µs | **15910 IOPS, 250 µs** | **2.29 ×** |
+| A control | randwrite 4k psync QD1, 1 thread, 1 file | 7064 IOPS, 141 µs | 7357 IOPS, 135 µs | 1.04 × |
+| A control | randwrite 4k psync QD1, 4 threads, 4 files | 18030 IOPS, 220 µs | 17909 IOPS, 222 µs | 0.99 × |
+| B | randwrite 4k libaio QD16 | 22795 IOPS, 697 µs | 22673 IOPS, 701 µs | 0.99 × |
+| C | randread 4k psync QD1 | 8445 IOPS, 118 µs | 8417 IOPS, 118 µs | 1.00 × |
+| C | randread 4k libaio QD16 | 42046 IOPS, 376 µs | 42959 IOPS, 369 µs | 1.02 × |
+| C | seq read 1M psync | 1512 MB/s | 1520 MB/s | 1.01 × |
+| C | seq write 1M psync | 85 MB/s | 85 MB/s | 1.00 × |
+| D | randwrite 4k psync QD1, `direct=0` | 34572 IOPS, 26 µs | 35575 IOPS, 26 µs | 1.03 × |
+| D | second `dd` read of a warm file | 8.1 GB/s | 12 GB/s | page cache intact |
+
+**Four writers on one file now reach 89 % of four writers on four files**
+(15910 against 17909), where they reached 38 % before. That ratio is the
+result: the per-inode lock, not the transport, was what separated the two
+shapes, and the shared lock closes nearly the whole gap. Single-writer and
+four-file throughput both stay put, which is what says the win came from
+concurrency rather than from a cheaper write.
+
+**The kernel took the flags, on two independent observations.**
+`mmap(MAP_SHARED)` on an `O_DIRECT` descriptor returns `ENODEV` where it
+mapped before, while an ordinary descriptor still maps — the kernel's own
+signal that it stored `FOPEN_DIRECT_IO` (`file.c:2393-2399`). And counting
+entries into the two write paths during probe B: 171035 calls to
+`fuse_cache_write_iter` and none to `fuse_direct_write_iter` on the control,
+289741 the other way round with the change, with no cross-over in either
+direction. This kernel inlines `fuse_dio_wr_exclusive_lock` itself
+(`grep -c` of `/proc/kallsyms` returns 0), so the lock branch is not directly
+observable; probe A against its four-file control is the measurement that
+stands in for it.
+
+**Probe B does not move, and the reason is that queue depth never needed the
+lock.** The plan expected 4 KiB writes at QD16 to gain what probe A gained,
+and predicted the FUSE event loop as the likely obstacle if they did not.
+They did not, and the event loop is not it: `--fuse-threads 4` measured 36572
+and 36388 IOPS against 37776 and 37237 for the single default loop. The
+explanation is upstream of both. A libaio write is not a synchronous iocb, so
+`fuse_direct_IO` already returned `-EIOCBQUEUED` before this change
+(`file.c:2892-2894`), so the exclusive lock lasted only long enough to queue
+the request rather than spanning the round trip. The lock costs what it costs
+when a `pwrite` waits inside it, which is the psync shape probe A measures.
+Probe B is bimodal on this pair — 22-23k IOPS in the campaign, 37-38k in the
+later runs, on both builds alike — and tracks server-side cache state.
+
+**Buffered opens keep every bit of today's behaviour**, the other half of
+the contract:
+`direct=0` random write holds at ~35k IOPS with the writeback cache still
+aggregating, and a second `dd` of a warm file still comes out of the page
+cache at gigabytes per second, so `FOPEN_KEEP_CACHE` survived on both reply
+shapes.
+
+`mmap(MAP_SHARED)` on an `O_DIRECT` descriptor now returns `ENODEV`. The mount
+declines to negotiate `FUSE_DIRECT_IO_ALLOW_MMAP` on purpose — fuser 0.18
+reaches the bit, so this is a choice about coherence rather than a limit — and
+spec §11 carries the follow-up.
