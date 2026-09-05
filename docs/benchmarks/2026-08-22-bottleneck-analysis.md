@@ -159,17 +159,44 @@ the kernel's FUSE layer costs this stack per operation:
 \* the least throttled 1 MiB write measurement of the day, 869 MB/s during
 the CPU capture. See the anomalies section for the range this job covers.
 
-**(2026-08-28) Do not size new work from this table.** Both columns date from
-2026-08-22, and three changes have landed under them since: the per-write
-`GETXATTR` elimination, the fuser 0.18 upgrade, and the window-permit fix. The
-mount column moved and the raw RPC column did not, because nothing has
-re-measured `lbfs-bench` since — `make build-guest` builds the server and the
-client only, so the load generator never reaches the guest. The two have drifted
-into contradiction: a 4 KiB random write through the mount now runs near 135 µs
-(Phase 9), *below* the 146.4 µs this table charges to the RPC layer alone. A
-mount cannot outrun the transport beneath it, so every "FUSE cost" figure above
-is a 2026-08-22 artefact. Re-measure both columns on the same day before
-quoting any of them.
+**(2026-09-05) Re-measured. Read the table below this paragraph, not the one
+above it.** Three changes landed under both columns after 2026-08-22 — the
+per-write `GETXATTR` elimination, the fuser 0.18 upgrade and the window-permit
+fix — and only the mount column moved, because `vm/deploy.sh` copied the server
+and the client and left `lbfs-bench` on the developer's machine. The two drifted
+into contradiction: the 146.4 µs the table above charges the RPC layer for a
+4 KiB random write sits over the ~135 µs Phase 9 measured through the mount, and
+a mount cannot outrun the transport under it. Both columns below come from one
+interleaved campaign on 2026-09-05 — six rounds, each shape's mount job and RPC
+job back to back inside a round, the server drained before every job. Phase 10
+carries the method, the per-round figures and the spread.
+
+| shape | mount | raw RPC | FUSE cost |
+|---|---|---|---|
+| randread 4k qd1 | 121.1 µs | 88.5 µs | +31.6 µs (+36%) |
+| randwrite 4k qd1 | 184.6 µs | 149.4 µs | +36.6 µs (+24%) |
+| randread 4k qd16 | 366.7 µs | 280.1 µs | +86.1 µs (+31%) |
+| seq read 1M qd1 | 570.2 µs | 379.7 µs | +190.0 µs (+50%) |
+| seq write 1M qd1 | 754.0 µs | 597.2 µs | +148.9 µs (+25%)† |
+
+Each figure is a median of six 15 s runs, and the cost column takes the median
+of the six within-round differences rather than subtracting two medians, since
+each pair shares a round.
+
+† the two columns of this row drift apart during the campaign — its per-round
+difference runs from 86 µs to 284 µs while the mount holds still and the RPC
+side speeds up. Phase 10 shows the drift. Read this row as a range, not as a
+figure.
+
+One row changed character; the rest kept theirs. FUSE charges a 4 KiB write
+36.6 µs and a 4 KiB read 31.6 µs, where 2026-08-22 read +150 µs against +27 µs.
+That +150 µs was the `security.capability` probe's round trip, which Phase 8
+removed, and what remains costs a write about what it costs a read. The three
+read rows move by 11-17% and keep their ordering. The 1 MiB write row drops from
++444 µs to +149 µs, which indicts the throttled mount measurement its asterisk
+warns about rather than telling us anything about FUSE. The pipelining claim
+below this table holds too: 9439 IOPS at qd1 against 50576 at qd16 today, the
+same 5.4 ×.
 
 The RPC layer pipelines well once FUSE stops serialising: 4 KiB random reads
 go from 9086 IOPS at qd1 to 48766 at qd16, a 5.4 × gain on 16 × the depth.
@@ -496,6 +523,15 @@ operations — the VFS rule, now on the server's side of the wire.
   stale** (2026-08-28): both RPC numbers predate kill-priv, fuser 0.18 and the
   window-permit fix, and nothing has re-measured them — see the note under the
   Phase 5 table. Re-run `lbfs-bench` before quoting a gap in microseconds.
+  **Re-measured 2026-09-05, and the gap holds** (Phase 10): over the network a
+  4 KiB write costs 149.4 µs against the read's 88.5 µs, which is 61 µs by the
+  mean and 39 µs by the median, beside the 54 µs of 2026-08-22. The write side
+  itself barely moved — 146.4 µs then, 149.4 µs now — so kill-priv, fuser 0.18
+  and the window-permit fix all landed above the server's write handling rather
+  than in it. At 1 MiB the same gap runs 218 µs by the mean and 157 µs by the
+  median. This campaign left the loopback pair alone, so the 26 µs end of the
+  range above stays a 2026-08-22 figure. Both spec §11 items keep their
+  evidence.
 
 ## Cleanup performed
 
@@ -670,3 +706,137 @@ shapes.
 declines to negotiate `FUSE_DIRECT_IO_ALLOW_MMAP` on purpose — fuser 0.18
 reaches the bit, so this is a choice about coherence rather than a limit — and
 spec §11 carries the follow-up.
+
+## Phase 10: both columns on one day (2026-09-05)
+
+`vm/deploy.sh` now installs `lbfs-bench` on the client guest beside
+`lbfs-client` (branch `build/deploy-lbfs-bench`, `47a7a18`), which is what put
+the raw-RPC column back in reach. The bin target always existed and
+`make build-guest` always emitted it; the deploy step copied two binaries and
+left the third in `target/guest/release`. Both guests run the `main` code at
+`3a906b8`: server `26c6dff9fb226581980ea521c123b5c0`, client
+`f89f37e8ad78bfde568548baac31e062`, bench `682f5f11cb8f46be7c3a68cb6d72ff22`.
+Kernel 7.0.0-28-generic on both, fio 3.41, two vCPUs and 1962 MB each.
+
+**Method.** One file — `rpcbench.dat`, 512 MiB, directly under the export root,
+grown to full size before the first timed job and addressed by both columns.
+fio reaches it through `/mnt/lbfs` with `direct=1`; `lbfs-bench` reaches the
+same bytes over the wire at `192.168.77.10:9423` with no FUSE anywhere. Six
+rounds of five shapes, 15 s per job: inside a round each shape runs its mount
+job and then its RPC job, and the server drains (`sync`, then poll
+`/proc/meminfo` until `Dirty + Writeback` falls under 8 MB) before each of the
+ten jobs. Phase 9 explains why the two columns alternate instead of following
+one another — a straight column-then-column pass on this pair once produced a
+16 × swing that re-running the first configuration reproduced. The mount stayed
+up throughout and sat idle during the RPC jobs.
+
+Mean latency per operation, one figure per round, in round order:
+
+| shape | mount, six rounds (µs) | raw RPC, six rounds (µs) |
+|---|---|---|
+| randread 4k qd1 | 120.5 121.6 125.8 119.1 119.9 122.2 | 90.6 90.9 89.1 87.8 88.0 86.7 |
+| randwrite 4k qd1 | 194.2 191.6 188.3 178.3 181.0 179.5 | 156.0 154.7 154.3 144.3 144.4 142.9 |
+| randread 4k qd16 | 360.6 371.6 367.2 367.1 366.3 364.0 | 277.3 279.4 280.8 281.4 281.8 276.8 |
+| seq read 1M qd1 | 564.4 570.5 576.6 568.7 570.0 588.6 | 382.2 385.4 379.8 379.0 379.6 368.0 |
+| seq write 1M qd1 | 776.2 756.2 747.6 744.6 751.7 841.9 | 689.7 672.6 622.3 572.2 546.1 557.9 |
+
+The within-round difference, which is the FUSE layer's price on this stack:
+
+| shape | mount − RPC, six rounds (µs) | median |
+|---|---|---|
+| randread 4k qd1 | 29.9 30.7 36.7 31.3 31.9 35.5 | **31.6** |
+| randwrite 4k qd1 | 38.2 36.9 34.0 34.0 36.6 36.6 | **36.6** |
+| randread 4k qd16 | 83.3 92.2 86.4 85.7 84.5 87.2 | **86.1** |
+| seq read 1M qd1 | 182.2 185.1 196.8 189.7 190.4 220.6 | **190.0** |
+| seq write 1M qd1 | 86.5 83.6 125.3 172.4 205.6 284.0 | **148.9** |
+
+The three 4 KiB rows hold inside a 9 µs band across all six rounds, and the
+1 MiB read stays within 16% of its median. The 1 MiB write walks: its RPC side
+speeds up from 690 µs to 546 µs over the campaign while its mount side holds
+near 750 µs, and the difference grows with the gap. That is the shape this
+document has flagged since the method note at the top — server page-cache
+writeback owns it, and no drain reaches the state it accumulates.
+
+Rounds 1-3 and rounds 4-6 ran as two passes about ten minutes apart, the second
+identical to the first except that fio also reported percentiles. The
+per-round differences above cross that boundary without a step, which is the
+point of taking them within a round.
+
+Throughput at the medians:
+
+| shape | mount | raw RPC |
+|---|---|---|
+| randread 4k qd1 | 8203 IOPS, 121.1 µs | 9439 IOPS, 88.5 µs |
+| randwrite 4k qd1 | 5382 IOPS, 184.6 µs | 5996 IOPS, 149.4 µs |
+| randread 4k qd16 | 43175 IOPS, 366.7 µs | 50576 IOPS, 280.1 µs |
+| seq read 1M qd1 | 1751 MB/s, 570.2 µs | 2501 MB/s, 379.7 µs |
+| seq write 1M qd1 | 1315 MB/s, 754.0 µs | 1626 MB/s, 597.2 µs |
+
+**The raw RPC layer barely moved in two weeks**, which is the answer to why the
+Phase 5 table went wrong: the mount column changed under it and this one did
+not. The three 4 KiB shapes land within 4% of their 2026-08-22 mean latencies,
+the 1 MiB read 9% under, the 1 MiB write 14% under:
+
+| shape | 2026-08-22 raw RPC | 2026-09-05 raw RPC |
+|---|---|---|
+| read 4k qd1 rand | 9086 IOPS, 92.2 µs | 9439 IOPS, 88.5 µs |
+| write 4k qd1 rand | 6148 IOPS, 146.4 µs | 5996 IOPS, 149.4 µs |
+| read 4k qd16 rand | 48766 IOPS, 291 µs | 50576 IOPS, 280.1 µs |
+| read 1M qd1 seq | 2272 MB/s, 419 µs | 2501 MB/s, 379.7 µs |
+| write 1M qd1 seq | 1391 MB/s, 698 µs | 1626 MB/s, 597.2 µs |
+
+The three changes left the wire where they found it. Two of them — kill-priv's
+client half and the fuser bump — sit above it by construction, and the third
+pair, the server's own set-user-ID strip and the window-permit release, costs a
+4 KiB write nothing this campaign can see. Reading the last of those as a null
+result for the window-permit fix would go too far: one connection at qd1 and
+qd16 is a mild test of a permit held across a reply write.
+
+**The write tail belongs to the server, and both columns carry it.** At 4 KiB
+the mount's p99 runs 913-1335 µs against a 184.6 µs mean, and the RPC layer's
+p99 runs 840-1223 µs against a 149.4 µs mean, while both read shapes hold p99
+under 180 µs. Medians strip the tail and leave the same picture the means give:
+across the last three rounds, where fio also recorded percentiles, the mount's
+4 KiB write median is 156.7 µs against the RPC layer's 123.7 µs, a difference of
+33.0 µs, beside 31.8 µs for the read at the same statistic. Fifteen seconds of
+4 KiB writing at ~5.4k IOPS dirties ~320 MB on a 1962 MB guest, which is enough
+to meet `balance_dirty_pages` mid-run whatever the drain did beforehand.
+
+**The 4 KiB mount write reads slower today than Phase 9's 135 µs** — 184.6 µs
+by the mean, 156.7 µs by the median. The FUSE difference underneath stays put
+across all six rounds (34.0-38.2 µs), so the shift sits below the FUSE layer:
+this pair, this file, this server cache state. Comparing a mount figure from
+one day against an RPC figure from another is the trap this whole phase exists
+to close, and Phase 9's 135 µs deserves the same caution in the other
+direction.
+
+**Phase 8's open question closes.** It offered two readings of the 145 µs that
+removing the `security.capability` probe saved: either the probe path cost more
+than the 92 µs a bare metadata round trip prices, or the 146.4 µs the raw RPC
+layer charged a 4 KiB write that day ran pessimistic. Today's 149.4 µs sits
+within 3 µs of that 146.4 µs, which rules the second reading out — the RPC layer
+charges a 4 KiB write about what it charged then. The first reading stands: the
+reopen through `/proc` and the `spawn_blocking` hop behind it cost more than a
+`GETATTR` round trip. Today's table also prices the kernel write-path work the
+old arithmetic estimated at ~58 µs — FUSE costs a 4 KiB write 36.6 µs, and that
+figure covers the whole `/dev/fuse` round trip rather than the write path alone.
+
+**The write/read asymmetry in the raw RPC path survives at both sizes.** A
+4 KiB write costs 149.4 µs against the read's 88.5 µs — 61 µs by the mean,
+39 µs by the median (125.5 against 86.3) — where 2026-08-22 measured 146.4
+against 92.2, a 54 µs gap. At 1 MiB the write costs 597.2 µs against the read's
+379.7 µs, 218 µs by the mean and 157 µs by the median. Neither figure includes
+FUSE, and the p99 spread says part of the 4 KiB gap is the server's flusher
+rather than its write handler. The two spec §11 survey items keep their
+evidence, including the NFS comparison: kernel NFS answers a complete 4 KiB
+write in ~104-111 µs, under what lbfs's bare RPC layer charges for one.
+
+### Restore state
+
+* Client guest: `/mnt/lbfs` unmounted, no `lbfs-client` process, the fio driver
+  and its JSON output removed from `/tmp`.
+* Server guest: `rpcbench.dat` deleted, the export empty again, `lbfs-server`
+  active with no restarts.
+* `lbfs-bench` stays at `/usr/local/bin/lbfs-bench` on the client guest, which
+  is where `vm/deploy.sh` now puts it on every deploy.
+* Both domains still running.
