@@ -8,7 +8,11 @@ source "$(dirname "$0")/lib.sh"
 
 BIN="${LBFS_GUEST_BIN:-$REPO_DIR/target/guest/release}"
 
-for b in lbfs-server lbfs-client; do
+# `lbfs-bench` rides along with the client. It is a bin target of the client
+# crate, so `make build-guest` already emits it; what it lacked was a way onto
+# the guest, and a raw-RPC column nobody can re-measure goes stale beside a
+# mount column that moves.
+for b in lbfs-server lbfs-client lbfs-bench; do
   [ -x "$BIN/$b" ] || {
     echo "missing $BIN/$b - run 'make build-guest'" >&2
     exit 1
@@ -57,10 +61,10 @@ if ! vm_ssh "$SERVER_IP" '
   exit 1
 fi
 
-vm_scp "$BIN/lbfs-client" "ubuntu@$CLIENT_IP:/tmp/"
-vm_ssh "$CLIENT_IP" 'sudo install -m755 /tmp/lbfs-client /usr/local/bin/'
+vm_scp "$BIN/lbfs-client" "$BIN/lbfs-bench" "ubuntu@$CLIENT_IP:/tmp/"
+vm_ssh "$CLIENT_IP" 'sudo install -m755 /tmp/lbfs-client /tmp/lbfs-bench /usr/local/bin/'
 
 echo "deployed."
 echo "  server  $SERVER_IP  lbfs-server is $(vm_ssh "$SERVER_IP" 'systemctl is-active lbfs-server') on :$SERVER_PORT, exporting $SERVER_EXPORT"
-echo "  client  $CLIENT_IP  /usr/local/bin/lbfs-client"
+echo "  client  $CLIENT_IP  /usr/local/bin/lbfs-client, /usr/local/bin/lbfs-bench"
 echo "  mount   lbfs-client $SERVER_IP:$SERVER_PORT $SERVER_EXPORT $CLIENT_MOUNT"
