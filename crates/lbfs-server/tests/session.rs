@@ -351,13 +351,88 @@ async fn unknown_opcode_closes_connection() {
     assert!(at_eof(&mut s).await, "unknown opcode is connection-fatal");
 }
 
+/// A client that keeps the window exactly full is not an overrunning client.
+///
+/// The two ends measure the same window from different edges: the client frees
+/// a slot when it *reads* an answer and may spend it again at once, while the
+/// server frees one around the *write*. This holds the window precisely full
+/// for a few thousand rounds — one new request per reply, never more than
+/// eight outstanding at any instant — which is the shape a FUSE writeback
+/// flood produces and the shape a server that miscounts the window kills.
+///
+/// It is a contract test rather than the regression test for the ordering bug
+/// that prompted it. Reaching that bug takes the writer descheduled between
+/// the socket write and the permit drop, a thread-scheduling accident this
+/// reproduces only by luck; the ordering itself is pinned deterministically by
+/// `rpc::tests::the_window_slot_returns_before_the_reply_is_written`.
+/// Multi-threaded regardless, because a current-thread runtime cannot
+/// interleave the writer and the read loop the way a real mount does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permanently_full_window_is_not_an_overrun() {
+    const WINDOW: u64 = 8;
+    const ROUNDS: u64 = 4000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start_server_for(dir.path()).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+
+    let hello = enc(&HelloRequest {
+        magic: MAGIC,
+        version: PROTOCOL_VERSION,
+        max_inflight: WINDOW as u32,
+        max_io_size: 1 << 20,
+        writeback: false,
+    });
+    let (hdr, body) = call(&mut s, 1, Opcode::Hello, &hello).await;
+    assert_eq!(hdr.op_or_status, STATUS_OK);
+    let hello: HelloReply = dec(&body);
+    assert_eq!(hello.max_inflight, WINDOW as u32);
+
+    let attach = enc(&AttachRequest {
+        path: path_bytes(dir.path()),
+    });
+    call(&mut s, 2, Opcode::Attach, &attach).await;
+
+    // GETATTR on the root: the smallest round trip the protocol has, so the
+    // test measures the window and not the backend.
+    let getattr = enc(&GetattrRequest {
+        node: ROOT_NODE,
+        fh: None,
+    });
+
+    let mut next = 100u64;
+    for _ in 0..WINDOW {
+        send(&mut s, next, Opcode::Getattr as u16, 0, &getattr, &[]).await;
+        next += 1;
+    }
+
+    for _ in 0..ROUNDS {
+        // `recv` unwraps, so a server that closed the connection fails here
+        // with a broken pipe or an unexpected EOF rather than hanging.
+        let (hdr, _, _) = recv(&mut s).await;
+        assert_eq!(
+            hdr.op_or_status, STATUS_OK,
+            "request {} answered with status {}",
+            hdr.request_id, hdr.op_or_status
+        );
+        send(&mut s, next, Opcode::Getattr as u16, 0, &getattr, &[]).await;
+        next += 1;
+    }
+
+    for _ in 0..WINDOW {
+        let (hdr, _, _) = recv(&mut s).await;
+        assert_eq!(hdr.op_or_status, STATUS_OK);
+    }
+}
+
 /// More requests in flight than the settled window is a violation.
 ///
 /// Getting there deterministically takes a client that refuses to read: the
-/// permits are released as replies reach the socket, so the only way to hold
-/// them is to stop the replies from draining. Megabyte reads and a window of
-/// eight put far more bytes in the writer than any socket buffer will take, so
-/// the permits stay held while the requests keep arriving.
+/// permits are released as the writer picks each reply up, so the only way to
+/// hold them is to stop the replies from draining. Megabyte reads and a window
+/// of eight put far more bytes in the writer than any socket buffer will take,
+/// so the writer blocks on the first reply and the rest of the permits stay
+/// held while the requests keep arriving.
 #[tokio::test]
 async fn window_overrun_closes_connection() {
     const READ_SIZE: usize = 1 << 20;

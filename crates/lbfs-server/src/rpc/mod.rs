@@ -28,12 +28,14 @@
 //!   connection-fatal, not an error reply — the protocol has no in-band
 //!   recovery, and a client that miscounted has already desynchronized the
 //!   stream (spec §3.1).
-//! * **The window permit outlives the reply.** It is released by the writer
-//!   after the reply is on the socket, not by the handler after it queues one.
-//!   The client is entitled to send a new request the instant it sees an
-//!   answer, and releasing earlier or later than the socket write would make
-//!   the two sides disagree about the window — in one direction a spurious
-//!   violation, in the other an unenforced limit.
+//! * **The window permit outlives the handler, and ends just before the
+//!   write.** It travels with the reply rather than being dropped by the
+//!   handler that produced one, so a reply queued behind the writer still
+//!   holds its slot. The writer then releases it immediately *before* putting
+//!   the bytes on the socket, because the client returns its own permit the
+//!   moment it reads an answer: any window the server keeps the slot for past
+//!   that point is a window in which a well-behaved client's next request
+//!   looks like an overrun.
 //! * **A reply that was produced gets sent.** `LOOKUP`, `MKDIR`, `CREATE` and
 //!   friends hand the client a lookup count the moment they succeed;
 //!   swallowing that reply would strand the count for the life of the session.
@@ -512,11 +514,10 @@ struct OutFrame {
     data: Option<DataPayload>,
     /// The in-flight window permit this request consumed.
     ///
-    /// Carried here rather than dropped by the handler so that the writer
-    /// releases it *after* the reply bytes are on the socket. The client may
-    /// send its next request the moment it reads an answer; a permit released
-    /// only after that request arrives would look like a window overrun and
-    /// kill a perfectly well-behaved connection.
+    /// Carried here rather than dropped by the handler, so that a reply
+    /// waiting its turn behind the writer still counts against the window.
+    /// The writer releases it immediately *before* the reply bytes go out —
+    /// see `writer_task` for why that side of the write, and not the other.
     permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -809,6 +810,16 @@ async fn writer_task(
             data,
             permit,
         } = frame;
+        // Before the write, not after it. The client returns its own permit
+        // the moment it *reads* an answer, and is then entitled to send a
+        // replacement request immediately. Holding this permit across the
+        // write leaves a stretch in which the client has legitimately spent a
+        // slot the server still counts as occupied: on a fast link the
+        // replacement lands in the read loop before this task is scheduled
+        // again, and a well-behaved client dies of a window overrun it never
+        // committed. Releasing here costs one frame of slack, since a single
+        // writer holds at most one reply at a time.
+        drop(permit);
         let bytes = data.as_ref().map(DataPayload::as_slice).unwrap_or(&[]);
         let hdr = FrameHeader {
             request_id,
@@ -824,9 +835,6 @@ async fn writer_task(
             socket_dead.notify_one();
             return;
         }
-        // Explicit, and in this order on purpose: the window opens up only
-        // once the answer it was holding a slot for is on the wire.
-        drop(permit);
     }
 }
 
@@ -985,6 +993,71 @@ mod tests {
         let frame = rx.recv().await.expect("the request must be answered");
         assert_eq!((frame.request_id, frame.status), (77, Errno::EIO.0));
         assert!(frame.body.is_empty());
+    }
+
+    /// The window slot comes back before the reply goes out, not after.
+    ///
+    /// The two ends measure the same window from different edges: the client
+    /// frees its slot when it *reads* an answer and may spend it again at
+    /// once, while the server can only free one around the *write*. Doing it
+    /// after leaves a stretch in which the client has legitimately spent a
+    /// slot the server still counts as taken, and the replacement request
+    /// arriving inside that stretch is read as an overrun — a well-behaved
+    /// client killed for the server's own bookkeeping. A saturated mount hits
+    /// it within seconds; two vCPUs preempting the writer between the socket
+    /// write and the drop is all it takes.
+    ///
+    /// Pinned here rather than through a live session because the failing
+    /// interleaving is a thread-scheduling accident, and a test that only
+    /// sometimes reproduces it would pass on the broken code. This asserts the
+    /// ordering itself: a writer blocked with the reply still unsent must
+    /// already have given the slot back.
+    #[tokio::test]
+    async fn the_window_slot_returns_before_the_reply_is_written() {
+        // Far past any socket buffer, so the write cannot complete while
+        // nothing is reading the other end.
+        const HUGE: usize = 32 << 20;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Held, never read from: that is what blocks the writer mid-reply.
+        let _peer = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let (_, write_half) = accepted.into_split();
+
+        let window = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&window).try_acquire_owned().unwrap();
+        assert_eq!(window.available_permits(), 0);
+
+        let (tx, rx) = mpsc::channel::<OutFrame>(1);
+        let dead = Arc::new(Notify::new());
+        let writer = tokio::spawn(writer_task(write_half, rx, Arc::clone(&dead)));
+        tx.send(OutFrame {
+            request_id: 1,
+            status: STATUS_OK,
+            body: Vec::new(),
+            data: Some(DataPayload::Owned(vec![0u8; HUGE])),
+            permit: Some(permit),
+        })
+        .await
+        .unwrap();
+
+        // The writer is parked on a socket nobody drains, so the reply is
+        // still unsent. The slot has to be back regardless.
+        for _ in 0..100 {
+            if window.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            window.available_permits(),
+            1,
+            "the writer still holds the window slot for a reply it has not sent"
+        );
+        assert!(!writer.is_finished(), "the write should still be blocked");
+
+        writer.abort();
     }
 
     #[tokio::test]
