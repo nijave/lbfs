@@ -609,10 +609,16 @@ Future work:
   146 µs. Weigh that win against cheaper routes to part of it (FUSE
   passthrough, FUSE-over-io_uring via a fuser fork) and against the
   maintenance cost of a kernel module; the VM harness with swappable
-  kernels exists for exactly this experiment.
+  kernels exists for exactly this experiment. **Re-measure before sizing
+  this** (2026-08-28): that 146 µs dates from 2026-08-22 and three changes
+  have landed under it since, to the point where the mount now measures
+  faster than the figure — see the note under the Phase 5 table in
+  `docs/benchmarks/2026-08-22-bottleneck-analysis.md`. The
+  FUSE-over-io_uring branch of this item now has its own plan.
 - Server-side kernel integration survey: find the ~54 µs write/read
   asymmetry in the raw RPC path (4k write 146 µs vs read 92 µs with no
-  FUSE involved), then assess zero-copy sends from page cache to socket
+  FUSE involved — stale figures, same caveat as above; the asymmetry
+  itself stands), then assess zero-copy sends from page cache to socket
   (splice/sendfile, MSG_ZEROCOPY), io_uring SQPOLL and provided buffers,
   and whether an in-kernel serving path (the knfsd shape) pays for
   itself. Complements the io_uring registered-buffers item below.

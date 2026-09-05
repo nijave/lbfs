@@ -159,6 +159,18 @@ the kernel's FUSE layer costs this stack per operation:
 \* the least throttled 1 MiB write measurement of the day, 869 MB/s during
 the CPU capture. See the anomalies section for the range this job covers.
 
+**(2026-08-28) Do not size new work from this table.** Both columns date from
+2026-08-22, and three changes have landed under them since: the per-write
+`GETXATTR` elimination, the fuser 0.18 upgrade, and the window-permit fix. The
+mount column moved and the raw RPC column did not, because nothing has
+re-measured `lbfs-bench` since — `make build-guest` builds the server and the
+client only, so the load generator never reaches the guest. The two have drifted
+into contradiction: a 4 KiB random write through the mount now runs near 135 µs
+(Phase 9), *below* the 146.4 µs this table charges to the RPC layer alone. A
+mount cannot outrun the transport beneath it, so every "FUSE cost" figure above
+is a 2026-08-22 artefact. Re-measure both columns on the same day before
+quoting any of them.
+
 The RPC layer pipelines well once FUSE stops serialising: 4 KiB random reads
 go from 9086 IOPS at qd1 to 48766 at qd16, a 5.4 × gain on 16 × the depth.
 Streaming does not pipeline — 1 MiB reads sit at ~2.3 GB/s whether one or
@@ -463,6 +475,13 @@ operations — the VFS rule, now on the server's side of the wire.
   gets 128 KiB. Buffered sequential reads thus fetch in 128 KiB steps
   whatever the mount asks for; today's `direct=1` jobs bypass readahead
   entirely, so no number here reflects that cap.
+
+  **This item stays open, and the strike above does not reach it** (noted
+  2026-08-28, because the two sit next to each other and invite the
+  confusion). `perf/big-requests` raised the *request* ceiling and ran every
+  job with `direct=1`, which bypasses readahead by definition, so it measured
+  nothing about this splitter. Different mechanism, different code path, and
+  still nobody has measured a buffered sequential read against it.
 * `lbfs-bench` addresses one file directly under the export root. `LOOKUP`
   refuses a name containing a slash, so a path like `bench/rand.dat` returns
   `EINVAL`.
@@ -473,7 +492,10 @@ operations — the VFS rule, now on the server's side of the wire.
   comparison sharpens the point — kernel NFS answers a complete 4k write in
   ~104-111 µs, less than lbfs's bare RPC write. Spec §11 carries the
   follow-up analysis items (kernel-module client feasibility, server-side
-  kernel integration survey).
+  kernel integration survey). **The asymmetry is real and the figures are
+  stale** (2026-08-28): both RPC numbers predate kill-priv, fuser 0.18 and the
+  window-permit fix, and nothing has re-measured them — see the note under the
+  Phase 5 table. Re-run `lbfs-bench` before quoting a gap in microseconds.
 
 ## Cleanup performed
 
