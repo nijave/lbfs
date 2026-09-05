@@ -2,10 +2,42 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to execute this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Not started — no task below has run. The plan first targeted fuser
-0.15.1; a 2026-08-27 revision retargeted it at fuser 0.18.0 (ABI 7.40), which
-reached `main` through the two-step upgrade plan. Three things to know before
-executing:
+**Status:** Complete, with one acceptance bar missed for a reason that
+invalidates the bar rather than the change. All six tasks ran on 2026-08-28.
+Probe A carried the day: four threads writing one file went from 6938 to
+15910 IOPS, 2.29 × its same-day control and 89 % of the four-threads-four-files
+ceiling, where it had reached 38 % of that ceiling before. Every other shape
+held within spread, and the kernel confirmed it took both flags — `MAP_SHARED`
+on an `O_DIRECT` descriptor returns `ENODEV`, and the write path moved wholly
+from `fuse_cache_write_iter` to `fuse_direct_write_iter`.
+
+Four things the execution learned that the plan did not know:
+
+- **Probe B never needed this change, so its 3 × bar was unreachable by
+  construction.** A libaio write is not a synchronous iocb, so `fuse_direct_IO`
+  already returned `-EIOCBQUEUED` beforehand and the exclusive lock only ever
+  spanned the queueing, not the round trip. Measured 0.99 ×. The plan named the
+  FUSE event loop as the suspect if B disappointed; `--fuse-threads 4` ruled
+  that out (36.5k against 37.5k for one loop). Acceptance criterion 5 fails as
+  written; strike it rather than chase it.
+- **A pre-existing server bug blocked the acceptance run, and fixing it came
+  first.** A saturated mount tripped `in-flight window overrun` and took `EIO`
+  mid-job, because the server released a request's window permit only after
+  the reply's socket write returned, while the client frees its own slot the
+  moment it reads that reply. Fixed on its own branch (`fix/window-permit-
+  release`, PR #15); both benchmark builds carry it.
+- **Straight before-then-after passes cannot measure this pair.** Sequential
+  1 MiB write read 1065 MB/s in the first pass and 66 MB/s in the second, and
+  re-measuring the *first* build reproduced the second figure — the row tracks
+  the host's page cache. The recorded campaign alternates builds round by
+  round and reports medians of three.
+- **Linux 7.0 inlines `fuse_dio_wr_exclusive_lock`**, so Step 4's
+  bpftrace probe is unavailable (`grep -c` of `/proc/kallsyms` gives 0). Probe
+  A against its four-file control stands in for it, as Step 4 anticipated.
+
+The plan first targeted fuser 0.15.1; a 2026-08-27 revision retargeted it at
+fuser 0.18.0 (ABI 7.40), which reached `main` through the two-step upgrade
+plan. Three things that revision fixed, kept here as history:
 
 - fuser 0.18.0 names `FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES` and can
   negotiate `FUSE_DIRECT_IO_ALLOW_MMAP`, so the plan no longer declares a
@@ -219,7 +251,7 @@ own QD16 control.
 - Consumes: nothing.
 - Produces: the written contract the later tasks argue from. Names fixed here: the reply flag set `FOPEN_KEEP_CACHE | FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES`, and the promise about mixed access.
 
-- [ ] **Step 1: Separate the two meanings of "direct" in §6**
+- [x] **Step 1: Separate the two meanings of "direct" in §6**
 
 Find this line at the end of §6:
 
@@ -240,7 +272,7 @@ handle out of its page cache and demands no alignment of anybody, while
 stripping the second is one coherent position.
 ```
 
-- [ ] **Step 2: Add the per-open direct-I/O bullet to §7**
+- [x] **Step 2: Add the per-open direct-I/O bullet to §7**
 
 In §7, find the caching bullet:
 
@@ -292,7 +324,7 @@ works, and `mmap` on an ordinary open keeps its behaviour. §11 carries the
 follow-up.
 ```
 
-- [ ] **Step 3: Add the two follow-ups to §11**
+- [x] **Step 3: Add the two follow-ups to §11**
 
 At the end of the "Future work" list in §11, add:
 
@@ -311,12 +343,12 @@ At the end of the "Future work" list in §11, add:
   would put FUSE vocabulary inside the `FileSystem` trait (§5.1).
 ```
 
-- [ ] **Step 4: Check the diff**
+- [x] **Step 4: Check the diff**
 
 Run: `git diff --stat docs/superpowers/specs/2026-08-20-lbfs-design.md`
 Expected: one file changed, three hunks.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/superpowers/specs/2026-08-20-lbfs-design.md
@@ -334,7 +366,7 @@ git commit -m "docs(spec): per-open direct I/O for O_DIRECT opens"
 - Consumes: fuser 0.18's names — `FopenFlags` with its `FOPEN_PARALLEL_DIRECT_WRITES` variant and the `OpenFlags` newtype, both already in the file's import block, and in scope for the tests through `use super::*`.
 - Produces: `fn open_flags(app_flags: OpenFlags) -> FopenFlags`. Both `open` and `create` call it with the flags fuser handed them; `create` wraps its bare `i32` in `OpenFlags` at the call site.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block at the bottom of `crates/lbfs-client/src/fuse.rs`, beside the existing `opens_keep_the_page_cache`:
 
@@ -424,12 +456,12 @@ Then replace the existing `opens_keep_the_page_cache` test in the same block:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p lbfs-client --lib open_flags direct_io parallel_write`
 Expected: FAIL to compile — `this function takes 0 arguments but 1 argument was supplied` on every `open_flags(...)` call. The flag names themselves resolve, because fuser 0.18 supplies them.
 
-- [ ] **Step 3: Give `open_flags` the application's flags**
+- [x] **Step 3: Give `open_flags` the application's flags**
 
 In `crates/lbfs-client/src/fuse.rs`, replace `fn open_flags()` and its doc comment:
 
@@ -479,7 +511,7 @@ fn open_flags(app_flags: OpenFlags) -> FopenFlags {
 }
 ```
 
-- [ ] **Step 4: Hand the decision to both call sites**
+- [x] **Step 4: Hand the decision to both call sites**
 
 In `crates/lbfs-client/src/fuse.rs`, replace the `open` callback:
 
@@ -510,17 +542,17 @@ and the `created` arm of the `create` callback:
 
 `create` needs this as much as `open` does: `fuse_create_open` stores the reply's flags on the new handle (`fs/fuse/dir.c:887`) and runs the same `fuse_finish_open` path (`dir.c:905`), so a `create` answering with the cached reply would leave every freshly made file on the serialised path until something closed and reopened it. In `open` the compiler enforces the plumbing — `flags` is the only `OpenFlags` in the callback. In `create` fuser hands a bare `i32`, and the `OpenFlags(flags)` wrap is the one place this plan constructs the newtype; `mode` and `umask` are `u32`, so handing the wrong integer still fails to compile.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p lbfs-client --lib open_flags direct_io parallel_write page_cache`
 Expected: PASS — `only_an_o_direct_open_gets_the_direct_io_reply`, `the_parallel_write_bit_never_travels_alone`, `opens_keep_the_page_cache`.
 
-- [ ] **Step 6: Run the whole gate**
+- [x] **Step 6: Run the whole gate**
 
 Run: `make check`
 Expected: PASS. `open_flags` has exactly two callers and both moved in Step 4, so nothing else in the workspace mentions it.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/lbfs-client/src/fuse.rs
@@ -538,7 +570,7 @@ git commit -m "feat(client): O_DIRECT opens reply FOPEN_DIRECT_IO | FOPEN_PARALL
 - Consumes: Task 2's reply flags.
 - Produces: `fn two_direct_writers_on_one_file_both_land(writeback: bool)` plus two `#[test]` wrappers, following the file's existing `file_content_round_trips(writeback: bool)` shape.
 
-- [ ] **Step 1: Widen the imports**
+- [x] **Step 1: Widen the imports**
 
 In `tests/tests/loopback.rs`, replace the `use std::os::unix::fs::MetadataExt;` line at line 57 with:
 
@@ -548,7 +580,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 
 `FileExt` supplies `write_all_at` and `read_exact_at`, which are `pwrite`/`pread` and thus leave the shared file offset alone — the only honest way for two threads to write one file at fixed places. `OpenOptionsExt` supplies `custom_flags`, which is how `O_DIRECT` reaches `open(2)` from Rust.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to `tests/tests/loopback.rs`, beside the `file_content_round_trips` pair:
 
@@ -668,17 +700,17 @@ fn two_direct_writers_on_one_file_both_land_without_the_writeback_cache() {
 }
 ```
 
-- [ ] **Step 3: Run the new cases**
+- [x] **Step 3: Run the new cases**
 
 Run: `cargo test -p lbfs-tests --test loopback two_direct_writers -- --ignored --test-threads=1`
 Expected: PASS, both cases. Run it on the pre-Task-2 tree too if you want the contrast — it passes there as well, because the exclusive lock is correct, only slow. What this guards is the relaxed lock: a torn block or a short file here means the shared path lost a write.
 
-- [ ] **Step 4: Run the whole loopback suite**
+- [x] **Step 4: Run the whole loopback suite**
 
 Run: `make test-loopback`
 Expected: PASS, no regressions in the existing cases.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/tests/loopback.rs
@@ -696,7 +728,7 @@ git commit -m "test(loopback): two concurrent O_DIRECT writers on one file"
 - Consumes: Task 2's reply flags, and Task 3's `FileExt`/`OpenOptionsExt` imports.
 - Produces: `fn appends_stay_whole_with_direct_io(writeback: bool)` plus two `#[test]` wrappers.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `tests/tests/loopback.rs`, directly after the `two_direct_writers_on_one_file_both_land` pair:
 
@@ -802,17 +834,17 @@ fn appends_stay_whole_with_direct_io_without_the_writeback_cache() {
 }
 ```
 
-- [ ] **Step 2: Run the new cases**
+- [x] **Step 2: Run the new cases**
 
 Run: `cargo test -p lbfs-tests --test loopback appends_stay_whole -- --ignored --test-threads=1`
 Expected: PASS, both cases.
 
-- [ ] **Step 3: Run the whole loopback suite**
+- [x] **Step 3: Run the whole loopback suite**
 
 Run: `make test-loopback`
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/tests/loopback.rs
@@ -830,7 +862,7 @@ git commit -m "test(loopback): O_APPEND with O_DIRECT stays whole in both mount 
 - Consumes: Task 2's reply flags, and Task 3's `FileExt`/`OpenOptionsExt` imports.
 - Produces: `fn cached_and_direct_descriptors_stay_coherent(writeback: bool)` plus two `#[test]` wrappers.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `tests/tests/loopback.rs`, directly after the `appends_stay_whole_with_direct_io` pair:
 
@@ -923,17 +955,17 @@ fn cached_and_direct_descriptors_stay_coherent_without_the_writeback_cache() {
 }
 ```
 
-- [ ] **Step 2: Run the new cases**
+- [x] **Step 2: Run the new cases**
 
 Run: `cargo test -p lbfs-tests --test loopback cached_and_direct -- --ignored --test-threads=1`
 Expected: PASS, both cases.
 
-- [ ] **Step 3: Run the whole gate and the whole loopback suite**
+- [x] **Step 3: Run the whole gate and the whole loopback suite**
 
 Run: `make check && make test-loopback`
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/tests/loopback.rs
@@ -951,7 +983,7 @@ git commit -m "test(loopback): a cached descriptor beside a direct one stays coh
 - Consumes: every task above.
 - Produces: the acceptance evidence. No automated test — this one needs two guests and a quiet machine.
 
-- [ ] **Step 1: Build the control, deploy it, and lay out the working set**
+- [x] **Step 1: Build the control, deploy it, and lay out the working set**
 
 The A/B needs a build without this change, the way the `FUSE_ASYNC_DIO` campaign rebuilt `e6ebfaf`'s client for its control column. Build the parent of Task 2's commit, deploy it, and lay out both files at full size — an extending write takes the exclusive lock and runs synchronously even under `FUSE_ASYNC_DIO` (`fs/fuse/file.c:2866-2868`), so a job that grows its own file measures nothing.
 
@@ -971,7 +1003,7 @@ ls -l /mnt/lbfs/seq.dat /mnt/lbfs/rand.dat
 
 Expected: both files exactly 536870912 bytes.
 
-- [ ] **Step 2: Run the control pass**
+- [x] **Step 2: Run the control pass**
 
 Drain the server before every single job:
 
@@ -1040,7 +1072,7 @@ dd if=/mnt/lbfs/seq.dat of=/dev/null bs=1M count=256
 
 Record every number. This control pass is the baseline every acceptance bar reads against — the "today" figures earlier in the plan predate the kill-priv change and the fuser 0.18 upgrade, so expect the write shapes to come in well above them (single-thread randwrite near 6000 IOPS rather than 3325) and treat any resemblance as coincidence, not confirmation.
 
-- [ ] **Step 3: Deploy the change and run the same pass**
+- [x] **Step 3: Deploy the change and run the same pass**
 
 ```bash
 make build-guest && make vm-deploy
@@ -1063,7 +1095,7 @@ Then repeat Step 2's jobs, drain and all. Expected, with "control" meaning Step 
 
 The two bold rows are the acceptance bars. Everything else is a no-regression check.
 
-- [ ] **Step 4: Confirm the kernel took the bits**
+- [x] **Step 4: Confirm the kernel took the bits**
 
 Two observations, because the two bits arrive differently.
 
@@ -1101,7 +1133,7 @@ sudo bpftrace -e 'kretprobe:fuse_dio_wr_exclusive_lock { @[retval] = count(); }'
 
 Expected: `@[0]` dominates, which is the shared branch. A count dominated by `@[1]` names which of the four conditions in `fuse_dio_wr_exclusive_lock` fired — the usual culprit is a working file that was not laid out at full size, which sends every write down the past-the-end branch at `file.c:1419-1421`. A `grep -c` of `0` means the compiler inlined the function and this probe is unavailable; fall back to comparing probe A against its four-file control.
 
-- [ ] **Step 5: Run the integrity job**
+- [x] **Step 5: Run the integrity job**
 
 The parallelism is worth nothing if a write lands in the wrong place, and the loopback tests could not check that under real concurrency.
 
@@ -1111,7 +1143,7 @@ make vm-test
 
 Expected: PASS, including the fio crc32c verify job in `vm/tests/fio.sh`.
 
-- [ ] **Step 6: Record it**
+- [x] **Step 6: Record it**
 
 Append a section to `docs/benchmarks/2026-08-22-bottleneck-analysis.md`:
 
@@ -1142,7 +1174,7 @@ with the writeback cache still aggregating them.
 
 Then correct the closing paragraph of "The exclusive inode lock" section — the sentence reading "Only separate files scale" — so it points at this new section instead of leaving a conclusion standing that is no longer true.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add docs/benchmarks/2026-08-22-bottleneck-analysis.md
