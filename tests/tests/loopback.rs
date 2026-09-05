@@ -874,6 +874,93 @@ fn appends_stay_whole_with_direct_io_without_the_writeback_cache() {
     appends_stay_whole_with_direct_io(false);
 }
 
+/// One file, two descriptors, one of them direct — the mixed-access promise of
+/// spec §7, checked in both directions.
+///
+/// Opening the cached descriptor puts the inode into caching mode
+/// (`fs/fuse/iomode.c:238`, `iomode.c:63-65`), which sends every direct write
+/// back to the exclusive lock (`fs/fuse/file.c:1416-1417`). That costs the
+/// parallelism and buys back today's behaviour, so nothing here can regress
+/// into a race. What it must not cost is coherence, and coherence comes from
+/// the direct path doing its own page work: a flush before the transfer
+/// (`file.c:1667-1673`), an invalidate before a write (`file.c:1682-1688`) and
+/// another after it (`file.c:1741-1748`).
+///
+/// So: a direct write must be visible to a cached reader with no flush, and a
+/// cached write must be visible to a direct reader with no `fsync`. Neither
+/// test calls `sync_all`, on purpose — an explicit flush would prove nothing.
+fn cached_and_direct_descriptors_stay_coherent(writeback: bool) {
+    const BLOCK: usize = 64 * 1024;
+
+    let mut lb = Loopback::start(Opts {
+        writeback,
+        ..Opts::default()
+    });
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+    let path = mnt.join("mixed.dat");
+
+    std::fs::write(&path, vec![b'a'; 2 * BLOCK]).unwrap();
+
+    let cached = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let direct = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&path)
+        .unwrap();
+
+    // Direct write, cached read. The direct path invalidated the range, so the
+    // cached descriptor has to go back to the server for it.
+    direct.write_all_at(&vec![b'b'; BLOCK], 0).unwrap();
+    let mut seen = vec![0u8; BLOCK];
+    cached.read_exact_at(&mut seen, 0).unwrap();
+    assert!(
+        seen.iter().all(|&b| b == b'b'),
+        "the cached descriptor served stale pages after a direct write"
+    );
+
+    // Cached write, direct read, no flush in between. The direct read's own
+    // `filemap_write_and_wait_range` is what has to push the dirty page out.
+    cached
+        .write_all_at(&vec![b'c'; BLOCK], BLOCK as u64)
+        .unwrap();
+    let mut seen = vec![0u8; BLOCK];
+    direct.read_exact_at(&mut seen, BLOCK as u64).unwrap();
+    assert!(
+        seen.iter().all(|&b| b == b'c'),
+        "the direct descriptor read around a dirty page instead of flushing it"
+    );
+
+    // Both descriptors closed before the export is inspected: the second block
+    // only has to reach the server by the time the cached handle is gone.
+    drop(direct);
+    drop(cached);
+
+    let landed = std::fs::read(export.join("mixed.dat")).unwrap();
+    assert_eq!(landed.len(), 2 * BLOCK);
+    assert!(landed[..BLOCK].iter().all(|&b| b == b'b'));
+    assert!(landed[BLOCK..].iter().all(|&b| b == b'c'));
+
+    lb.unmount();
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn cached_and_direct_descriptors_stay_coherent_with_the_writeback_cache() {
+    cached_and_direct_descriptors_stay_coherent(true);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn cached_and_direct_descriptors_stay_coherent_without_the_writeback_cache() {
+    cached_and_direct_descriptors_stay_coherent(false);
+}
+
 /// Unmounting is the drain, and the drain is what the shipped binary leans on.
 ///
 /// `crates/lbfs-client/src/main.rs` treats `drop(session)` as "unmount, drain,
