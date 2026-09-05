@@ -8,7 +8,32 @@ unexecuted: another agent holds 192.168.77.10/.11 for the session-resumption
 work, so this branch verifies at the loopback level only, and Task 7 records the
 one step a later session must run.
 
-Two findings shaped the plan:
+Two things the execution learned that the plan did not know:
+
+- **`LbfsFuse::destroy` is the wrong home for the driver's sync, and the first
+  build proved it by panicking.** `BackgroundSession` has no `Drop` of its own,
+  so dropping it releases the session thread's `JoinHandle` — detaching, never
+  joining — and then unmounts. `drop(session)` in `main.rs` thus returns while
+  that thread is still running, `run()` returns, the tokio `Runtime` drops,
+  and `destroy` reaches a runtime mid-shutdown: `A Tokio 1.x context was found,
+  but it is being shutdown`, on the exit path, in the shipped binary. `make
+  test-loopback` caught it through `loopback_cli.rs`, which runs the real
+  binary; the in-process harness missed it because `umount_and_join` joins. The
+  sync moved to `force_sync_on_exit` in `main.rs`, after `drop(session)` and
+  before the connection closes — where the runtime and the connection are both
+  still owned, and where `umount(2)` has already guaranteed every dirty page
+  reached the server. Task 4's checkbox covers that home, not the one it
+  named.
+- **The loopback layer cannot witness an unforced sync, so that case moved
+  down.** Task 5 planned a case proving an application's `fsync(2)` still obeys
+  the server's policy, using the FIFO the protocol suite uses. Through a mount
+  that is impossible twice over: the client implements no `mknod` (`ENOSYS`), and
+  even given a FIFO the kernel opens it through its own `fifo_open` rather than
+  through FUSE, so the sync never reaches the server. `crates/lbfs-client/tests/
+  live.rs` pins the property instead, where the FIFO works. A comment in
+  `loopback.rs` records why the case is absent rather than leaving a gap.
+
+Two findings from the reading shaped the plan:
 
 - **The server ignores unknown frame flag bits today.** `read_loop` in
   `crates/lbfs-server/src/rpc/mod.rs` checks `body_len`, the opcode, `data_len`
@@ -33,8 +58,9 @@ The server threads the frame's flags from `read_loop` through `dispatch` into tw
 `FileSystem` methods that grow a `force: bool`; `LocalFs::maybe_fsync` reads
 `force` as a policy override. The client sends the flag from two places and
 nowhere else: `LbfsFuse::setxattr` intercepting one reserved name on the mount
-root, and `LbfsFuse::destroy` at unmount. Nothing touches the ordinary `fsync(2)`
-path, so `fsync = "ignore"` still means what it meant.
+root, and `force_sync_on_exit` in `main.rs` just after the unmount. Nothing
+touches the ordinary `fsync(2)` path, so `fsync = "ignore"` still means what it
+meant.
 
 **Tech Stack:** Rust (edition 2021), tokio 1, fuser 0.18.0 (ABI 7.40,
 exact-pinned), io-uring 0.7, rustix 1, postcard 1.1 + serde/serde_bytes, libc,
@@ -206,21 +232,27 @@ The client intercepts `setxattr` and nothing else. `getxattr`, `listxattr` and
 and never joins a listing — both true, since the mount stores nothing. Any value
 triggers one sync; the client reads none of it.
 
-**The driver: `LbfsFuse::destroy`.** fuser calls the filesystem's `destroy` from
-`Session::run`, after every event-loop thread has joined
-(`fuser-0.18.0/src/session.rs:330`). That moment is the one this wants:
+**The driver: `main.rs`, one line after the unmount.** The plan first named
+`LbfsFuse::destroy` and the Status note above records the panic that ruled it
+out. `force_sync_on_exit` runs immediately after `drop(session)`, which is the
+moment this wants for three reasons:
 
-1. `drop(session)` in `main.rs` unmounts, and `umount(2)` syncs the superblock —
-   so the kernel has already written back every dirty page as ordinary `WRITE`
-   callbacks, and the server holds every byte in its page cache.
-2. The event loops have exited, so nothing more arrives.
-3. `main.rs` still holds the `Connection`, and `Loopback`'s field order drops the
-   session before the connection for the same reason, so the socket still works.
+1. `drop(session)` unmounts, and `umount(2)` syncs the superblock — so the kernel
+   has already written back every dirty page as ordinary `WRITE` callbacks, and
+   the server holds every byte in its page cache. Under `ignore` that is exactly
+   the data a crash would lose.
+2. The unmount has taken the mount away, so no FUSE callback can still wait on
+   this thread.
+3. `run()` owns both the tokio `Runtime` and the `Connection` at this line, which
+   `destroy` on a detached session thread cannot promise.
 
-`destroy` runs synchronously on the session thread, which is no tokio worker, so
-`Handle::block_on` is legal there. A timeout bounds the call and the log carries
-its failure rather than raising one: an unmount that hung on a wedged server
-would beat an unforced sync only in the wrong direction.
+`run()`'s own thread is no tokio worker, so `Runtime::block_on` is legal here. A
+timeout bounds the call and the log carries its failure rather than raising one:
+an exit that refused to happen would be the worse trade.
+
+One consequence worth naming: the driver-initiated sync belongs to the shipped
+binary, not to `LbfsFuse`. An embedder — `tests/tests/loopback.rs` included —
+mounts the bridge without it and calls the control itself if it wants one.
 
 **The ordinary `fsync(2)` path never sets the flag.** Spec §11 names two entry
 points and neither one is an application's own `fsync`. Forcing those would drain
@@ -263,10 +295,12 @@ loopback case asserts it across a real socket.
 | `crates/lbfs-server/src/fs/mod.rs` | `fsync` and `fsyncdir` grow `force: bool` |
 | `crates/lbfs-server/src/fs/local/mod.rs` | `maybe_fsync` takes `force`; `fsyncdir` runs `syncfs` on a forced export root |
 | `crates/lbfs-client/src/conn.rs` | `Reply` keeps the frame flags; `call_raw` takes request flags and returns reply flags; `force_sync_export` |
-| `crates/lbfs-client/src/fuse.rs` | `CONTROL_XATTR_SYNC`, the `setxattr` intercept, the `destroy` sync |
+| `crates/lbfs-client/src/fuse.rs` | `CONTROL_XATTR_SYNC` and the `setxattr` intercept |
+| `crates/lbfs-client/src/main.rs` | `force_sync_on_exit`, run after `drop(session)` |
 | `tests/src/lib.rs` | `TestClient::call_flagged`, and a `Reply` that keeps the reply's flags |
 | `tests/tests/protocol.rs` | Forced-sync wire cases, including the FIFO witness |
 | `tests/tests/loopback.rs` | The control xattr from user space, under both policies |
+| `crates/lbfs-client/tests/loopback_cli.rs` | The shipped binary's exit sync, read out of its own log |
 | `docs/superpowers/specs/2026-08-20-lbfs-design.md` | §3.1, §6, §11 |
 | `README.md` | The control xattr, beside the durability policy it overrides |
 
@@ -274,97 +308,101 @@ loopback case asserts it across a real socket.
 
 ## Task 1: Proto — the flag goes live
 
-- [ ] Rename `FLAG_FORCE_SYNC_RESERVED` to `FLAG_FORCE_SYNC` in
+- [x] Rename `FLAG_FORCE_SYNC_RESERVED` to `FLAG_FORCE_SYNC` in
       `crates/lbfs-proto/src/frame.rs` and replace the "Never set in product v1"
       note with what the bit means on a request and on a reply.
-- [ ] Add a unit case pinning `FLAG_NO_REPLY` and `FLAG_FORCE_SYNC` as bits 0 and
+- [x] Add a unit case pinning `FLAG_NO_REPLY` and `FLAG_FORCE_SYNC` as bits 0 and
       1 and asserting they never overlap — one bit now carries two protocols'
       worth of meaning, and a later flag must not land on top of it.
-- [ ] `make check`.
-- [ ] Commit: `feat(proto): make frame flag bit 1 the live FORCE_SYNC flag`.
+- [x] `make check`.
+- [x] Commit: `feat(proto): make frame flag bit 1 the live FORCE_SYNC flag`.
 
 ## Task 2: Server — honour the flag
 
-- [ ] Failing test first, in `crates/lbfs-server/src/fs/local/mod.rs`'s test
+- [x] Failing test first, in `crates/lbfs-server/src/fs/local/mod.rs`'s test
       module: under `FsyncPolicy::Ignore`, a forced `fsync` on a FIFO handle
       answers `EINVAL` while an unforced one answers `Ok`.
-- [ ] Add `force: bool` to `FileSystem::fsync` and `FileSystem::fsyncdir` in
+- [x] Add `force: bool` to `FileSystem::fsync` and `FileSystem::fsyncdir` in
       `crates/lbfs-server/src/fs/mod.rs`, documented as the policy override.
-- [ ] `LocalFs::maybe_fsync(&self, fd, datasync, force)`: run the real sync when
+- [x] `LocalFs::maybe_fsync(&self, fd, datasync, force)`: run the real sync when
       `force || self.fsync_policy == FsyncPolicy::Honor`.
-- [ ] `LocalFs::fsyncdir`: on `force` against `ROOT_NODE`, run
+- [x] `LocalFs::fsyncdir`: on `force` against `ROOT_NODE`, run
       `rustix::fs::syncfs` on a blocking thread — io_uring carries no opcode for
       it, and `statfs` next door already set that precedent. Otherwise
       `maybe_fsync`.
-- [ ] Failing test: under `Ignore`, a forced `fsyncdir` on `ROOT_NODE` succeeds,
+- [x] Failing test: under `Ignore`, a forced `fsyncdir` on `ROOT_NODE` succeeds,
       and so does an unforced one. Task 3's acknowledgement pins which branch
       ran, since `syncfs` cannot fail informatively.
-- [ ] `make check`.
-- [ ] Commit: `feat(server): honour FORCE_SYNC over the durability policy`.
+- [x] `make check`.
+- [x] Commit: `feat(server): honour FORCE_SYNC over the durability policy`.
 
 ## Task 3: Server — thread the flag and acknowledge it
 
-- [ ] Failing test first, in `tests/tests/protocol.rs`: under `Ignore`, a forced
+- [x] Failing test first, in `tests/tests/protocol.rs`: under `Ignore`, a forced
       `FSYNC` frame on a FIFO answers `EINVAL`, and the same frame unforced
       answers OK. This needs `TestClient::call_flagged` and a `Reply` that keeps
       the reply frame's flags, so add both to `tests/src/lib.rs` first.
-- [ ] Turn `dispatch::Reply` from a 3-tuple into a struct with `status`, `flags`,
+- [x] Turn `dispatch::Reply` from a 3-tuple into a struct with `status`, `flags`,
       `body`, `data`, and update the five constructors and every direct
       construction.
-- [ ] `dispatch` takes the frame's `flags`; the `Fsync` and `Fsyncdir` arms read
+- [x] `dispatch` takes the frame's `flags`; the `Fsync` and `Fsyncdir` arms read
       `FLAG_FORCE_SYNC` out of it, pass `force` to the trait, and write
       `FLAG_FORCE_SYNC` onto a reply whose forced sync succeeded.
-- [ ] `read_loop` passes `hdr.flags` into the spawned `dispatch`; `OutFrame`
+- [x] `read_loop` passes `hdr.flags` into the spawned `dispatch`; `OutFrame`
       carries `flags`; `writer_task` puts them on the wire instead of `0`.
-- [ ] Failing test: the acknowledgement rides a forced `FSYNC`/`FSYNCDIR` reply
+- [x] Failing test: the acknowledgement rides a forced `FSYNC`/`FSYNCDIR` reply
       under both policies, and stays off an unforced one.
-- [ ] Failing test: `FLAG_FORCE_SYNC` on `GETATTR` lies inert — answered
+- [x] Failing test: `FLAG_FORCE_SYNC` on `GETATTR` lies inert — answered
       normally, unacknowledged, connection alive. §1 rests on this property, so
       the suite asserts it rather than assuming it.
-- [ ] `make check`.
-- [ ] Commit: `feat(server): carry FORCE_SYNC through dispatch and acknowledge it`.
+- [x] `make check`.
+- [x] Commit: `feat(server): carry FORCE_SYNC through dispatch and acknowledge it`.
 
 ## Task 4: Client — send the flag from two places
 
-- [ ] Failing test first, in `crates/lbfs-client/tests/live.rs`: against a server
+- [x] Failing test first, in `crates/lbfs-client/tests/live.rs`: against a server
       on `FsyncPolicy::Ignore`, `Connection::force_sync_export` succeeds, while a
       plain `fsync` on a FIFO handle still answers `Ok` — which proves the
       ordinary path kept its behaviour.
-- [ ] `conn.rs`: `Reply` gains `flags`, filled from the frame header in
+- [x] `conn.rs`: `Reply` gains `flags`, filled from the frame header in
       `reader_task`. `call_raw` takes a request `flags: u16` and returns the
       reply's; `call` and `call_unit` pass `0` and drop the answer.
-- [ ] `conn.rs`: `force_sync_export()` — `OPENDIR(ROOT_NODE)`, forced
+- [x] `conn.rs`: `force_sync_export()` — `OPENDIR(ROOT_NODE)`, forced
       `FSYNCDIR`, `RELEASEDIR`; `EOPNOTSUPP` when the reply carries no
       acknowledgement; the releasedir runs whatever the sync answered.
-- [ ] `fuse.rs`: `CONTROL_XATTR_SYNC = b"user.lbfs.sync"`, and a `setxattr`
+- [x] `fuse.rs`: `CONTROL_XATTR_SYNC = b"user.lbfs.sync"`, and a `setxattr`
       intercept that fires for that name on `FUSE_ROOT_ID` and nowhere else.
-- [ ] `fuse.rs`: `destroy` runs the forced sync through `Handle::block_on` under
-      a timeout, logs the outcome, and never fails the unmount.
-- [ ] `make check`.
-- [ ] Commit: `feat(client): force a real sync from the mount root and at unmount`.
+- [x] `main.rs`: `force_sync_on_exit` runs the forced sync on the owned runtime
+      under a timeout, logs the outcome, and never fails the exit. **Not**
+      `fuse.rs::destroy` — see the Status note for the panic that ruled it out.
+- [x] `make check`.
+- [x] Commit: `feat(client): force a real sync from the mount root and at unmount`.
 
 ## Task 5: Loopback — the control from user space
 
-- [ ] Failing test first: under `Opts { fsync: FsyncPolicy::Ignore, .. }`,
+- [x] Failing test first: under `Opts { fsync: FsyncPolicy::Ignore, .. }`,
       `setxattr(mnt, "user.lbfs.sync", b"")` succeeds, and `lb.conn()`'s own
       `force_sync_export` collects the acknowledgement — which proves the server
       took the honour branch, across a real socket.
-- [ ] Failing test: the same name on a *file* in the mount travels, stores and
+- [x] Failing test: the same name on a *file* in the mount travels, stores and
       reads back, and the name never joins the mount root's `listxattr` — the
       shadowing bound from §5.
-- [ ] Failing test: the control also succeeds under `FsyncPolicy::Honor`.
-- [ ] `make test-loopback`.
-- [ ] Commit: `test(loopback): force a sync through the mount root control xattr`.
+- [x] Failing test: the control also succeeds under `FsyncPolicy::Honor`.
+- [x] Failing test, in `crates/lbfs-client/tests/loopback_cli.rs`: the shipped
+      binary logs the forced sync on its way out, and none of its three failure
+      lines. The log is the only witness — `syncfs` leaves nothing to stat for.
+- [x] `make test-loopback`.
+- [x] Commit: `test(loopback): force a sync through the mount root control xattr`.
 
 ## Task 6: Spec and README
 
-- [ ] §3.1: bit 1 is `FORCE_SYNC`, live, on requests and on replies.
-- [ ] §6: the control exists, what it does to `O_SYNC` masking (nothing), and the
+- [x] §3.1: bit 1 is `FORCE_SYNC`, live, on requests and on replies.
+- [x] §6: the control exists, what it does to `O_SYNC` masking (nothing), and the
       export-root `syncfs` widening.
-- [ ] §11 fast-follow 2: struck, with one line naming what stayed out.
-- [ ] README: the control xattr, beside the durability policy it overrides.
-- [ ] `make check`.
-- [ ] Commit: `docs(spec): the forced-sync control exists; strike fast-follow 2`.
+- [x] §11 fast-follow 2: struck, with one line naming what stayed out.
+- [x] README: the control xattr, beside the durability policy it overrides.
+- [x] `make check`.
+- [x] Commit: `docs(spec): the forced-sync control exists; strike fast-follow 2`.
 
 ## Task 7: VM verification — NOT RUN ON THIS BRANCH
 
@@ -423,6 +461,6 @@ branch stops at the loopback level. A later session runs, in order:
 - **`user.lbfs.sync` on the mount root no longer stores.** This plan says so, and
   the loss covers that one inode, but it takes a name out of the user's
   namespace.
-- **Durability past the syscall stays unproven on this branch.** Task 6 proves
+- **Durability past the syscall stays unproven on this branch.** Task 3 proves
   `fsync(2)` and `syncfs(2)` ran and returned success. Whether the bytes reached
   the platter needs the power-cut case in Task 7, which this session cannot run.
