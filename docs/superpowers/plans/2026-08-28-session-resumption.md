@@ -10,12 +10,22 @@ its rulings and does not re-argue them.
 **Two coordination facts before Task 1.**
 
 - **A second change is in flight on the same files.** The forced-sync control
-  message (spec §11 fast-follow 2) touches `crates/lbfs-proto/src/frame.rs` and
-  the server's dispatch. This plan touches neither frame flag bit 1 nor the
-  `FLAG_FORCE_SYNC_RESERVED` constant, and Task 2 is the only place the two
-  changes overlap: both want `PROTOCOL_VERSION` and the `Opcode` enum. **Land
-  one of them first and rebase the other.** Two independent bumps to `3` produce
-  a tree where the version number means two different wire formats.
+  message (spec §11 fast-follow 2) lives on `feat/forced-sync-control`. Read at
+  `95a866f` on 2026-08-28, it turns `FLAG_FORCE_SYNC_RESERVED` into a live
+  `FLAG_FORCE_SYNC`, carries the bit through dispatch, and honours it in
+  `LocalFs` — and it touches `crates/lbfs-proto/src/frame.rs`,
+  `crates/lbfs-server/src/rpc/mod.rs`, `crates/lbfs-server/src/rpc/dispatch.rs`,
+  `tests/src/lib.rs` and `tests/tests/protocol.rs`.
+
+  At that commit it **does not** move `PROTOCOL_VERSION` and adds **no**
+  opcode, so the two changes conflict only textually, in `frame.rs` and in the
+  server's read loop. Whichever lands second rebases. Two things to confirm
+  rather than assume when that happens: that the branch still leaves the
+  version at `2` — a live flag on `FSYNC` is a wire-behaviour change that could
+  yet earn a bump of its own, and two independent bumps to `3` produce a tree
+  where one version number means two wire formats — and that
+  `FLAG_FORCE_SYNC_RESERVED` has become `FLAG_FORCE_SYNC`, which is the name
+  this plan's Global Constraints must then leave alone.
 - **This plan bumps the protocol version to `3`.** Both ends deploy together
   (spec §11, "Noted and deferred"), so the cost is a lock-step deploy and
   nothing else.
@@ -47,7 +57,8 @@ tempfile; Linux 7.0 guests under libvirt.
 - Frame header: exactly 24 bytes, little-endian, layout per spec §3.1.
   **Unchanged by this plan.**
 - **Frame flag bit 1 belongs to the forced-sync fast-follow. No task here reads
-  it, writes it, or renames `FLAG_FORCE_SYNC_RESERVED`.**
+  it, writes it, or renames its constant** — `FLAG_FORCE_SYNC_RESERVED` before
+  that branch lands, `FLAG_FORCE_SYNC` after.
 - Protocol magic `LBFS`; version moves `2` → `3`, exact match on both ends.
   Task 2 owns that move and no other task touches the number.
 - Status field: `0` OK, `1..=4095` Linux errno, `>= 0xFF00` protocol statuses.
