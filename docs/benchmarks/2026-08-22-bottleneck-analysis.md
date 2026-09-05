@@ -503,12 +503,17 @@ operations — the VFS rule, now on the server's side of the wire.
   whatever the mount asks for; today's `direct=1` jobs bypass readahead
   entirely, so no number here reflects that cap.
 
-  **This item stays open, and the strike above does not reach it** (noted
-  2026-08-28, because the two sit next to each other and invite the
-  confusion). `perf/big-requests` raised the *request* ceiling and ran every
-  job with `direct=1`, which bypasses readahead by definition, so it measured
-  nothing about this splitter. Different mechanism, different code path, and
-  still nobody has measured a buffered sequential read against it.
+  **Measured 2026-08-28, and the cap was worth half the throughput of a
+  buffered sequential read.** Raising `read_ahead_kb` to 1024 lifts that shape
+  from 843 to 1627 MB/s at `bs=1M` (medians of three interleaved rounds) while
+  the `direct=1` control holds within 0.3% and random reads stay flat. The
+  curve flattens at 1024 because that is where the readahead window meets the
+  negotiated 1 MiB `max_io_size`: `strace` counts 4102 reads off `/dev/fuse`
+  at 128 against 517 at both 1024 and 4096. Full campaign, with the memory and
+  tail-latency costs that argue against going past 1024, in
+  `2026-08-28-readahead.md`. The strike on the bullet above never reached this
+  item — that experiment raised the *request* ceiling and ran every job with
+  `direct=1`, which bypasses readahead by definition.
 * `lbfs-bench` addresses one file directly under the export root. `LOOKUP`
   refuses a name containing a slash, so a path like `bench/rand.dat` returns
   `EINVAL`.
