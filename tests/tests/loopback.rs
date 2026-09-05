@@ -774,6 +774,106 @@ fn two_direct_writers_on_one_file_both_land_without_the_writeback_cache() {
     two_direct_writers_on_one_file_both_land(false);
 }
 
+/// Two appenders, one file, both `O_DIRECT`, both mount shapes.
+///
+/// Append is the one write shape this change deliberately leaves alone, and
+/// the reason is a single line: `fuse_dio_wr_exclusive_lock` returns true for
+/// `IOCB_APPEND` before it looks at anything else
+/// (`fs/fuse/file.c:1412-1413`), because an append has to know the eventual end
+/// of the file. So two appenders serialise, and this test says so by insisting
+/// that each block arrives whole.
+///
+/// Both mount shapes, because the server reads `O_APPEND` differently in each
+/// and only one of them can be wrong at a time:
+///
+/// * **writeback on** — the server strips `O_APPEND` from its own descriptor,
+///   and the client's kernel picks the offset itself through
+///   `generic_write_checks` (`file.c:1792` on the direct path, `file.c:1496` on
+///   the cached one) while holding the exclusive lock. Two appends that raced
+///   would overwrite one another and the file would come out short.
+/// * **writeback off** — the server keeps `O_APPEND`, and the export's own
+///   kernel places the bytes at the true end of the file, so a stale client
+///   `i_size` costs nothing.
+///
+/// The direct path also skips the `fuse_update_attributes(STATX_SIZE |
+/// STATX_MODE)` that opens `fuse_cache_write_iter` (`file.c:1482-1486`). That
+/// is exactly the refresh the writeback cache already answered locally, so the
+/// offset arithmetic must come out the same. This test is what says it did.
+fn appends_stay_whole_with_direct_io(writeback: bool) {
+    const BLOCK: usize = 64 * 1024;
+
+    let mut lb = Loopback::start(Opts {
+        writeback,
+        ..Opts::default()
+    });
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+    let path = mnt.join("appended.dat");
+
+    std::fs::write(&path, vec![b'a'; BLOCK]).unwrap();
+
+    std::thread::scope(|s| {
+        for mark in *b"bc" {
+            let path = path.clone();
+            s.spawn(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .unwrap();
+                f.write_all(&vec![mark; BLOCK]).unwrap();
+            });
+        }
+    });
+
+    let landed = std::fs::read(export.join("appended.dat")).unwrap();
+    assert_eq!(
+        landed.len(),
+        3 * BLOCK,
+        "two appends of {BLOCK} bytes onto {BLOCK} bytes must give 3 blocks; \
+         a short file means the two appends chose the same offset"
+    );
+    assert!(landed[..BLOCK].iter().all(|&b| b == b'a'));
+
+    // Order is nobody's business — the exclusive lock says one goes first, not
+    // which. Wholeness is: neither block may carry a byte of the other.
+    let second = &landed[BLOCK..2 * BLOCK];
+    let third = &landed[2 * BLOCK..];
+    let mut marks = [second[0], third[0]];
+    marks.sort_unstable();
+    assert_eq!(marks, [b'b', b'c'], "one appender's block never arrived");
+    assert!(second.iter().all(|&b| b == second[0]), "block two is torn");
+    assert!(third.iter().all(|&b| b == third[0]), "block three is torn");
+
+    // One more append through an ordinary descriptor, to prove the cached path
+    // still agrees with the direct one about where the end of the file is.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"tail").unwrap();
+        f.sync_all().unwrap();
+    }
+    let landed = std::fs::read(export.join("appended.dat")).unwrap();
+    assert_eq!(landed.len(), 3 * BLOCK + 4);
+    assert_eq!(&landed[3 * BLOCK..], b"tail");
+
+    lb.unmount();
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn appends_stay_whole_with_direct_io_and_the_writeback_cache() {
+    appends_stay_whole_with_direct_io(true);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn appends_stay_whole_with_direct_io_without_the_writeback_cache() {
+    appends_stay_whole_with_direct_io(false);
+}
+
 /// Unmounting is the drain, and the drain is what the shipped binary leans on.
 ///
 /// `crates/lbfs-client/src/main.rs` treats `drop(session)` as "unmount, drain,
