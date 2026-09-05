@@ -91,8 +91,15 @@ Every message is one frame:
 - `op/status`: opcode in requests. In responses: `0` = OK, `1..4096` = Linux
   errno, `>= 0xFF00` = protocol statuses (`VERSION_MISMATCH`,
   `ATTACH_DENIED`, `NOT_EXPORTED`).
-- `flags`: bit 0 = `NO_REPLY` (used by FORGET). We reserve bit 1 now for the
-  future `FORCE_SYNC` control flag (§11), so adding it later breaks nothing.
+- `flags`: bit 0 = `NO_REPLY` (used by FORGET). Bit 1 = `FORCE_SYNC`, live in
+  both directions (§6). On a `FSYNC`/`FSYNCDIR` request it overrides the
+  server's durability policy; on the reply it carries the server's
+  acknowledgement that the sync ran. The reservation cost nothing to redeem:
+  the server has never masked flag bits or refused an unknown one, so a client
+  setting bit 1 against a server that predates the control is inert rather than
+  fatal, and the version stayed at `2`. **An unknown flag bit is not a protocol
+  violation** — a peer must ignore what it does not recognize, which is what
+  keeps the next flag as cheap as this one was.
 - `body`: postcard-encoded per-op struct. Small, metadata only.
 - `data`: bulk payload — present only on `WRITE` requests, `READ`/`GETXATTR`/
   `LISTXATTR` responses, and `SETXATTR` requests. Never passes through the
@@ -323,8 +330,46 @@ different things — `FOPEN_DIRECT_IO` tells the client's kernel to keep one
 handle out of its page cache and demands no alignment of anybody, while
 `O_DIRECT` on the export would demand aligned block I/O. Setting the first and
 stripping the second is one coherent position.
-A future control message will force a real sync regardless of this setting;
-§3.1 reserves frame flag bit 1 for it now (§11).
+
+### Forcing a sync regardless of the policy
+
+Frame flag bit 1, `FORCE_SYNC` (§3.1), overrides the policy for one call. A
+`FSYNC` or `FSYNCDIR` carrying it runs the real syscall whatever `fsync` says,
+and the reply carries the bit back so the client knows the sync happened — a
+server built before the control ignores the request flag and answers `OK` with
+`flags = 0`, and nothing else separates the two.
+
+Two entry points, and neither one is an application's own `fsync(2)`: forcing
+those would leave `ignore` with nothing to configure.
+
+- **A control xattr on the mount root.** `setxattr` of `user.lbfs.sync` on the
+  mountpoint. The client intercepts that one name on that one inode and never
+  forwards it; the same name on any other file is an ordinary attribute. `user.`
+  rather than `trusted.` so an unprivileged CI job can invoke it, and `setxattr`
+  alone, so the name reads back absent and never lists — the mount keeps
+  nothing.
+- **The client driver, at unmount.** `main.rs` runs the same control after
+  `drop(session)` and before the connection closes. That ordering is the point:
+  `umount(2)` has pushed every dirty page across as an ordinary `WRITE`, so the
+  export's whole data set sits in the server's page cache and nothing later in
+  the shutdown would flush it. Bounded by a timeout and never fatal — an exit
+  that refused to happen would be the worse trade.
+
+**Granularity.** `FORCE_SYNC` on a `FSYNC` means `fsync`/`fdatasync` on that
+file, so under `honor` the flag changes nothing. On a `FSYNCDIR` it means the
+same for any directory but the export root, where it means `syncfs(2)` — "sync
+the export". Per-inode `fsync` on a directory writes that directory's metadata
+and leaves every dirty file page where `ignore` put it, which is not what either
+entry point above is asking for. The widening stops at the root because the root
+is the node whose name already means the whole export, and `syncfs` never syncs
+less than `fsync` would.
+
+**`O_SYNC` masking does not change.** `ignore` has two halves and this control
+touches one. `mask_open_flags` fixes a descriptor's flags at `OPEN`/`CREATE`
+time and no later request can revisit them; a control that changed the policy
+for the life of a handle would be a runtime policy switch, not a forced sync.
+Nor does it need to — `O_SYNC` would make each write durable as it lands, and
+the forced sync makes every write durable at a moment the caller picks.
 
 ## 7. Client (`lbfs-client`)
 
@@ -502,7 +547,10 @@ TDD throughout. Layers:
 2. **Protocol integration (no FUSE/VM):** raw frames against a real server
    exporting a tempdir — handshake negotiation, attach allow/deny, every
    opcode's happy + errno paths, `ESTALE` after forget, both fsync policies,
-   connection-fatal violations. This layer pins the wire contract.
+   the `FORCE_SYNC` flag and its acknowledgement, connection-fatal violations.
+   This layer pins the wire contract, and it owns the one witness to whether a
+   sync really ran: `fsync(2)` on a FIFO answers `EINVAL`, so a forced sync on
+   one under `ignore` proves the syscall reached the kernel.
 3. **Full-stack loopback (host, needs `/dev/fuse`):** real client mounting
    from a real server over localhost; std::fs operations through the mount.
 4. **E2e in VMs:** smoke suite covering every v1 op; **fio** for both
@@ -523,13 +571,16 @@ Fast-follows (priority order):
 1. **Reconnection / session resumption:** re-`ATTACH` on connection loss
    with re-establishment of node and handle state; requires a session-resume
    protocol extension (the `HELLO` version field is the vehicle).
-2. **Forced-sync control:** force a real sync even while the server runs
-   `fsync = "ignore"`. Two entry points: one reachable from user space on a
-   live mount (an ioctl or a control xattr on the mount root), and one the
-   client driver calls on its own at moments such as unmount. On the wire,
-   both ride the reserved frame flag bit 1 on `FSYNC`/`FSYNCDIR` (or a
-   dedicated opcode) so the server honors the sync no matter its policy —
-   e.g., before snapshots.
+2. ~~**Forced-sync control.**~~ **Done** (2026-08-28) — §6 holds the design.
+   Both entry points shipped: `setxattr` of `user.lbfs.sync` on the mount root,
+   and the client driver's own call after the unmount. Both ride frame flag
+   bit 1 on `FSYNCDIR`, and the reply carries the bit back as the server's
+   acknowledgement. The protocol version stayed at `2`. The chosen entry point
+   was the control xattr rather than an ioctl, so lbfs still implements no
+   `ioctl` and a per-file forced sync has no user-space route — the wire carries
+   `FORCE_SYNC` on `FSYNC` and the protocol suite exercises it, but no shipped
+   caller sends it. No test yet shows the forced bytes surviving a power cut;
+   that needs the VM pair.
 
 Long-term direction: lbfs grows toward a single-writer, multi-reader,
 volatile overlay filesystem tuned for CI and build systems. Build hosts
