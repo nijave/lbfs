@@ -18,6 +18,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -191,7 +192,15 @@ fn run() -> Result<(), StartupError> {
         n_threads,
         cli.fuse_clone_fd,
     );
-    let fs = LbfsFuse::new(conn, rt.handle().clone(), ttl, entry_ttl, writeback);
+    // Cloned rather than moved: the exit path still needs the connection after
+    // the mount has let go of it, to force the sync below.
+    let fs = LbfsFuse::new(
+        Arc::clone(&conn),
+        rt.handle().clone(),
+        ttl,
+        entry_ttl,
+        writeback,
+    );
     let session =
         fuser::spawn_mount(fs, &cli.mountpoint, &cfg).map_err(|source| StartupError::Mount {
             path: cli.mountpoint.display().to_string(),
@@ -215,9 +224,58 @@ fn run() -> Result<(), StartupError> {
     // two would fail those last writes with `EIO` and lose the data.
     tracing::info!("unmounting");
     drop(session);
+
+    // Now, and not a step earlier: the unmount above has pushed every dirty
+    // page across as an ordinary `WRITE`, so the whole of this mount's data
+    // sits in the server's page cache and nothing later in this shutdown will
+    // flush it. Under `fsync = "ignore"` that is precisely the data a crash
+    // would lose, and this is the driver-initiated half of the forced-sync
+    // control (spec §11).
+    force_sync_on_exit(&rt, &conn);
+
     match ending {
         Ending::Signalled => Ok(()),
         Ending::SessionEnded => Err(StartupError::SessionEnded),
+    }
+}
+
+/// How long the exit waits for its forced sync before giving up on it.
+///
+/// Bounded, because the mount is already gone and the only thing this call can
+/// still cost is the process's exit: a server wedged mid-`syncfs` must not turn
+/// "unmount, drain, exit" into "unmount, drain, hang". Generous, because a very
+/// dirty export takes real time to flush and giving up early wastes the sync
+/// rather than shortening it.
+const EXIT_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Make the export durable on the way out, whatever the server's policy.
+///
+/// Called after the unmount and before the connection closes, which is the only
+/// window where both halves hold: the data has all arrived, and the socket still
+/// works. Failure is reported and never raised — an exit that refused to happen
+/// because a sync did not would be a worse bargain than an unsynced export, and
+/// the operator can read the reason in the log either way.
+///
+/// `EOPNOTSUPP` has one specific meaning here: the server is older than the
+/// control and ignored the flag, so its durability policy still decides. That
+/// deserves the loudest of the three lines, because it is the case where an
+/// operator believes they have a guarantee they do not have.
+fn force_sync_on_exit(rt: &tokio::runtime::Runtime, conn: &Arc<Connection>) {
+    let conn = Arc::clone(conn);
+    let synced = rt.block_on(async move {
+        tokio::time::timeout(EXIT_SYNC_TIMEOUT, conn.force_sync_export()).await
+    });
+    match synced {
+        Ok(Ok(())) => tracing::info!("forced a sync of the export before exit"),
+        Ok(Err(e)) if e.0 == libc::EOPNOTSUPP as u16 => tracing::warn!(
+            "this server does not implement the forced-sync control; its \
+             durability policy decided, and the export may hold unsynced writes"
+        ),
+        Ok(Err(e)) => tracing::warn!(errno = e.0, "the export was not synced on the way out"),
+        Err(_) => tracing::warn!(
+            timeout = ?EXIT_SYNC_TIMEOUT,
+            "the forced sync did not finish; exiting anyway"
+        ),
     }
 }
 

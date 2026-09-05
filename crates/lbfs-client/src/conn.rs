@@ -55,8 +55,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use lbfs_proto::frame::{
-    FrameHeader, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE,
-    PROTOCOL_VERSION, STATUS_ATTACH_DENIED, STATUS_NOT_EXPORTED, STATUS_OK,
+    FrameHeader, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE, FLAG_FORCE_SYNC, FLAG_NO_REPLY, MAGIC,
+    MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_ATTACH_DENIED, STATUS_NOT_EXPORTED, STATUS_OK,
     STATUS_VERSION_MISMATCH, WINDOW_CLAMP,
 };
 use lbfs_proto::io::{read_body, read_header, write_frame, IoError};
@@ -70,7 +70,9 @@ use lbfs_proto::ops::{
     RenameRequest, RmdirRequest, SetattrRequest, SetxattrRequest, StatfsRequest, SymlinkRequest,
     UnlinkRequest, WriteReply, WriteRequest,
 };
-use lbfs_proto::types::{Entry, Fh, FileAttr, NodeId, SetattrArgs, StatfsReply, XattrReply};
+use lbfs_proto::types::{
+    Entry, Fh, FileAttr, NodeId, SetattrArgs, StatfsReply, XattrReply, ROOT_NODE,
+};
 use lbfs_proto::Errno;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -223,6 +225,11 @@ struct HandshakeReply {
 /// A reply, unpacked from its frame.
 struct Reply {
     status: u16,
+    /// The reply frame's own flags. Only a forced sync ever sets one, and its
+    /// absence is what tells a client that the server never heard of the
+    /// control — both ends still answer `2` to the handshake, so nothing else
+    /// separates a sync that ran from one that was skipped (spec §3.1).
+    flags: u16,
     body: Vec<u8>,
     data: Vec<u8>,
 }
@@ -483,7 +490,7 @@ impl Connection {
         req: &Req,
         data: Vec<u8>,
     ) -> Result<(Rep, Vec<u8>), Errno> {
-        let (body, data) = self.call_raw(op, encode(op, req)?, data).await?;
+        let (_, body, data) = self.call_raw(op, 0, encode(op, req)?, data).await?;
         match postcard::from_bytes(&body) {
             Ok(rep) => Ok((rep, data)),
             Err(e) => {
@@ -502,17 +509,36 @@ impl Connection {
     /// keeps the postcard round trip out of the hot path for two thirds of the
     /// opcode table.
     async fn call_unit<Req: Serialize>(&self, op: Opcode, req: &Req) -> Result<(), Errno> {
-        self.call_raw(op, encode(op, req)?, Vec::new()).await?;
+        self.call_raw(op, 0, encode(op, req)?, Vec::new()).await?;
         Ok(())
     }
 
+    /// The same, carrying request flags out and handing the reply's back.
+    ///
+    /// Only the forced-sync control needs either half, which is why the two
+    /// plain wrappers above spend no signature on them.
+    async fn call_unit_flagged<Req: Serialize>(
+        &self,
+        op: Opcode,
+        req: &Req,
+        flags: u16,
+    ) -> Result<u16, Errno> {
+        let (reply_flags, _, _) = self
+            .call_raw(op, flags, encode(op, req)?, Vec::new())
+            .await?;
+        Ok(reply_flags)
+    }
+
     /// Everything a call does that does not depend on the body's type.
+    ///
+    /// Returns the reply frame's flags alongside its two segments.
     async fn call_raw(
         &self,
         op: Opcode,
+        flags: u16,
         body: Vec<u8>,
         data: Vec<u8>,
-    ) -> Result<(Vec<u8>, Vec<u8>), Errno> {
+    ) -> Result<(u16, Vec<u8>, Vec<u8>), Errno> {
         if self.shared.is_dead() {
             return Err(Errno::EIO);
         }
@@ -578,7 +604,7 @@ impl Connection {
         slot.send(Outbound {
             id,
             op: op as u16,
-            flags: 0,
+            flags,
             body,
             data,
         });
@@ -587,7 +613,7 @@ impl Connection {
         // construction: it only runs when the connection is over.
         let reply = rx.await.map_err(|_| Errno::EIO)?;
         match reply.status {
-            STATUS_OK => Ok((reply.body, reply.data)),
+            STATUS_OK => Ok((reply.flags, reply.body, reply.data)),
             errno @ 1..=4095 => Err(Errno(errno)),
             status => {
                 // Protocol statuses belong to the handshake, and 4096..0xFF00
@@ -839,8 +865,8 @@ impl Connection {
             offset,
             size,
         };
-        let (_, data) = self
-            .call_raw(Opcode::Read, encode(Opcode::Read, &req)?, Vec::new())
+        let (_, _, data) = self
+            .call_raw(Opcode::Read, 0, encode(Opcode::Read, &req)?, Vec::new())
             .await?;
         Ok(data)
     }
@@ -999,6 +1025,53 @@ impl Connection {
             .await
     }
 
+    /// Make the whole export durable, whatever the server's policy (spec §6,
+    /// §11).
+    ///
+    /// A forced `FSYNCDIR` on the export root, which the server reads as "sync
+    /// the export" and answers with `syncfs(2)`. The two entry points spec §11
+    /// names both land here: a `setxattr` of the control name on the mount root,
+    /// and the driver's own call at unmount.
+    ///
+    /// Three round trips rather than one, because `FSYNCDIR` needs a directory
+    /// handle and this call owns none. A control invoked before a snapshot or at
+    /// an unmount can afford them.
+    ///
+    /// `EOPNOTSUPP` means the server answered without the acknowledgement — it
+    /// predates this control and ignored the flag. That reads as failure on
+    /// purpose: both ends agree on protocol version `2` either way, so a caller
+    /// that took `Ok` at face value would believe in a sync that never ran.
+    pub async fn force_sync_export(&self) -> Result<(), Errno> {
+        let dh = self.opendir(ROOT_NODE).await?;
+        let synced = self
+            .call_unit_flagged(
+                Opcode::Fsyncdir,
+                &FsyncdirRequest {
+                    node: ROOT_NODE,
+                    dh,
+                    // Metadata included: a snapshot wants the directory tree as
+                    // much as the bytes in it.
+                    datasync: false,
+                },
+                FLAG_FORCE_SYNC,
+            )
+            .await;
+        // The handle closes whatever the sync answered; leaking one on the
+        // error path would strand a descriptor on the server for the life of
+        // the session.
+        let released = self.releasedir(ROOT_NODE, dh).await;
+        let acked = synced?;
+        released?;
+        if acked & FLAG_FORCE_SYNC == 0 {
+            tracing::warn!(
+                "the server did not acknowledge the forced sync; it predates the \
+                 control and its durability policy still decides"
+            );
+            return Err(Errno(libc::EOPNOTSUPP as u16));
+        }
+        Ok(())
+    }
+
     pub async fn statfs(&self, node: NodeId) -> Result<StatfsReply, Errno> {
         let (reply, _) = self
             .call(Opcode::Statfs, &StatfsRequest { node }, Vec::new())
@@ -1041,7 +1114,7 @@ impl Connection {
             name: name.to_vec(),
             flags,
         };
-        self.call_raw(Opcode::Setxattr, encode(Opcode::Setxattr, &req)?, value)
+        self.call_raw(Opcode::Setxattr, 0, encode(Opcode::Setxattr, &req)?, value)
             .await?;
         Ok(())
     }
@@ -1286,6 +1359,7 @@ async fn read_loop(sock: &mut OwnedReadHalf, shared: &Shared, max_data: u32) -> 
         }
         let reply = Reply {
             status: hdr.op_or_status,
+            flags: hdr.flags,
             body,
             data,
         };
