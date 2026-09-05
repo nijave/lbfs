@@ -78,7 +78,11 @@ pub trait FileSystem: Send + Sync + 'static {
     ) -> FsResult<u32>;
     async fn flush(&self, node: NodeId, fh: Fh) -> FsResult<()>;
     async fn release(&self, node: NodeId, fh: Fh) -> FsResult<()>;
-    async fn fsync(&self, node: NodeId, fh: Fh, datasync: bool) -> FsResult<()>;
+    /// `force` carries the frame's `FLAG_FORCE_SYNC`: run the real
+    /// `fsync`/`fdatasync` whatever the durability policy says (spec §6). Under
+    /// `fsync = "honor"` it changes nothing, since the unforced call already
+    /// reaches the syscall.
+    async fn fsync(&self, node: NodeId, fh: Fh, datasync: bool, force: bool) -> FsResult<()>;
     async fn fallocate(
         &self,
         node: NodeId,
@@ -118,7 +122,11 @@ pub trait FileSystem: Send + Sync + 'static {
         max_bytes: u32,
     ) -> FsResult<ReaddirplusReply>;
     async fn releasedir(&self, node: NodeId, dh: Fh) -> FsResult<()>;
-    async fn fsyncdir(&self, node: NodeId, dh: Fh, datasync: bool) -> FsResult<()>;
+    /// As [`FileSystem::fsync`], with one widening: a forced sync of the
+    /// **export root** means "make the export durable", which a per-inode
+    /// `fsync` on a directory descriptor cannot deliver. Implementations run
+    /// `syncfs(2)` for that node and the narrow `fsync` for any other.
+    async fn fsyncdir(&self, node: NodeId, dh: Fh, datasync: bool, force: bool) -> FsResult<()>;
     async fn statfs(&self, node: NodeId) -> FsResult<StatfsReply>;
     /// `(value_size, bytes)`. Per FUSE convention `size == 0` asks for the
     /// length alone and the returned byte vector is empty.

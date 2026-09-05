@@ -240,7 +240,7 @@ pub(crate) async fn dispatch(
         }
         Opcode::Fsync => {
             let req = decode!(FsyncRequest, body);
-            unit(fs.fsync(req.node, req.fh, req.datasync).await)
+            unit(fs.fsync(req.node, req.fh, req.datasync, false).await)
         }
         Opcode::Fallocate => {
             let req = decode!(FallocateRequest, body);
@@ -307,7 +307,7 @@ pub(crate) async fn dispatch(
         }
         Opcode::Fsyncdir => {
             let req = decode!(FsyncdirRequest, body);
-            unit(fs.fsyncdir(req.node, req.dh, req.datasync).await)
+            unit(fs.fsyncdir(req.node, req.dh, req.datasync, false).await)
         }
         Opcode::Statfs => {
             let req = decode!(StatfsRequest, body);
