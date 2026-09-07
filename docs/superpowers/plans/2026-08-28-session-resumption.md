@@ -206,7 +206,7 @@ a short read here is a silently weak secret.
   here: protocol version `3`, the `RESUME` and `DETACH` opcodes, the three new
   statuses, the two config keys, and the sentence §7 replaces.
 
-- [ ] **Step 1: §3.2 — the version and the new handshake field**
+- [x] **Step 1: §3.2 — the version and the new handshake field**
 
 Replace the version-`2` paragraph of step 1 with a version-`3` one that keeps
 the existing argument verbatim and adds: version `3` carries a request to
@@ -216,7 +216,7 @@ trailing-byte tolerance is the same reason the match stays exact.
 Add to step 2's list: the settled grace, in milliseconds, zero when the server
 retains nothing.
 
-- [ ] **Step 2: §3.3 — session lifetime**
+- [x] **Step 2: §3.3 — session lifetime**
 
 After the `NodeId` bullet, state that a *session* rather than a connection
 scopes node ids, generations and handles, that a session outlives its
@@ -224,16 +224,16 @@ socket by the configured grace, and that a client re-attaches with the ticket
 `ATTACH` handed it. Point at the design document for what that does and does
 not restore.
 
-- [ ] **Step 3: §3.4 — two opcodes**
+- [x] **Step 3: §3.4 — two opcodes**
 
 Add `RESUME` and `DETACH` to the Session row of the opcode table.
 
-- [ ] **Step 4: §4 — the config keys**
+- [x] **Step 4: §4 — the config keys**
 
 Add `resume_grace = "60s"` and `max_resumable_sessions = 64` to the TOML block,
 with one sentence each.
 
-- [ ] **Step 5: §7 — replace the connection-loss bullet**
+- [x] **Step 5: §7 — replace the connection-loss bullet**
 
 Find:
 
@@ -252,14 +252,14 @@ directory cursors intact; a server that does not — a restart, an expired grace
 a wrong ticket — leaves the mount dead in the old sense, `EIO` until unmount.
 Name the design document for the reasoning.
 
-- [ ] **Step 6: §8 — staleness**
+- [x] **Step 6: §8 — staleness**
 
 Replace "Server restart ⇒ connection drop ⇒ `EIO` until remount (until
 reconnection lands)" with the settled behaviour: a server restart empties the
 session registry, so it refuses the claim and the mount answers `EIO` until
 remount. A transport failure to a server that stayed up resumes instead.
 
-- [ ] **Step 7: §11 — retire the fast-follow, add the leftovers**
+- [x] **Step 7: §11 — retire the fast-follow, add the leftovers**
 
 Move fast-follow 1 out of the priority list and into a line recording that it
 landed, naming the design document. Renumber what remains, reading §11 as it
@@ -271,12 +271,12 @@ space; a session-level `FORGET` queue that survives a connection swap; and
 reclaiming the lookup counts and handles stranded by requests that died in the
 gap.
 
-- [ ] **Step 8: Check the diff**
+- [x] **Step 8: Check the diff**
 
 Run: `git diff --stat docs/superpowers/specs/2026-08-20-lbfs-design.md`
 Expected: one file changed.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add docs/superpowers/specs/2026-08-20-lbfs-design.md docs/superpowers/plans/2026-08-28-session-resumption.md
