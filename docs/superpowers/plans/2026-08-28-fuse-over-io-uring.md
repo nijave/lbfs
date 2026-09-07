@@ -2,7 +2,43 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to execute this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Not started. Task 1 is a gate, not a formality — it decides whether
+**Status:** Stopped at Task 1's own gate on 2026-09-07, and the honest prior
+held. The transport slice of a 4 KiB operation — the `/dev/fuse` syscall pair
+plus the scheduling around it, the only part of the mount's cost a ring
+transport could remove — measures **14.2 µs on the random read and 13.5 µs on
+the random write**, against the 25 µs bar Task 1 Step 4 set. Both figures
+over-count the prize: they carry kprobe overhead and two wakeups a ring keeps.
+The record, method and per-round tables live in
+`docs/benchmarks/2026-09-07-fuse-uring-ceiling.md` (dated by the campaign
+rather than by this plan's proposed `2026-08-28-fuse-over-io-uring.md` name).
+This plan joins `2026-08-22-big-requests.md` and the `--fuse-threads` ladder as
+the third performance campaign here to end at its own measurement. Tasks 2-9
+stay unexecuted and the fork never starts; Task 9's spec §11 annotation — keep
+the survey item, attach the finding — remains for a later session.
+
+Three things the execution learned that the plan did not know:
+
+- **Step 1's Makefile half had already landed.** `vm/deploy.sh` has installed
+  `lbfs-bench` on the client guest since 2026-09-05 (branch
+  `build/deploy-lbfs-bench`), and Phase 10 of the bottleneck analysis
+  re-measured the stale baselines the same day. Task 1 re-anchored both
+  columns again anyway — same-day columns are the method — and they held:
+  mount − RPC medians of 27.9 µs (randread 4 KiB QD1), 34.5 µs (randwrite),
+  94.0 µs (QD16) against Phase 10's 31.6 / 36.6 / 86.1.
+- **The guest kernel inlines `fuse_simple_request`**, as Step 3
+  anticipated, so the attribution probes sit on `request_wait_answer` and the
+  `fuse_dev_do_read`/`fuse_dev_do_write` boundary instead. That split is
+  cleaner than probing the bridge's `conn.call`: it cuts the operation exactly
+  at the kernel boundary, so the service segment prices fuser-plus-bridge
+  userspace time (14-17 µs, which a ring also keeps) separately from the
+  transport itself.
+- **The two halves of the gap cross-check.** Transport (14.2 µs) plus bridge
+  (14.4 µs) reproduces the read's 27.9 µs anchor gap within a microsecond, so
+  the ceiling is not an artifact of where the probes sit.
+
+The paragraph below is the plan as written before the measurement.
+
+Task 1 is a gate, not a formality — it decides whether
 the rest of this plan runs at all, and the honest prior is that it might not.
 Two performance campaigns in this repository already ended in recorded negative
 results (`docs/benchmarks/2026-08-22-big-requests.md`, and the `--fuse-threads`
@@ -244,14 +280,14 @@ Task 9's negative-result record is the whole deliverable.
 - Produces: a current, same-day measurement of the FUSE tax on 4 KiB shapes,
   and a go/no-go ruling written down.
 
-- [ ] **Step 1: Re-measure the raw RPC baseline, because the recorded one is stale**
+- [x] **Step 1: Re-measure the raw RPC baseline, because the recorded one is stale**
 
 `make build-guest` builds `lbfs-server` and `lbfs-client` only, so `lbfs-bench`
 never reaches the guest. Add it, deploy it, and run the 4 KiB shapes against the
 same export the mount uses. The recorded 146 µs write / 92 µs read predates
 kill-priv, fuser 0.18 and the window-permit fix.
 
-- [ ] **Step 2: Measure the same shapes through the mount, same day, interleaved**
+- [x] **Step 2: Measure the same shapes through the mount, same day, interleaved**
 
 4 KiB random read and random write, QD1 psync, plus QD16 libaio. Alternate
 mount and raw-RPC measurements rather than running one after the other, and
@@ -259,7 +295,7 @@ report medians of at least three — the campaign method every benchmark in this
 repository now uses, for the reason `2026-08-22-big-requests.md` and the
 parallel-direct-writes plan both record.
 
-- [ ] **Step 3: Split the difference into its parts**
+- [x] **Step 3: Split the difference into its parts**
 
 The gap between the two columns is FUSE plus the bridge. Attribute it with
 `bpftrace` on the client: time from the kernel's `fuse_simple_request` (or the
@@ -268,7 +304,7 @@ a good many `fs/fuse` functions) to the bridge's `conn.call`,
 and back. What this plan could recover is the syscall-and-scheduling part of
 that, not the whole gap.
 
-- [ ] **Step 4: Rule**
+- [x] **Step 4: Rule**
 
 Write the ruling into the benchmark document with its numbers.
 
@@ -278,7 +314,7 @@ operation**, which is roughly 20% and enough to close a meaningful part of the
 gap to kernel NFS. Below that, stop: record the measurement, skip to Task 9,
 and leave spec §11's item in place with the finding attached.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Makefile docs/benchmarks/2026-08-28-fuse-over-io-uring.md
