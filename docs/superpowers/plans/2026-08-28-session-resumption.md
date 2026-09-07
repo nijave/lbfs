@@ -5,27 +5,18 @@
 **Status:** Not started. Written 2026-08-28 alongside
 `docs/superpowers/specs/2026-08-28-session-resumption-design.md`, which holds
 the reasoning this plan executes. Read that document first; this one assumes
-its rulings and does not re-argue them.
+its rulings and does not re-argue them. Revised 2026-09-07 after subagent
+review: no ticket rotation, shape checks inside the registry's `claim`,
+resumption opt-in with the shipped binary on by default, and the review's
+mechanical corrections folded in.
 
 **Two coordination facts before Task 1.**
 
-- **A second change is in flight on the same files.** The forced-sync control
-  message (spec §11 fast-follow 2) lives on `feat/forced-sync-control`. Read at
-  `95a866f` on 2026-08-28, it turns `FLAG_FORCE_SYNC_RESERVED` into a live
-  `FLAG_FORCE_SYNC`, carries the bit through dispatch, and honours it in
-  `LocalFs` — and it touches `crates/lbfs-proto/src/frame.rs`,
-  `crates/lbfs-server/src/rpc/mod.rs`, `crates/lbfs-server/src/rpc/dispatch.rs`,
-  `tests/src/lib.rs` and `tests/tests/protocol.rs`.
-
-  At that commit it **does not** move `PROTOCOL_VERSION` and adds **no**
-  opcode, so the two changes conflict only textually, in `frame.rs` and in the
-  server's read loop. Whichever lands second rebases. Two things to confirm
-  rather than assume when that happens: that the branch still leaves the
-  version at `2` — a live flag on `FSYNC` is a wire-behaviour change that could
-  yet earn a bump of its own, and two independent bumps to `3` produce a tree
-  where one version number means two wire formats — and that
-  `FLAG_FORCE_SYNC_RESERVED` has become `FLAG_FORCE_SYNC`, which is the name
-  this plan's Global Constraints must then leave alone.
+- **The forced-sync control landed on `main`** (2026-09-07, PR #19). It made
+  frame flag bit 1 the live `FLAG_FORCE_SYNC`, left `PROTOCOL_VERSION` at `2`,
+  added no opcode, and struck fast-follow 2 from spec §11 — so Task 1 Step 7
+  renumbers a list that has already lost one entry. Read §11 as it stands
+  before editing it. No rebase question remains; this plan builds on `main`.
 - **This plan bumps the protocol version to `3`.** Both ends deploy together
   (spec §11, "Noted and deferred"), so the cost is a lock-step deploy and
   nothing else.
@@ -56,9 +47,9 @@ tempfile; Linux 7.0 guests under libvirt.
 
 - Frame header: exactly 24 bytes, little-endian, layout per spec §3.1.
   **Unchanged by this plan.**
-- **Frame flag bit 1 belongs to the forced-sync fast-follow. No task here reads
-  it, writes it, or renames its constant** — `FLAG_FORCE_SYNC_RESERVED` before
-  that branch lands, `FLAG_FORCE_SYNC` after.
+- **Frame flag bit 1 is the live `FLAG_FORCE_SYNC`** (landed with the
+  forced-sync control, 2026-09-07). No task here reads it, writes it, or
+  renames it.
 - Protocol magic `LBFS`; version moves `2` → `3`, exact match on both ends.
   Task 2 owns that move and no other task touches the number.
 - **Resumption is opt-in at the handshake, and the library default is off.**
@@ -172,7 +163,9 @@ inside `SETTLE_TIMEOUT` (30 s).
 `rustix` already ships in the workspace with `["event", "fs", "net", "process",
 "thread"]`. Adding `"rand"` reaches `rustix::rand::getrandom`, which is the
 `getrandom(2)` syscall — no new crate, no new supply chain, and `deny.toml`
-unchanged. Task 2 makes that edit.
+unchanged. Task 2 makes that edit. The call takes a `GetRandomFlags` argument
+and reports how many bytes it filled; Task 3 loops until all 16 fill, because
+a short read here is a silently weak secret.
 
 ---
 
@@ -184,9 +177,11 @@ unchanged. Task 2 makes that edit.
 | `crates/lbfs-proto/src/frame.rs` | `PROTOCOL_VERSION = 3`; three new statuses |
 | `crates/lbfs-proto/src/types.rs` | `SessionTicket` |
 | `crates/lbfs-proto/src/ops.rs` | `Opcode::Resume`, `Opcode::Detach`; `HelloRequest.resume`; `HelloReply.resume_grace_ms`; `AttachReply.ticket`; `ResumeRequest`, `ResumeReply`, `DetachRequest` |
-| `crates/lbfs-server/src/rpc/registry.rs` | New: `Registry<T>`, the state machine, the reaper |
+| `crates/lbfs-server/src/rpc/registry.rs` | New: `Registry<T, G>`, the state machine, the reaper |
 | `crates/lbfs-server/src/rpc/mod.rs` | `Server` holds a registry; `attach` mints; `resume` and `detach` join the handshake; teardown releases; `TCP_USER_TIMEOUT` |
 | `crates/lbfs-server/src/config.rs` | `resume_grace`, `max_resumable_sessions`, `parse_duration` |
+| `crates/lbfs-server/tests/session.rs` | Mechanical: new handshake and `Config` fields at construction sites |
+| `crates/lbfs-client/tests/live.rs`, `crates/lbfs-client/tests/loopback_cli.rs` | Mechanical field additions; the `--no-reconnect` CLI case |
 | `crates/lbfs-client/src/conn.rs` | `Connection::closed()`; `resume` and `detach` calls; the handshake carries a ticket |
 | `crates/lbfs-client/src/session.rs` | New: `Session`, the reconnect supervisor, parked calls |
 | `crates/lbfs-client/src/fuse.rs` | `LbfsFuse` holds an `Arc<Session>` |
@@ -267,8 +262,8 @@ remount. A transport failure to a server that stayed up resumes instead.
 - [ ] **Step 7: §11 — retire the fast-follow, add the leftovers**
 
 Move fast-follow 1 out of the priority list and into a line recording that it
-landed, naming the design document. Renumber the forced-sync item to 1 —
-**check for a conflict with the forced-sync branch before editing this list**.
+landed, naming the design document. Renumber what remains, reading §11 as it
+stands on `main` — the forced-sync entry is already struck as done.
 
 Add to "Future work": a persistent-session design over
 `name_to_handle_at`/`open_by_handle_at`; the cold re-attach with a poisoned id
@@ -296,6 +291,7 @@ git commit -m "docs(spec): session resumption over a retained server session"
 - Edit: `crates/lbfs-proto/src/frame.rs`, `crates/lbfs-proto/src/types.rs`, `crates/lbfs-proto/src/ops.rs`
 - Edit: `Cargo.toml` (the `rustix` feature list)
 - Edit: `crates/lbfs-server/src/rpc/mod.rs`, `crates/lbfs-client/src/conn.rs`, `tests/src/lib.rs` (mechanical field additions only)
+- Edit: `crates/lbfs-server/tests/session.rs`, `tests/tests/protocol.rs` (the tests that build the handshake structs literally)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -341,7 +337,7 @@ pub const STATUS_SESSION_BUSY: u16 = 0xFF05;
 pub const STATUS_SESSION_MISMATCH: u16 = 0xFF06;
 ```
 
-Leave `FLAG_NO_REPLY` and `FLAG_FORCE_SYNC_RESERVED` untouched.
+Leave `FLAG_NO_REPLY` and `FLAG_FORCE_SYNC` untouched.
 
 - [ ] **Step 4: `types.rs` — the ticket**
 
@@ -410,18 +406,22 @@ pub struct DetachRequest {
 - [ ] **Step 6: The `rustix` feature**
 
 In the workspace `Cargo.toml`, add `"rand"` to the `rustix` feature list, with
-a comment naming Task 5's use: session secrets come from
+a comment naming Task 3's use: session secrets come from
 `rustix::rand::getrandom`, which is `getrandom(2)` and no new crate.
 
 - [ ] **Step 7: Make the workspace compile again, inertly**
 
 Fill the new fields at every construction site with values that change nothing:
 `resume: false` in the client's `hello`, `resume_grace_ms: 0` in the server's
-`HelloReply`, `ticket: None` in the server's `AttachReply`, and the same in
-`tests/src/lib.rs`'s handshake helpers. Add `Resume` and `Detach` to the
-server's post-handshake rejection alongside `Hello` and `Attach` — after the
-handshake they are as illegal as the other two, and leaving them out would let
-a client re-attach mid-session.
+`HelloReply`, `ticket: None` in the server's `AttachReply` — and the same in
+every test that builds those structs literally: `tests/src/lib.rs`'s handshake
+helpers, `crates/lbfs-server/tests/session.rs`'s `hello_body`, and
+`tests/tests/protocol.rs`. The client's other tests reach the wire through
+`Connection` and the binary, so the compiler arbitrates whether they move.
+Add `Resume` to the server's post-handshake rejection alongside `Hello` and
+`Attach` — after the handshake a re-attach is as illegal as the other two.
+`Detach` stays out of that list — an ordinary in-session request, and Task 7
+answers it there.
 
 - [ ] **Step 8: Run the tests**
 
@@ -432,7 +432,7 @@ everybody checks; the loopback client and server both moved to `3` together.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add Cargo.toml crates/lbfs-proto/src/frame.rs crates/lbfs-proto/src/types.rs crates/lbfs-proto/src/ops.rs crates/lbfs-server/src/rpc/mod.rs crates/lbfs-client/src/conn.rs tests/src/lib.rs
+git add Cargo.toml crates/lbfs-proto/src/frame.rs crates/lbfs-proto/src/types.rs crates/lbfs-proto/src/ops.rs crates/lbfs-server/src/rpc/mod.rs crates/lbfs-server/tests/session.rs crates/lbfs-client/src/conn.rs tests/src/lib.rs tests/tests/protocol.rs
 git commit -m "feat(proto): version 3 with session tickets, RESUME and DETACH"
 ```
 
@@ -448,8 +448,9 @@ git commit -m "feat(proto): version 3 with session tickets, RESUME and DETACH"
 - Consumes: `lbfs_proto::types::SessionTicket`.
 - Produces: `Registry<T, G>` — generic over the payload and over an opaque
   shape guard, so its own tests need no filesystem and no handshake — plus
-  `pub type SessionRegistry = Registry<Arc<dyn FileSystem>, (Limits, bool)>`
-  in `rpc::mod`, the guard being the settled limits and the `writeback` flag.
+  `pub type SessionRegistry = Registry<Arc<dyn FileSystem>, Limits>`
+  in `rpc::mod`, the guard being the settled limits — `writeback` already
+  rides inside the rpc `Limits` struct.
   Methods: `mint`, `claim`, `release`, `drop_session`, `reap_expired`, `len`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -571,6 +572,7 @@ git commit -m "feat(server): a registry of sessions that outlive their sockets"
 **Files:**
 - Edit: `crates/lbfs-server/src/config.rs`
 - Edit: `crates/lbfs-server/pkg/lbfs.toml`, `vm/server-config.toml`
+- Edit: `tests/src/lib.rs`, `tests/tests/loopback.rs`, `crates/lbfs-server/tests/session.rs`, `crates/lbfs-client/tests/live.rs`, `crates/lbfs-client/tests/loopback_cli.rs` (every literal `Config` construction)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -595,6 +597,13 @@ widen to `u64` before scaling, and refuse anything that does not parse whole.
 Document `resume_grace = "0"` as the switch that turns retention off, so an
 operator who wants today's behaviour has one.
 
+`Config` has no `Default` impl, and five test call sites build it literally:
+the loopback harness (`tests/src/lib.rs` and `tests/tests/loopback.rs`),
+`crates/lbfs-server/tests/session.rs`, and the client's `live.rs` and
+`loopback_cli.rs` — the server binary itself goes through `from_toml`, whose
+literal lives in `config.rs`. Every one gains the two fields — the compiler
+names each — and this task's commit stages them all.
+
 - [ ] **Step 4: Update the two shipped configs**
 
 Add both keys, commented, to `crates/lbfs-server/pkg/lbfs.toml` and `vm/server-config.toml`.
@@ -604,7 +613,7 @@ Add both keys, commented, to `crates/lbfs-server/pkg/lbfs.toml` and `vm/server-c
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/lbfs-server/src/config.rs crates/lbfs-server/pkg/lbfs.toml vm/server-config.toml
+git add crates/lbfs-server/src/config.rs crates/lbfs-server/pkg/lbfs.toml crates/lbfs-server/tests/session.rs crates/lbfs-client/tests/live.rs crates/lbfs-client/tests/loopback_cli.rs tests/src/lib.rs tests/tests/loopback.rs vm/server-config.toml
 git commit -m "feat(server): resume_grace and max_resumable_sessions"
 ```
 
@@ -646,7 +655,9 @@ reaper wakes on an interval (grace / 4, floored at a second), calls
 `LocalFs::releasedir` already gives for its own snapshots applies here: freeing a
 large directory's entries is a million small deallocations, and the final
 `close(2)` on an unlinked file's last descriptor does journal work. A registry
-with a zero grace skips the task entirely.
+with a zero grace skips the task entirely. The spawn means the `pub`,
+synchronous `Server::new` now needs a runtime context its signature does not
+show — every current caller sits inside one, and its doc comment must say so.
 
 - [ ] **Step 4: `hello` reports the grace**
 
@@ -657,7 +668,7 @@ for resumption and the server retains anything, else `0`. Carry the client's
 - [ ] **Step 5: `attach` mints**
 
 After `LocalFs::from_root_fd` succeeds and before the reply, mint, storing the
-settled `Limits` and `writeback` as the entry's guard. A `None`
+settled `Limits` as the entry's guard — `writeback` rides inside it. A `None`
 from the registry — the `max_resumable_sessions` cap — means the reply carries
 `ticket: None` and the session behaves as it does today. Log the refusal once
 per occurrence with the cap in the line.
@@ -673,9 +684,12 @@ arriving during the 30-second drain must not queue behind it.
 
 - [ ] **Step 7: `TCP_USER_TIMEOUT`**
 
-In `rpc::configure_socket`, add
-`sockopt::set_tcp_user_timeout(sock, KEEPALIVE_BUDGET)` where the budget is
-`KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * KEEPALIVE_COUNT`. Without it a server
+In `rpc::configure_socket`, set `TCP_USER_TIMEOUT` to the keepalive budget,
+`KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * KEEPALIVE_COUNT`. One signature to
+respect: unlike its `Duration`-taking keepalive neighbours in the same
+function, rustix's `sockopt::set_tcp_user_timeout` takes plain `u32`
+milliseconds — convert with `as_millis()` and a checked cast, and leave a
+comment on why the types differ. Without it a server
 with replies queued for a black-holed peer sits in TCP retransmission for
 minutes, holding the session attached past any grace worth configuring and
 refusing every claim with `STATUS_SESSION_BUSY`.
@@ -764,7 +778,8 @@ RESUME")`.
 `resume` is one registry call and one `getattr`:
 
 1. `registry.claim(&ticket, &guard)`, where the guard is this handshake's
-   settled `Limits` and `writeback`. `NoSession`, `Busy` and `Mismatch` map
+   settled `Limits`, `writeback` included as one of its fields. `NoSession`,
+   `Busy` and `Mismatch` map
    straight to their statuses. A refusal mutates nothing inside the registry,
    so there is nothing to release and nothing to undo.
 2. `fs.getattr(ROOT_NODE, None)` for the reply's `root_attr`.
@@ -823,7 +838,8 @@ clean unmount wants.
 Beside `Forget`, which the loop already handles inline. `DETACH` is one
 registry call, so spawning a task for it would cost more than doing it — but
 unlike `FORGET` it takes a window permit and produces a reply, because the
-client waits for it before closing.
+client waits for it before closing. Log the detach with the session id at
+INFO; Task 13's drill greps for the line.
 
 - [ ] **Step 4: Run the tests, then `make check` and `make test-loopback`**
 
@@ -925,11 +941,14 @@ pub struct Session {
 }
 ```
 
-In this task `Session::current()` returns the connection or `EIO`, and nothing
-ever writes `Reconnecting`. Give it the same call surface `LbfsFuse` uses
-today: rather than re-declaring thirty methods, `Session` exposes
-`current() -> Result<Arc<Connection>, Errno>` and `LbfsFuse`'s callbacks take
-one extra line each.
+In this task `Session::current()` answers immediately — `Live` returns the
+connection, `Dead` returns `EIO` — and nothing ever writes `Reconnecting`.
+Declare it `async` anyway, today: Task 10 turns `Reconnecting` into a park,
+and an `fn` here would mean visiting all thirty `fuse.rs` call sites twice for
+one signature change. Rather than re-declaring thirty methods, `Session`
+exposes `async fn current() -> Result<Arc<Connection>, Errno>`; each `LbfsFuse`
+callback awaits it inside the block it already spawns, so the callbacks
+themselves stay synchronous and take one extra line each.
 
 - [ ] **Step 3: Move `LbfsFuse` onto it**
 
@@ -1026,7 +1045,8 @@ first dial parks rather than seeing a stale `Live`.
 
 - [ ] **Step 5: Parked calls**
 
-`Session::current()` becomes async: `Live` returns at once, `Dead` returns
+`Session::current()` went `async` back in Task 9; this step adds the parking
+arm. `Live` returns at once, `Dead` returns
 `EIO` at once, `Reconnecting` waits on the `watch` receiver until the state
 leaves `Reconnecting`. The wait needs no timeout of its own — the supervisor
 guarantees the state leaves `Reconnecting` inside the deadline, and a wait with
@@ -1234,7 +1254,10 @@ Assert afterwards:
 - A file opened before the sever and held open across it still reads and writes
   afterwards. Use a small helper that holds a descriptor across the sever;
   `exec 3<>` in the shell is enough.
-- The server logs a claim, and its session count returns to one.
+- The server's log carries the claim line Task 6 emits — grep the journal over
+  `vm_ssh` — and, after the unmount, the detach line Task 7 emits. Those two
+  lines are the drill's window into the registry; nothing else exposes a
+  session count.
 - The mount unmounts cleanly.
 
 - [ ] **Step 2: Wire it into `vm/test.sh`**
@@ -1323,10 +1346,6 @@ git commit -m "test(vm): a severed connection costs latency, not the mount"
   rule plus a `conntrack` flush reaches the same place with more moving parts.
   Task 13 is the only thing that depends on it, and the loopback proxy in Task
   12 covers the same behaviour without any kernel feature at all.
-- **The forced-sync branch and this one both want `PROTOCOL_VERSION` and the
-  `Opcode` enum.** Whichever lands second rebases. Nothing else in the two
-  changes overlaps: this plan reads no frame flag, and the forced-sync change
-  touches no session state.
 - **A ticket is a bearer capability on a protocol with no authentication.** An
   observer on the wire reads it out of the `ATTACH` reply, and can also read
   every byte of every file the session carries. The ticket never rotates —

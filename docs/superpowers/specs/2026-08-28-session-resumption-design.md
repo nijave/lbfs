@@ -1,7 +1,9 @@
 # lbfs — Session Resumption: Design
 
 Date: 2026-08-28
-Status: Proposed
+Status: Proposed. Revised 2026-09-07: the ticket does not rotate (§7.6), the
+registry verifies the negotiated shape inside `claim` (§8.1), and resumption
+opts in at the handshake — library off, shipped binary on (§8.2).
 
 ## 1. Overview
 
@@ -436,9 +438,9 @@ STATUS_SESSION_MISMATCH = 0xFF06
 
 ### 7.8 What does not change
 
-The frame header keeps its layout, its lengths and its flags. **Flag bit 1
-stays reserved for the forced-sync control message of spec §11, and nothing in
-this design reads or writes it.** No opcode grows a field. Bulk data still
+The frame header keeps its layout, its lengths and its flags. **Flag bit 1 is
+the live `FLAG_FORCE_SYNC` of the forced-sync control (spec §11), and nothing
+in this design reads or writes it.** No opcode grows a field. Bulk data still
 travels outside the serializer.
 
 ## 8. Structure
@@ -635,8 +637,8 @@ session dead, which stops the supervisor and fails anything parked.
   choice, and the per-core scaling of spec §3.1 would replace it with a rule
   about how many, not whether.
 - **No forget-queue survival.** §9.
-- **No change to frame flag bit 1**, which belongs to the forced-sync
-  fast-follow.
+- **No change to frame flag bit 1**, the live `FLAG_FORCE_SYNC` of the
+  forced-sync control.
 - **No per-request timeouts.** Spec §8 declines them and this design does not
   reopen the question. A request parked on a live socket that never answers is
   the same hang it produces today.
