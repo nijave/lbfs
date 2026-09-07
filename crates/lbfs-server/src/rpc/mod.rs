@@ -413,6 +413,7 @@ async fn hello(sock: &mut TcpStream, server: &Server) -> Result<Option<Limits>, 
         max_inflight: limits.max_inflight,
         max_io_size: limits.max_io_size,
         max_body_size: MAX_BODY_SIZE,
+        resume_grace_ms: 0,
     })?;
     reply(sock, hdr.request_id, STATUS_OK, &body).await?;
     Ok(Some(limits))
@@ -474,7 +475,10 @@ async fn attach(
             return Ok(None);
         }
     };
-    let body = encode(&AttachReply { root_attr })?;
+    let body = encode(&AttachReply {
+        root_attr,
+        ticket: None,
+    })?;
     reply(sock, hdr.request_id, STATUS_OK, &body).await?;
     tracing::info!(path = %requested.display(), writeback = limits.writeback, "attached");
     Ok(Some(fs))
@@ -618,9 +622,12 @@ async fn read_loop(
         }
         let op = Opcode::try_from(hdr.op_or_status)
             .map_err(|_| SessionError::Protocol("unknown opcode"))?;
-        if matches!(op, Opcode::Hello | Opcode::Attach) {
+        // After the handshake a re-attach is as illegal as a second HELLO or
+        // ATTACH, and RESUME is a re-attach. DETACH stays out of this list: it
+        // is an ordinary in-session request.
+        if matches!(op, Opcode::Hello | Opcode::Attach | Opcode::Resume) {
             return Err(SessionError::Protocol(
-                "HELLO or ATTACH after the handshake",
+                "HELLO, ATTACH or RESUME after the handshake",
             ));
         }
         if hdr.data_len > data_limit(op, limits) {

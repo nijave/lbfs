@@ -399,12 +399,16 @@ pub(crate) async fn dispatch(
             let req = decode!(RemovexattrRequest, body);
             unit(fs.removexattr(req.node, &req.name).await)
         }
-        // The session runs these itself: the two handshake opcodes are refused
-        // after `ATTACH`, and `FORGET` carries `NO_REPLY` and never reaches a
+        // The session runs these itself: the handshake opcodes — `RESUME`
+        // included, being `ATTACH`'s sibling — are refused after the
+        // handshake, and `FORGET` carries `NO_REPLY` and never reaches a
         // reply-producing path. `EINVAL` rather than `unreachable!` so a future
         // refactor that lets one slip through answers the client instead of
-        // panicking a request task and stranding it.
-        Opcode::Hello | Opcode::Attach | Opcode::Forget => err(Errno::EINVAL),
+        // panicking a request task and stranding it. `DETACH` sits here only
+        // until the session answers it in the read loop; nothing sends it yet.
+        Opcode::Hello | Opcode::Attach | Opcode::Resume | Opcode::Detach | Opcode::Forget => {
+            err(Errno::EINVAL)
+        }
     }
 }
 

@@ -108,6 +108,7 @@ fn hello_body(version: u32, max_io_size: u32) -> Vec<u8> {
         max_inflight: 128,
         max_io_size,
         writeback: false,
+        resume: false,
     })
 }
 
@@ -382,6 +383,7 @@ async fn a_permanently_full_window_is_not_an_overrun() {
         max_inflight: WINDOW as u32,
         max_io_size: 1 << 20,
         writeback: false,
+        resume: false,
     });
     let (hdr, body) = call(&mut s, 1, Opcode::Hello, &hello).await;
     assert_eq!(hdr.op_or_status, STATUS_OK);
@@ -451,6 +453,7 @@ async fn window_overrun_closes_connection() {
         max_inflight: 8,
         max_io_size: READ_SIZE as u32,
         writeback: false,
+        resume: false,
     });
     let (hdr, body) = call(&mut s, 1, Opcode::Hello, &hello).await;
     assert_eq!(hdr.op_or_status, STATUS_OK);

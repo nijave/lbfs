@@ -128,8 +128,14 @@ impl Fake {
         assert_eq!(attach.op, Opcode::Attach as u16);
         let req: AttachRequest = attach.decode();
         assert_eq!(req.path, EXPORT, "the export path travels as bytes");
-        sess.reply_ok(attach.id, &AttachReply { root_attr: root })
-            .await;
+        sess.reply_ok(
+            attach.id,
+            &AttachReply {
+                root_attr: root,
+                ticket: None,
+            },
+        )
+        .await;
 
         sess
     }
@@ -201,6 +207,7 @@ fn settled(max_inflight: u32, max_io_size: u32) -> HelloReply {
         max_inflight,
         max_io_size,
         max_body_size: MAX_BODY_SIZE,
+        resume_grace_ms: 0,
     }
 }
 
@@ -288,8 +295,14 @@ async fn connect_negotiates_attaches_and_reports_the_root() {
     assert_eq!(req.path, EXPORT);
     let mut root = root_dir();
     root.ino = 99;
-    sess.reply_ok(attach.id, &AttachReply { root_attr: root })
-        .await;
+    sess.reply_ok(
+        attach.id,
+        &AttachReply {
+            root_attr: root,
+            ticket: None,
+        },
+    )
+    .await;
 
     let (conn, hello, got_root) = client.await.unwrap().unwrap();
     assert_eq!(hello.version, PROTOCOL_VERSION);
@@ -318,6 +331,7 @@ async fn a_client_that_never_negotiates_writeback_says_so() {
         attach.id,
         &AttachReply {
             root_attr: root_dir(),
+            ticket: None,
         },
     )
     .await;

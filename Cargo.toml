@@ -24,7 +24,10 @@ io-uring = "0.7"
 # `thread` is here for `capabilities()`: the server reads its own CAP_FSETID
 # once at startup to learn whether the backing kernel will strip set-user-ID
 # on its behalf. See `fs::local::killpriv`.
-rustix = { version = "1", features = ["event", "fs", "net", "process", "thread"] }
+# `rand` is here for session secrets: `rustix::rand::getrandom` is the
+# `getrandom(2)` syscall, so the registry's 128-bit ticket secrets cost no new
+# crate. See `rpc::registry`.
+rustix = { version = "1", features = ["event", "fs", "net", "process", "rand", "thread"] }
 libc = "0.2"
 globset = "0.4"
 toml = "1.1"

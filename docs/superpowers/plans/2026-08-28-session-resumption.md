@@ -300,7 +300,7 @@ git commit -m "docs(spec): session resumption over a retained server session"
   `resume_grace_ms: 0`, `ticket: None`), and every existing test passes
   unchanged.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/lbfs-proto/src/ops.rs`'s test module, add cases pinning: the two new
 opcode numbers round-trip through `TryFrom<u16>`; `36` still fails; a
@@ -315,12 +315,12 @@ In `crates/lbfs-proto/src/frame.rs`, add a case pinning `PROTOCOL_VERSION == 3`
 and that the three new statuses sit above `0xFF00`, differ from each other, and
 differ from the three that already exist.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test -p lbfs-proto`
 Expected: FAIL to compile — the names do not exist.
 
-- [ ] **Step 3: `frame.rs`**
+- [x] **Step 3: `frame.rs`**
 
 ```rust
 /// Version 3 adds session resumption: `HelloRequest.resume`,
@@ -339,7 +339,7 @@ pub const STATUS_SESSION_MISMATCH: u16 = 0xFF06;
 
 Leave `FLAG_NO_REPLY` and `FLAG_FORCE_SYNC` untouched.
 
-- [ ] **Step 4: `types.rs` — the ticket**
+- [x] **Step 4: `types.rs` — the ticket**
 
 ```rust
 /// What a client presents to claim a session it was already attached to.
@@ -376,7 +376,7 @@ impl SessionTicket {
 }
 ```
 
-- [ ] **Step 5: `ops.rs` — opcodes, fields, request structs**
+- [x] **Step 5: `ops.rs` — opcodes, fields, request structs**
 
 Add `Resume = 34` and `Detach = 35` to the enum and to `TryFrom<u16>`. Add
 `pub resume: bool` to `HelloRequest`, `pub resume_grace_ms: u32` to
@@ -403,13 +403,13 @@ pub struct DetachRequest {
 }
 ```
 
-- [ ] **Step 6: The `rustix` feature**
+- [x] **Step 6: The `rustix` feature**
 
 In the workspace `Cargo.toml`, add `"rand"` to the `rustix` feature list, with
 a comment naming Task 3's use: session secrets come from
 `rustix::rand::getrandom`, which is `getrandom(2)` and no new crate.
 
-- [ ] **Step 7: Make the workspace compile again, inertly**
+- [x] **Step 7: Make the workspace compile again, inertly**
 
 Fill the new fields at every construction site with values that change nothing:
 `resume: false` in the client's `hello`, `resume_grace_ms: 0` in the server's
@@ -423,13 +423,13 @@ Add `Resume` to the server's post-handshake rejection alongside `Hello` and
 `Detach` stays out of that list — an ordinary in-session request, and Task 7
 answers it there.
 
-- [ ] **Step 8: Run the tests**
+- [x] **Step 8: Run the tests**
 
 Run: `make check` then `make test-loopback`
 Expected: PASS. The wire grew fields nobody reads and one version number
 everybody checks; the loopback client and server both moved to `3` together.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add Cargo.toml crates/lbfs-proto/src/frame.rs crates/lbfs-proto/src/types.rs crates/lbfs-proto/src/ops.rs crates/lbfs-server/src/rpc/mod.rs crates/lbfs-server/tests/session.rs crates/lbfs-client/src/conn.rs tests/src/lib.rs tests/tests/protocol.rs

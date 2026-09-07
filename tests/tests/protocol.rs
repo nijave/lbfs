@@ -47,6 +47,7 @@ fn hello_request(max_inflight: u32, max_io_size: u32) -> HelloRequest {
         max_inflight,
         max_io_size,
         writeback: false,
+        resume: false,
     }
 }
 
@@ -86,6 +87,7 @@ async fn the_handshake_settles_and_echoes_the_limits() {
             max_inflight: WINDOW_CLAMP.0,
             max_io_size: 4096,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         }
     );
 
@@ -99,11 +101,12 @@ async fn the_handshake_settles_and_echoes_the_limits() {
             max_inflight: SERVER_WINDOW,
             max_io_size: SERVER_IO,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         }
     );
     // `writeback` is the client's alone and gets no echo, but it is a
     // positional field in the HELLO body: a session that reached ATTACH proves
-    // the server read the five-field handshake this client sent.
+    // the server read the six-field handshake this client sent.
     assert_eq!(c.root_attr().mode & libc::S_IFMT, libc::S_IFDIR);
 }
 

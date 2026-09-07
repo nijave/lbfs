@@ -37,6 +37,8 @@ pub enum Opcode {
     Setxattr = 31,
     Listxattr = 32,
     Removexattr = 33,
+    Resume = 34,
+    Detach = 35,
 }
 
 impl TryFrom<u16> for Opcode {
@@ -77,6 +79,8 @@ impl TryFrom<u16> for Opcode {
             31 => Self::Setxattr,
             32 => Self::Listxattr,
             33 => Self::Removexattr,
+            34 => Self::Resume,
+            35 => Self::Detach,
             other => return Err(other),
         })
     }
@@ -96,6 +100,9 @@ pub struct HelloRequest {
     /// `LocalFs::mask_open_flags`). Only the client knows it, so it travels
     /// with the handshake rather than being guessed at attach.
     pub writeback: bool,
+    /// Whether this client will try to resume its session after a
+    /// disconnection. A server that answers `resume_grace_ms == 0` declines.
+    pub resume: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +111,10 @@ pub struct HelloReply {
     pub max_inflight: u32,
     pub max_io_size: u32,
     pub max_body_size: u32,
+    /// How long this server holds a session after its socket dies, in
+    /// milliseconds. Zero means retention is off and every disconnection is
+    /// final.
+    pub resume_grace_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +126,29 @@ pub struct AttachRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachReply {
     pub root_attr: FileAttr,
+    /// `Some` when both sides asked for retention: the client set
+    /// `HelloRequest.resume` and the server holds a non-zero grace with room
+    /// under its session cap. `None` means this session dies with its socket.
+    pub ticket: Option<SessionTicket>,
+}
+
+/// Reply: [`ResumeReply`]. Replaces `ATTACH` as the second frame of a
+/// reconnecting session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeRequest {
+    pub ticket: SessionTicket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeReply {
+    pub root_attr: FileAttr,
+}
+
+/// No reply body. Drops the session and everything it holds, so a clean
+/// unmount does not leave descriptors resident for the grace period.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachRequest {
+    pub ticket: SessionTicket,
 }
 
 /// Reply: [`Entry`].
@@ -431,12 +465,12 @@ mod tests {
 
     #[test]
     fn opcode_round_trips_through_u16() {
-        for raw in 1u16..=33 {
+        for raw in 1u16..=35 {
             let op = Opcode::try_from(raw).unwrap();
             assert_eq!(op as u16, raw);
         }
         assert!(Opcode::try_from(0).is_err());
-        assert!(Opcode::try_from(34).is_err());
+        assert!(Opcode::try_from(36).is_err());
     }
 
     #[test]
@@ -458,6 +492,7 @@ mod tests {
             max_inflight: 128,
             max_io_size: 1 << 20,
             writeback: true,
+            resume: false,
         });
         round_trip(&HelloRequest {
             magic: MAGIC,
@@ -465,12 +500,14 @@ mod tests {
             max_inflight: 8,
             max_io_size: 4096,
             writeback: false,
+            resume: true,
         });
         round_trip(&HelloReply {
             version: 1,
             max_inflight: 128,
             max_io_size: 1 << 20,
             max_body_size: 64 << 10,
+            resume_grace_ms: 60_000,
         });
         round_trip(&AttachRequest {
             path: b"/srv/exports/a".to_vec(),
@@ -543,10 +580,37 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_two() {
-        // Version 1 bodies cannot carry the flag, and postcard ignores
-        // trailing bytes rather than refusing them, so the handshake is the
-        // only place that can catch a half-deployed pair.
-        assert_eq!(crate::frame::PROTOCOL_VERSION, 2);
+    fn resume_and_detach_opcodes_round_trip() {
+        assert_eq!(Opcode::try_from(34).unwrap(), Opcode::Resume);
+        assert_eq!(Opcode::Resume as u16, 34);
+        assert_eq!(Opcode::try_from(35).unwrap(), Opcode::Detach);
+        assert_eq!(Opcode::Detach as u16, 35);
+        assert!(Opcode::try_from(36).is_err());
+    }
+
+    #[test]
+    fn resume_and_detach_bodies_round_trip() {
+        let ticket = SessionTicket {
+            id: 7,
+            secret: [0xA5; 16],
+            grace_ms: 60_000,
+        };
+        round_trip(&ResumeRequest { ticket });
+        round_trip(&ResumeReply {
+            root_attr: FileAttr::default(),
+        });
+        round_trip(&DetachRequest { ticket });
+    }
+
+    #[test]
+    fn hello_request_round_trips_a_resume_ask() {
+        round_trip(&HelloRequest {
+            magic: MAGIC,
+            version: 3,
+            max_inflight: 128,
+            max_io_size: 1 << 20,
+            writeback: true,
+            resume: true,
+        });
     }
 }

@@ -1172,6 +1172,9 @@ async fn hello(sock: &mut TcpStream, proposal: &Proposal) -> Result<HelloReply, 
         max_inflight: proposal.max_inflight,
         max_io_size: proposal.max_io_size,
         writeback: proposal.writeback,
+        // Inert until the session layer asks to resume: the library default
+        // keeps today's teardown semantics for every direct caller.
+        resume: false,
     };
     let reply = exchange(sock, 1, Opcode::Hello, &req).await?;
     match reply.status {
@@ -1508,6 +1511,7 @@ mod tests {
             max_inflight: 128,
             max_io_size,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         }
     }
 
@@ -1593,6 +1597,7 @@ mod tests {
             max_inflight: WINDOW_CLAMP.0,
             max_io_size: MIN_IO_SIZE,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         };
         assert!(check_settled(&tiny, &answer).is_ok());
     }

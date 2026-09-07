@@ -320,6 +320,7 @@ impl TestClient {
                 max_inflight,
                 max_io_size,
                 writeback,
+                resume: false,
             })
             .await
             .ok();

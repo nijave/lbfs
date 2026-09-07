@@ -103,3 +103,60 @@ pub struct DirEntryPlus {
 pub struct XattrReply {
     pub size: u32,
 }
+
+/// What a client presents to claim a session it was already attached to.
+///
+/// `id` is the registry key: a server-local counter, never reused inside one
+/// process. `secret` is the whole of the authentication — 128 bits from
+/// `getrandom(2)`, compared in constant time. v1 has no authentication at all
+/// (spec §1), and this does not add one: a ticket is a bearer capability worth
+/// roughly what a fresh `ATTACH` to the same export is worth, plus the open
+/// descriptors a fresh attach could not reach. The session-resumption design
+/// document prices it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTicket {
+    pub id: u64,
+    pub secret: [u8; 16],
+    /// How long the server holds this session after its socket dies. Zero
+    /// means the server retains nothing.
+    pub grace_ms: u32,
+}
+
+impl SessionTicket {
+    /// Constant-time secret comparison.
+    ///
+    /// A short-circuiting `==` leaks the length of the matching prefix through
+    /// timing, which turns 2^128 guesses into 16 × 256. The loop below reads
+    /// every byte whatever it finds.
+    pub fn secret_eq(&self, other: &[u8; 16]) -> bool {
+        let mut diff = 0u8;
+        for (a, b) in self.secret.iter().zip(other.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_ticket_round_trips_and_compares_in_constant_time() {
+        let t = SessionTicket {
+            id: 42,
+            secret: [7u8; 16],
+            grace_ms: 60_000,
+        };
+        let bytes = postcard::to_allocvec(&t).unwrap();
+        let back: SessionTicket = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, t);
+
+        // One flipped secret byte must fail the comparison, through the
+        // constant-time helper rather than derived `==`.
+        let mut other = t.secret;
+        other[9] ^= 1;
+        assert!(t.secret_eq(&t.secret));
+        assert!(!t.secret_eq(&other));
+    }
+}
