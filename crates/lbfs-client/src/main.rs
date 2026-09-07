@@ -22,9 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use lbfs_client::conn::{ConnectError, Connection};
+use lbfs_client::conn::{ConnectError, Connection, Proposal};
 use lbfs_client::fuse::{session_config, LbfsFuse};
 use lbfs_client::readahead;
+use lbfs_client::session::Session;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -204,9 +205,28 @@ fn run() -> Result<(), StartupError> {
     // whole point of the bridge is that the requests it spawns overlap.
     let rt = tokio::runtime::Runtime::new().map_err(StartupError::Runtime)?;
     let export = cli.remote_path.as_os_str().as_bytes();
+    // Spelled out rather than left to `Connection::connect`, because the
+    // session below keeps the same proposal: whatever a later redial asks for
+    // has to be what this handshake asked for, or the server settles different
+    // limits than the mount was configured with.
+    let proposal = Proposal {
+        writeback,
+        ..Proposal::default()
+    };
     let (conn, limits, _root) = rt
-        .block_on(Connection::connect(addr, export, writeback))
+        .block_on(Connection::connect_with(addr, export, proposal))
         .map_err(|source| StartupError::Connect { addr, source })?;
+    // One object above the connection for the whole life of the mount. It holds
+    // no ticket and no reconnect deadline yet, so it forwards to the connection
+    // it was built with and nothing else.
+    let session = Session::new(
+        Arc::clone(&conn),
+        addr,
+        export.to_vec(),
+        proposal,
+        None,
+        Duration::ZERO,
+    );
 
     // Before the mount, not after. A signal arriving in the window between
     // `spawn_mount` returning and the handlers being installed would take its
@@ -228,7 +248,7 @@ fn run() -> Result<(), StartupError> {
     // Cloned rather than moved: the exit path still needs the connection after
     // the mount has let go of it, to force the sync below.
     let fs = LbfsFuse::new(
-        Arc::clone(&conn),
+        Arc::clone(&session),
         rt.handle().clone(),
         ttl,
         entry_ttl,

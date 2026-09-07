@@ -60,8 +60,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use lbfs_client::conn::Connection;
+use lbfs_client::conn::{Connection, Proposal};
 use lbfs_client::fuse::{session_config, LbfsFuse, CONTROL_XATTR_SYNC};
+use lbfs_client::session::Session;
 use lbfs_proto::frame::{DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE};
 use lbfs_server::config::{Allowlist, Config, FsyncPolicy};
 use rustix::fs::{StatVfsMountFlags, XattrFlags};
@@ -328,16 +329,34 @@ impl Loopback {
 
         let server = ServerSide::start(&export, &opts);
         let client_rt = runtime("lbfs-client");
+        // The same proposal the binary builds, and named here for the same
+        // reason: the session keeps it, so a redial asks for what this
+        // handshake asked for.
+        let proposal = Proposal {
+            writeback: opts.writeback,
+            ..Proposal::default()
+        };
         let (conn, limits, _root_attr) = client_rt
-            .block_on(Connection::connect(
+            .block_on(Connection::connect_with(
                 server.addr,
                 export.as_os_str().as_bytes(),
-                opts.writeback,
+                proposal,
             ))
             .expect("the client attaches to the export this test just exported");
+        // The mount holds the session; this harness keeps its own clone of the
+        // connection, because the cases that reach past the mount — the fd
+        // census, the forced-sync acknowledgement — speak to the socket.
+        let session = Session::new(
+            Arc::clone(&conn),
+            server.addr,
+            export.as_os_str().as_bytes().to_vec(),
+            proposal,
+            None,
+            Duration::ZERO,
+        );
 
         let fs = LbfsFuse::new(
-            Arc::clone(&conn),
+            Arc::clone(&session),
             client_rt.handle().clone(),
             opts.ttl,
             opts.entry_ttl,

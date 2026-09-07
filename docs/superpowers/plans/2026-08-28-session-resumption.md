@@ -909,13 +909,13 @@ git commit -m "feat(client): Connection::closed reports a connection's death"
   `LbfsFuse` holds an `Arc<Session>`. **A pure refactor: no reconnect, and
   every existing test passes unchanged.**
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 One case in `mux.rs`: a `Session` over a live connection forwards a typed call
 and returns the same answer the connection would; a `Session` whose connection
 died answers `EIO`. Written first so the refactor has a target.
 
-- [ ] **Step 2: Write `Session`**
+- [x] **Step 2: Write `Session`**
 
 ```rust
 enum State {
@@ -950,21 +950,21 @@ exposes `async fn current() -> Result<Arc<Connection>, Errno>`; each `LbfsFuse`
 callback awaits it inside the block it already spawns, so the callbacks
 themselves stay synchronous and take one extra line each.
 
-- [ ] **Step 3: Move `LbfsFuse` onto it**
+- [x] **Step 3: Move `LbfsFuse` onto it**
 
 `LbfsFuse::new` takes an `Arc<Session>`; `ctx` and `entry_ctx` return one.
 `init` reads `self.session.limits`. `destroy` reads a `dropped_forgets` that
 sums across connections. `main.rs` builds the `Session` after `connect` and
 hands it to `LbfsFuse`.
 
-- [ ] **Step 4: Run everything**
+- [x] **Step 4: Run everything**
 
 Run: `make check` then `make test-loopback`
 Expected: PASS with no test changed except the ones that named `Connection`
 directly. A refactor that needs a behavioural test edited is a refactor that
 changed behaviour — stop and find out why.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/lbfs-client/src/session.rs crates/lbfs-client/src/lib.rs crates/lbfs-client/src/fuse.rs crates/lbfs-client/src/main.rs crates/lbfs-client/src/bin/lbfs-bench.rs crates/lbfs-client/tests/mux.rs tests/tests/loopback.rs crates/lbfs-client/tests/loopback_cli.rs

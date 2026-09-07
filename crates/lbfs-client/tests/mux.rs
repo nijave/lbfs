@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lbfs_client::conn::{ConnectError, Connection, Proposal};
+// Aliased: `Session` in this file is the scripted server's accepted socket,
+// and the two would otherwise share a name across four hundred lines.
+use lbfs_client::session::Session as LbfsSession;
 use lbfs_proto::frame::{
     FrameHeader, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_ATTACH_DENIED,
     STATUS_NOT_EXPORTED, STATUS_OK, STATUS_VERSION_MISMATCH,
@@ -1207,6 +1210,55 @@ async fn two_waiters_both_learn_of_one_death() {
             .expect("every waiter learns of the death")
             .unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// The session above the connection
+// ---------------------------------------------------------------------------
+
+/// One call the way a FUSE callback makes it: ask the session for a
+/// connection, then spend it.
+async fn lookup_through(session: &LbfsSession, name: &[u8]) -> Result<Entry, Errno> {
+    session.current().await?.lookup(1, name).await
+}
+
+#[tokio::test]
+async fn a_session_forwards_a_call_and_reports_its_connections_death() {
+    let fake = Fake::bind().await;
+    let (conn, mut sess) = plain(&fake).await;
+    let session = LbfsSession::new(
+        Arc::clone(&conn),
+        fake.addr,
+        EXPORT.to_vec(),
+        Proposal::default(),
+        None,
+        Duration::ZERO,
+    );
+    // The mount reads these once, at `init`, and the kernel cannot be told a
+    // new number afterwards.
+    assert_eq!(session.limits, conn.limits);
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"f").await })
+    };
+    let req = sess.recv().await;
+    assert_eq!(req.op, Opcode::Lookup as u16, "the call reached the wire");
+    sess.reply_ok(req.id, &an_entry(2, 3)).await;
+    assert_eq!(
+        call.await.unwrap().expect("the lookup succeeds").node,
+        2,
+        "a session answers what its connection answers"
+    );
+
+    // The server vanishes. Nothing reconnects yet, so the session answers with
+    // exactly what the dead connection underneath it answers.
+    drop(sess);
+    assert_eq!(
+        lookup_through(&session, b"f").await.unwrap_err(),
+        Errno::EIO
+    );
+    assert!(conn.is_dead());
 }
 
 // ---------------------------------------------------------------------------
