@@ -852,7 +852,17 @@ impl fuser::Filesystem for LbfsFuse {
     fn destroy(&mut self) {
         let dropped = self.session.dropped_forgets();
         if dropped > 0 {
-            tracing::warn!(dropped, "forgets were dropped during this mount");
+            // The two counts have different cures. A forget lost to a full
+            // queue means the socket stalled behind a burst; one lost while
+            // reconnecting means the mount had no connection to hand it to at
+            // all, and a shorter `--reconnect-timeout` is the knob that shrinks
+            // that window. Either way the nodes they named stay resident on the
+            // server until the session ends (design §9).
+            tracing::warn!(
+                dropped,
+                while_reconnecting = self.session.dropped_while_reconnecting(),
+                "forgets were dropped during this mount"
+            );
         }
         tracing::info!("mount torn down");
     }

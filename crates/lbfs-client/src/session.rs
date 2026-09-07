@@ -50,6 +50,15 @@ use crate::conn::{ConnectError, Connection, Proposal};
 const BACKOFF_START: Duration = Duration::from_millis(50);
 const BACKOFF_CEILING: Duration = Duration::from_secs(1);
 
+/// How long [`Session::shutdown`] waits for its `DETACH` reply.
+///
+/// Brief on purpose. The session expires by itself when the grace runs out, so
+/// a `DETACH` that never lands costs the server a few descriptors for a minute
+/// rather than anything permanent — and a client that cannot detach must still
+/// exit. This bounds what a server that has stopped answering can add to an
+/// unmount.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Where this session's traffic goes.
 enum State {
     Live(Arc<Connection>),
@@ -108,6 +117,9 @@ impl Session {
     /// `conn`, and `ticket` is what its `ATTACH` reply carried — `None` for a
     /// server or a caller that wants no retention.
     ///
+    /// `deadline` is what the caller asked for, clamped here to what the
+    /// server's `HELLO` promised to hold — see [`clamp_deadline`].
+    ///
     /// **Spawns the reconnect supervisor**, so a caller that passes a ticket
     /// and a non-zero deadline must be inside a tokio runtime context. A caller
     /// that passes either of the two "off" values needs no runtime and gets no
@@ -122,6 +134,10 @@ impl Session {
         deadline: Duration,
     ) -> Arc<Session> {
         let limits = conn.limits.clone();
+        let deadline = clamp_deadline(
+            deadline,
+            Duration::from_millis(u64::from(limits.resume_grace_ms)),
+        );
         let (state, _) = watch::channel(State::Live(conn));
         let session = Arc::new(Session {
             state,
@@ -239,13 +255,53 @@ impl Session {
         self.gap_forgets.load(Ordering::Relaxed)
     }
 
-    /// End the mount: stop the supervisor and fail everything parked.
+    /// End the mount: detach the session, stop the supervisor, and fail
+    /// everything parked.
     ///
     /// Called after the unmount drain, because the drain flushes writeback and
     /// the `FORGET`s the kernel emits for every evicted inode, and both need
     /// the session. Nothing revives a session marked dead.
+    ///
+    /// The `DETACH` is what keeps a clean unmount from leaving the server
+    /// holding this mount's descriptors for the whole grace (design §7.5). It
+    /// goes out only over a live connection of a session that holds a ticket,
+    /// and only for as long as [`DETACH_TIMEOUT`] — this is not a caller that
+    /// may park behind a redial, and a failure goes to the log and no further:
+    /// the session expires by itself, and a client that cannot detach must
+    /// still exit.
     pub async fn shutdown(&self) {
+        if let (Some(ticket), Some(conn)) = (self.ticket, self.live()) {
+            match tokio::time::timeout(DETACH_TIMEOUT, conn.detach(ticket)).await {
+                Ok(Ok(())) => tracing::info!(session = ticket.id, "detached the session"),
+                Ok(Err(e)) => tracing::warn!(
+                    session = ticket.id,
+                    errno = e.0,
+                    "DETACH was refused; this session's descriptors stay on the \
+                     server until its grace runs out"
+                ),
+                Err(_) => tracing::warn!(
+                    session = ticket.id,
+                    timeout = ?DETACH_TIMEOUT,
+                    "DETACH went unanswered; this session's descriptors stay on \
+                     the server until its grace runs out"
+                ),
+            }
+        }
         self.mark_dead();
+    }
+
+    /// The current connection if there is a usable one, without waiting for a
+    /// redial.
+    ///
+    /// [`Session::shutdown`] is not a caller that may park: it runs when the
+    /// mount is already gone, and a `DETACH` that waited out a reconnect first
+    /// would hold the process open for exactly as long as the deadline it is
+    /// there to cancel.
+    fn live(&self) -> Option<Arc<Connection>> {
+        match &*self.state.borrow() {
+            State::Live(conn) if !conn.is_dead() => Some(Arc::clone(conn)),
+            _ => None,
+        }
     }
 
     /// Take the session out of `Live` and into `Reconnecting`, retiring the
@@ -391,6 +447,20 @@ impl Session {
     }
 }
 
+/// Bound a caller's reconnect deadline by what the server promised to hold.
+///
+/// Three-quarters of the advertised grace, and both halves of that matter. A
+/// client still dialling for a session the reaper already dropped is burning
+/// time on a guaranteed refusal; and a clamp that could land *on* the grace
+/// would leave it dialling at the exact moment the reaper fires (design §8.2).
+///
+/// A zero grace is a server that retains nothing — a `resume_grace = "0"`
+/// configuration, or a client that never asked — and it leaves nothing to wait
+/// for.
+fn clamp_deadline(asked: Duration, grace: Duration) -> Duration {
+    asked.min(grace / 4 * 3)
+}
+
 /// Whether a state can answer a call now, or a caller has to wait for the next
 /// one.
 ///
@@ -449,5 +519,37 @@ async fn supervise(weak: Weak<Session>, ticket: SessionTicket) {
         if !session.reconnect(ticket).await {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_deadline_clamps_to_three_quarters_of_the_advertised_grace() {
+        let grace = Duration::from_secs(60);
+        // Under the clamp the ask stands: ten seconds is what the flag
+        // defaults to and what the drills are timed against.
+        assert_eq!(
+            clamp_deadline(Duration::from_secs(10), grace),
+            Duration::from_secs(10)
+        );
+        // Over it, the server's promise wins — and with room to spare, so the
+        // last dial cannot land on the moment the reaper fires.
+        assert_eq!(
+            clamp_deadline(Duration::from_secs(120), grace),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            clamp_deadline(grace, grace),
+            Duration::from_secs(45),
+            "a deadline equal to the grace still gets a margin"
+        );
+        // A server that retains nothing leaves nothing to wait for.
+        assert_eq!(
+            clamp_deadline(Duration::from_secs(10), Duration::ZERO),
+            Duration::ZERO
+        );
     }
 }

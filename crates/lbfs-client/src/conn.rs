@@ -65,13 +65,13 @@ use lbfs_proto::frame::{
 use lbfs_proto::io::{read_body, read_header, write_frame, IoError};
 use lbfs_proto::ops::{
     AttachReply, AttachRequest, CopyFileRangeReply, CopyFileRangeRequest, CreateReply,
-    CreateRequest, FallocateRequest, FlushRequest, ForgetRequest, FsyncRequest, FsyncdirRequest,
-    GetattrRequest, GetxattrRequest, HelloReply, HelloRequest, LinkRequest, ListxattrRequest,
-    LookupRequest, LseekReply, LseekRequest, MkdirRequest, Opcode, OpenReply, OpenRequest,
-    OpendirReply, OpendirRequest, ReadRequest, ReaddirReply, ReaddirRequest, ReaddirplusReply,
-    ReadlinkReply, ReadlinkRequest, ReleaseRequest, ReleasedirRequest, RemovexattrRequest,
-    RenameRequest, ResumeReply, ResumeRequest, RmdirRequest, SetattrRequest, SetxattrRequest,
-    StatfsRequest, SymlinkRequest, UnlinkRequest, WriteReply, WriteRequest,
+    CreateRequest, DetachRequest, FallocateRequest, FlushRequest, ForgetRequest, FsyncRequest,
+    FsyncdirRequest, GetattrRequest, GetxattrRequest, HelloReply, HelloRequest, LinkRequest,
+    ListxattrRequest, LookupRequest, LseekReply, LseekRequest, MkdirRequest, Opcode, OpenReply,
+    OpenRequest, OpendirReply, OpendirRequest, ReadRequest, ReaddirReply, ReaddirRequest,
+    ReaddirplusReply, ReadlinkReply, ReadlinkRequest, ReleaseRequest, ReleasedirRequest,
+    RemovexattrRequest, RenameRequest, ResumeReply, ResumeRequest, RmdirRequest, SetattrRequest,
+    SetxattrRequest, StatfsRequest, SymlinkRequest, UnlinkRequest, WriteReply, WriteRequest,
 };
 use lbfs_proto::types::{
     Entry, Fh, FileAttr, NodeId, SessionTicket, SetattrArgs, StatfsReply, XattrReply, ROOT_NODE,
@@ -1220,6 +1220,22 @@ impl Connection {
             )
             .await?;
         Ok((reply.size, data))
+    }
+
+    /// End this session's retention now, rather than at the end of its grace.
+    ///
+    /// An ordinary in-session request, and one the caller waits for. The socket
+    /// closing cannot carry this meaning: a crashed client closes its socket
+    /// exactly the way a polite one does, and the crashed client is the case
+    /// retention exists for (design §7.5). The connection goes on serving
+    /// afterwards — `DETACH` ends the *session's* retention, not the socket —
+    /// so a clean unmount can flush and forget over it and only then let go.
+    ///
+    /// `ESTALE` means the server did not recognise the ticket: something
+    /// dropped this session already, or the caller cannot prove it owns one.
+    pub async fn detach(&self, ticket: SessionTicket) -> Result<(), Errno> {
+        self.call_unit(Opcode::Detach, &DetachRequest { ticket })
+            .await
     }
 
     pub async fn removexattr(&self, node: NodeId, name: &[u8]) -> Result<(), Errno> {

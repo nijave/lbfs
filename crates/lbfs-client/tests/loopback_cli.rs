@@ -124,22 +124,25 @@ impl ClientProcess {
     fn spawn(addr: SocketAddr, export: &Path, mnt: &Path) -> ClientProcess {
         // Inherited, so a failure in CI shows the client's own diagnosis
         // rather than only this test's assertion.
-        ClientProcess::spawn_with(addr, export, mnt, Stdio::inherit)
+        ClientProcess::spawn_with(addr, export, mnt, &[], Stdio::inherit)
     }
 
-    /// The same, letting the caller capture the client's log instead.
+    /// The same, letting the caller add flags and capture the client's log.
     ///
-    /// Only one case wants this. The binary's shutdown reports what it did
-    /// about the forced sync (spec §11) and reports it nowhere else — `syncfs`
-    /// leaves no trace a test can stat for — so reading the log is the only way
-    /// to show that the driver-initiated entry point fired at all.
+    /// The log is what two cases are actually about. The binary's shutdown
+    /// reports what it did about the forced sync (spec §11) and reports it
+    /// nowhere else — `syncfs` leaves no trace a test can stat for — and the
+    /// handshake reports whether this mount is resumable, which nothing outside
+    /// the process can see either.
     fn spawn_with(
         addr: SocketAddr,
         export: &Path,
         mnt: &Path,
+        flags: &[&str],
         out: fn() -> Stdio,
     ) -> ClientProcess {
         let child = Command::new(env!("CARGO_BIN_EXE_lbfs-client"))
+            .args(flags)
             .arg(addr.to_string())
             .arg(export)
             .arg(mnt)
@@ -400,7 +403,7 @@ fn the_binary_warns_once_with_the_readahead_command_it_may_not_run() {
     let (_root, export, mnt) = workspace();
     let (_server, addr) = serve(&export);
 
-    let mut client = ClientProcess::spawn_with(addr, &export, &mnt, Stdio::piped);
+    let mut client = ClientProcess::spawn_with(addr, &export, &mnt, &[], Stdio::piped);
     client.wait_until_mounted();
 
     // Non-fatal by observation: the mount serves reads and writes after the
@@ -462,7 +465,7 @@ fn the_binary_forces_a_sync_of_the_export_before_it_exits() {
     let (_root, export, mnt) = workspace();
     let (_server, addr) = serve_with(&export, FsyncPolicy::Ignore);
 
-    let mut client = ClientProcess::spawn_with(addr, &export, &mnt, Stdio::piped);
+    let mut client = ClientProcess::spawn_with(addr, &export, &mnt, &[], Stdio::piped);
     client.wait_until_mounted();
 
     // Data the policy leaves dirty on the server: written, never fsynced.
@@ -486,4 +489,113 @@ fn the_binary_forces_a_sync_of_the_export_before_it_exits() {
         std::fs::read_to_string(export.join("unsynced.txt")).unwrap(),
         "nobody called fsync"
     );
+}
+
+/// `--no-reconnect` restores what a lost server always cost: `EIO` at once,
+/// then a clean unmount, with nothing asked of the server and nothing retained
+/// by it.
+///
+/// The negative half of the resumption feature, and the one an operator falls
+/// back on. The flag clears the handshake request as well as the deadline, so
+/// there is no ticket, no retained session, and — the part this case measures —
+/// no ten-second park in front of the first error. The mount here also runs
+/// with `--attr-timeout 0`, for the reason the in-process twin gives: with
+/// caching on the kernel would answer from its own copies and prove nothing
+/// about the connection underneath.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn a_no_reconnect_mount_dies_with_its_server_as_it_always_has() {
+    require_fuse();
+    let (_root, export, mnt) = workspace();
+    let (server, addr) = serve(&export);
+
+    let mut client = ClientProcess::spawn_with(
+        addr,
+        &export,
+        &mnt,
+        &["--no-reconnect", "--attr-timeout", "0"],
+        Stdio::piped,
+    );
+    client.wait_until_mounted();
+    std::fs::write(mnt.join("before.txt"), "written while the server lived").unwrap();
+
+    // The server vanishes with the mount still up.
+    server.shutdown_timeout(Duration::from_secs(5));
+
+    // The client notices at its own pace — the socket has to reach EOF and the
+    // reader task has to mark the connection dead — so this is a bounded wait
+    // for the first `EIO` rather than an immediate assertion.
+    let started = Instant::now();
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    while errno_of(std::fs::metadata(mnt.join("never-existed"))) != Some(libc::EIO) {
+        assert!(
+            Instant::now() < deadline,
+            "the mount never started answering EIO"
+        );
+        std::thread::sleep(POLL);
+    }
+    let settled = started.elapsed();
+    assert!(
+        settled < NO_PARK,
+        "a --no-reconnect mount answered EIO only after {settled:?}, which is \
+         the reconnect park this flag exists to remove"
+    );
+    assert_eq!(
+        errno_of(std::fs::read(mnt.join("before.txt"))),
+        Some(libc::EIO),
+        "a name the kernel knows about still needs the server to open it"
+    );
+
+    let log = plain(&client.terminate_capturing());
+    assert!(
+        log.contains("resumable=false"),
+        "--no-reconnect must not ask for a ticket; the log was:\n{log}"
+    );
+    assert!(
+        !log.contains("re-attaching"),
+        "--no-reconnect must not redial; the log was:\n{log}"
+    );
+    assert!(
+        !is_fuse_mount(&mnt),
+        "the mount whose server died could not be taken down"
+    );
+    assert_eq!(std::fs::read_dir(&mnt).unwrap().count(), 0);
+}
+
+/// How long the mount has to notice that its server is gone.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The bound that separates "noticed the socket died" from "waited out a
+/// reconnect deadline". The deadline this binary defaults to is ten seconds.
+const NO_PARK: Duration = Duration::from_secs(5);
+
+/// The errno behind a failed filesystem call, or `None` if it succeeded.
+fn errno_of<T>(result: std::io::Result<T>) -> Option<i32> {
+    result.err().and_then(|e| e.raw_os_error())
+}
+
+/// The client's log with its colour codes taken out.
+///
+/// `tracing_subscriber::fmt` paints field names and values even when its output
+/// is a pipe, which drops escape sequences between `resumable`, `=` and what it
+/// settled on — so a test asserting on a field has to read past the paint. The
+/// cases that assert on a whole message need no such thing, since a message is
+/// one unbroken run of characters.
+fn plain(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // A CSI sequence ends at its final byte, which is the only letter in
+        // it; everything between is parameters this has no use for.
+        for c in chars.by_ref() {
+            if c.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+    out
 }

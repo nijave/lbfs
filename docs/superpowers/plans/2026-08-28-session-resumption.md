@@ -1081,6 +1081,7 @@ git commit -m "feat(client): re-attach to a retained session after a disconnect"
 
 **Files:**
 - Edit: `crates/lbfs-client/src/main.rs`, `crates/lbfs-client/src/session.rs`, `crates/lbfs-client/src/conn.rs`
+- Edit: `crates/lbfs-client/src/fuse.rs` (Step 5's line lives in `destroy`)
 - Edit: `crates/lbfs-client/tests/loopback_cli.rs`
 
 **Interfaces:**
@@ -1089,16 +1090,16 @@ git commit -m "feat(client): re-attach to a retained session after a disconnect"
   the binary asks to resume by default; `DETACH` lands in
   `Session::shutdown()`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Unit cases beside the existing `attr_timeout` and `event_loop_threads` ones:
 the flag parses, refuses a negative and an absurd value, and `--no-reconnect`
 yields a zero deadline. One `loopback_cli` case: a mount started with
 `--no-reconnect` behaves exactly as today when its server dies.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: The flags**
+- [x] **Step 3: The flags**
 
 Ten seconds by default, and the doc comment carries the reason: it has to stay
 under the twenty-second `timeout` that `vm/tests/disconnect.sh` puts around its
@@ -1113,7 +1114,7 @@ The binary asks for resumption whenever the deadline is non-zero:
 `--no-reconnect` clears the handshake request too, so it restores today's
 behaviour on the wire as well as in the client.
 
-- [ ] **Step 4: `DETACH` on the way out**
+- [x] **Step 4: `DETACH` on the way out**
 
 The detach lives in `Session::shutdown()`, not in `main.rs`: on a live
 connection of a session that holds a ticket, shutdown sends `DETACH`, waits
@@ -1127,18 +1128,18 @@ Order matters. `shutdown()` runs *after* the unmount drain, because the drain
 flushes writeback and the `FORGET`s the kernel emits for every evicted inode,
 and both need the session.
 
-- [ ] **Step 5: The dropped-forget line**
+- [x] **Step 5: The dropped-forget line**
 
 `destroy` already warns about dropped forgets. Extend it to name the count
 dropped while reconnecting, separately, since that is the one an operator can
 act on by shortening the deadline.
 
-- [ ] **Step 6: Run the tests, then `make check` and `make test-loopback`**
+- [x] **Step 6: Run the tests, then `make check` and `make test-loopback`**
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
-git add crates/lbfs-client/src/main.rs crates/lbfs-client/src/session.rs crates/lbfs-client/src/conn.rs crates/lbfs-client/tests/loopback_cli.rs
+git add crates/lbfs-client/src/main.rs crates/lbfs-client/src/session.rs crates/lbfs-client/src/conn.rs crates/lbfs-client/src/fuse.rs crates/lbfs-client/tests/loopback_cli.rs
 git commit -m "feat(client): --reconnect-timeout, --no-reconnect, DETACH at unmount"
 ```
 
