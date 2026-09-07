@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use lbfs_client::conn::Connection;
-use lbfs_client::fuse::{session_config, LbfsFuse};
+use lbfs_client::fuse::{session_config, LbfsFuse, CONTROL_XATTR_SYNC};
 use lbfs_proto::frame::{DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE};
 use lbfs_server::config::{Allowlist, Config, FsyncPolicy};
 use rustix::fs::{StatVfsMountFlags, XattrFlags};
@@ -300,10 +300,11 @@ impl ServerSide {
 struct Loopback {
     session: Option<fuser::BackgroundSession>,
     conn: Option<Arc<Connection>>,
-    /// Held, never read: the bridge's callbacks spawn onto this runtime's
-    /// handle, so it has to outlive the session and the connection that its
-    /// reader and writer tasks live on.
-    _client_rt: Runtime,
+    /// The bridge's callbacks spawn onto this runtime's handle, so it has to
+    /// outlive the session and the connection whose reader and writer tasks
+    /// live on it. A case that wants to drive the connection directly, rather
+    /// than through the mount, blocks on it — see [`Loopback::on_client_rt`].
+    client_rt: Runtime,
     server: ServerSide,
     root: Option<tempfile::TempDir>,
     export: PathBuf,
@@ -353,7 +354,7 @@ impl Loopback {
         let mounted = Loopback {
             session: Some(session),
             conn: Some(conn),
-            _client_rt: client_rt,
+            client_rt,
             server,
             root: Some(root),
             export,
@@ -392,6 +393,17 @@ impl Loopback {
 
     fn conn(&self) -> &Arc<Connection> {
         self.conn.as_ref().expect("the connection is still held")
+    }
+
+    /// Run one of the connection's own futures to completion.
+    ///
+    /// The escape hatch for a case whose subject is a call the mount cannot
+    /// make — the forced-sync control's acknowledgement being the one that
+    /// matters, since userspace sees only `setxattr`'s zero and never the reply
+    /// flag underneath it. Blocking is safe from here: the test thread is not a
+    /// worker of this runtime.
+    fn on_client_rt<F: std::future::Future>(&self, f: F) -> F::Output {
+        self.client_rt.block_on(f)
     }
 
     /// Unmount and wait for the session thread to finish.
@@ -1720,6 +1732,97 @@ fn fsync_is_honoured_under_the_honor_policy() {
 fn fsync_is_answered_under_the_ignore_policy() {
     fsync_is_honoured_under(FsyncPolicy::Ignore);
 }
+
+/// The forced-sync control, driven from user space through the mount root.
+///
+/// A `setxattr` of [`CONTROL_XATTR_SYNC`] on the mountpoint never reaches the
+/// server as an attribute: the bridge turns it into a forced `FSYNCDIR`, which
+/// the server answers with a real `syncfs(2)` whatever its durability policy
+/// (spec §6, §11).
+///
+/// **What this proves and what it does not.** The `setxattr` returning zero says
+/// the round trip worked. The connection's own call is the stronger claim: it
+/// fails with `EOPNOTSUPP` unless the server acknowledged the forced sync on the
+/// reply frame, and the server sets that bit only on the branch that performed
+/// the syscall — so an `Ok` here is the server reporting, across a real socket,
+/// that `syncfs(2)` ran and returned success. What no test at this layer can
+/// show is the bytes reaching the platter; that needs a power cut, which is VM
+/// work.
+fn the_forced_sync_control_works_under(policy: FsyncPolicy) {
+    let mut lb = Loopback::start(Opts {
+        fsync: policy,
+        ..Opts::default()
+    });
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+    let control = std::str::from_utf8(CONTROL_XATTR_SYNC).unwrap();
+
+    // Data the policy may have left dirty in the server's page cache.
+    std::fs::write(mnt.join("unsynced"), b"bytes nobody fsynced").unwrap();
+
+    // The user-space entry point. Any value asks for one sync.
+    rustix::fs::setxattr(&mnt, control, b"1", XattrFlags::empty())
+        .unwrap_or_else(|e| panic!("{policy:?}: the control xattr must succeed, got {e:?}"));
+    // And again, because a control is not a one-shot.
+    rustix::fs::setxattr(&mnt, control, b"", XattrFlags::empty()).unwrap();
+
+    // The same call the driver makes at unmount, reporting whether the server
+    // acknowledged it. This is the assertion that pins the honour branch.
+    lb.on_client_rt(lb.conn().force_sync_export())
+        .unwrap_or_else(|e| panic!("{policy:?}: the server must acknowledge the sync, got {e:?}"));
+
+    // The control stores nothing, so it reads back absent and never lists.
+    assert_eq!(
+        errno_of(xattr_value(&mnt, control).map_err(std::io::Error::from)),
+        Some(libc::ENODATA),
+        "the control is an action, not an attribute"
+    );
+    assert!(
+        !user_xattr_names(&mnt).contains(control),
+        "the control must not appear in the mount root's listing"
+    );
+
+    // The shadowing bound: the same name on any other file is an ordinary
+    // attribute and travels like one. Only the root inode loses the name.
+    let f = mnt.join("ordinary");
+    std::fs::write(&f, b"body").unwrap();
+    rustix::fs::setxattr(&f, control, b"stored", XattrFlags::empty()).unwrap();
+    assert_eq!(xattr_value(&f, control).unwrap(), b"stored");
+    assert!(user_xattr_names(&f).contains(control));
+    // The server has it too, under the same name.
+    assert_eq!(
+        xattr_value(&export.join("ordinary"), control).unwrap(),
+        b"stored"
+    );
+
+    // The mount is still healthy after all of it.
+    assert_eq!(
+        std::fs::read(export.join("unsynced")).unwrap(),
+        b"bytes nobody fsynced"
+    );
+    lb.unmount();
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn the_forced_sync_control_works_under_the_ignore_policy() {
+    the_forced_sync_control_works_under(FsyncPolicy::Ignore);
+}
+
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn the_forced_sync_control_works_under_the_honor_policy() {
+    the_forced_sync_control_works_under(FsyncPolicy::Honor);
+}
+
+// An application's own `fsync(2)` still rides the server's policy — the bridge
+// must not quietly force every sync the kernel passes down, or `fsync =
+// "ignore"` would have nothing left to configure. That property has no test at
+// *this* layer, and cannot: the FIFO that witnesses a real `fsync(2)` is opened
+// by the kernel's own `fifo_open` rather than by FUSE, so a sync on one never
+// reaches the server at all. It is pinned where the witness works instead —
+// `crates/lbfs-client/tests/live.rs` drives the connection directly, and
+// `tests/tests/protocol.rs` drives the frames.
 
 // ---------------------------------------------------------------------------
 // Concurrency

@@ -81,6 +81,11 @@ fn force_unmount(mnt: &Path) {
 
 /// A server on an OS-assigned port, serving `export`, on a runtime of its own.
 fn serve(export: &Path) -> (tokio::runtime::Runtime, SocketAddr) {
+    serve_with(export, FsyncPolicy::Honor)
+}
+
+/// The same, for a case whose subject is the durability policy.
+fn serve_with(export: &Path, fsync: FsyncPolicy) -> (tokio::runtime::Runtime, SocketAddr) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -90,7 +95,7 @@ fn serve(export: &Path) -> (tokio::runtime::Runtime, SocketAddr) {
         allowed_paths: vec![export.to_str().unwrap().to_string()],
         max_inflight: DEFAULT_MAX_INFLIGHT,
         max_io_size: DEFAULT_MAX_IO_SIZE,
-        fsync: FsyncPolicy::Honor,
+        fsync,
     };
     let allow = Allowlist::new(&cfg.allowed_paths).unwrap();
     let listener = rt
@@ -115,13 +120,30 @@ struct ClientProcess {
 
 impl ClientProcess {
     fn spawn(addr: SocketAddr, export: &Path, mnt: &Path) -> ClientProcess {
+        // Inherited, so a failure in CI shows the client's own diagnosis
+        // rather than only this test's assertion.
+        ClientProcess::spawn_with(addr, export, mnt, Stdio::inherit)
+    }
+
+    /// The same, letting the caller capture the client's log instead.
+    ///
+    /// Only one case wants this. The binary's shutdown reports what it did
+    /// about the forced sync (spec §11) and reports it nowhere else — `syncfs`
+    /// leaves no trace a test can stat for — so reading the log is the only way
+    /// to show that the driver-initiated entry point fired at all.
+    fn spawn_with(
+        addr: SocketAddr,
+        export: &Path,
+        mnt: &Path,
+        out: fn() -> Stdio,
+    ) -> ClientProcess {
         let child = Command::new(env!("CARGO_BIN_EXE_lbfs-client"))
             .arg(addr.to_string())
             .arg(export)
             .arg(mnt)
-            // Inherited, so a failure in CI shows the client's own diagnosis
-            // rather than only this test's assertion.
-            .stdout(Stdio::inherit())
+            // `tracing_subscriber::fmt()` writes to stdout, so that is the
+            // handle a case wanting the client's own log has to take.
+            .stdout(out())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("the lbfs-client binary runs");
@@ -161,6 +183,41 @@ impl ClientProcess {
         )
         .expect("the client is signalled");
         self.wait_for_exit("exit after SIGTERM")
+    }
+
+    /// `SIGTERM`, then the client's whole log, for a case that asserts on it.
+    ///
+    /// The read comes first and the wait second, and that order is the point:
+    /// the read returns when the child closes its stdout, which is when it
+    /// exits, so this both collects the log and waits for the exit — and it
+    /// cannot deadlock the way a wait-then-read would on a child still filling
+    /// a pipe nobody is draining. Only usable on a process spawned with
+    /// [`ClientProcess::spawn_with`] and a pipe.
+    fn terminate_capturing(&mut self) -> String {
+        use std::io::Read;
+
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(self.child.as_ref().expect("still running")),
+            rustix::process::Signal::TERM,
+        )
+        .expect("the client is signalled");
+
+        let mut out = self
+            .child
+            .as_mut()
+            .expect("still running")
+            .stdout
+            .take()
+            .expect("spawned with a piped stdout");
+        let mut log = String::new();
+        out.read_to_string(&mut log)
+            .expect("the client's log reads");
+        let status = self.wait_for_exit("exit after SIGTERM");
+        assert!(status.success(), "the client exited with {status}:\n{log}");
+        // Inherited output is what every other case relies on for diagnosis;
+        // this one took the pipe, so it hands the log back to the terminal too.
+        print!("{log}");
+        log
     }
 
     /// Wait for the child to leave, or kill it and fail saying what it never
@@ -316,5 +373,51 @@ fn the_binary_refuses_to_mount_an_export_the_server_does_not_offer() {
     assert!(
         !is_fuse_mount(&mnt),
         "the client mounted before it knew the export was refused"
+    );
+}
+
+/// The binary forces a real sync of the export on its way out (spec §11).
+///
+/// The second of the control's two entry points, and the one no user-space test
+/// can reach: nothing asks for it, so the only evidence it happened is the
+/// client saying so. `syncfs(2)` changes nothing a later `stat` can see, and the
+/// mount is gone by the time it runs — so the log is the witness, and the
+/// server's acknowledgement is what the log is reporting. A line claiming the
+/// sync appears only when the reply carried `FLAG_FORCE_SYNC`, which the server
+/// sets only on the branch that made the syscall.
+///
+/// `fsync = "ignore"` on purpose: that is the policy under which every byte this
+/// mount wrote is still dirty in the server's page cache when the unmount
+/// finishes, and the exit sync is the last thing that will ever flush it.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn the_binary_forces_a_sync_of_the_export_before_it_exits() {
+    require_fuse();
+    let (_root, export, mnt) = workspace();
+    let (_server, addr) = serve_with(&export, FsyncPolicy::Ignore);
+
+    let mut client = ClientProcess::spawn_with(addr, &export, &mnt, Stdio::piped);
+    client.wait_until_mounted();
+
+    // Data the policy leaves dirty on the server: written, never fsynced.
+    std::fs::write(mnt.join("unsynced.txt"), "nobody called fsync").unwrap();
+
+    let log = client.terminate_capturing();
+    assert!(
+        log.contains("forced a sync of the export before exit"),
+        "the binary must force a sync on the way out; its log was:\n{log}"
+    );
+    // The failure modes have their own lines, and none of them may appear.
+    for unwanted in [
+        "does not implement the forced-sync control",
+        "was not synced on the way out",
+        "did not finish",
+    ] {
+        assert!(!log.contains(unwanted), "{unwanted:?} in:\n{log}");
+    }
+    assert!(!is_fuse_mount(&mnt), "the client left its mount behind");
+    assert_eq!(
+        std::fs::read_to_string(export.join("unsynced.txt")).unwrap(),
+        "nobody called fsync"
     );
 }
