@@ -739,6 +739,20 @@ fn reply_statfs(reply: ReplyStatfs, r: Result<StatfsReply, Errno>) {
     }
 }
 
+// Three callbacks stay unwritten on purpose, left to fuser's defaults — each
+// logs a "[Not Implemented]" warning and answers `ENOSYS`:
+//
+// * `bmap` maps a file block to a device block, which fuser's own doc scopes
+//   to block-device-backed filesystems mounted with the `blkdev` option. This
+//   mount is a socket to a remote directory; a `FIBMAP`-style query has no
+//   device block to name.
+// * `ioctl` has no opcode on the wire — nothing in `lbfs_proto::Opcode`
+//   carries an ioctl — and the one control lbfs needs went to an xattr
+//   instead. See [`CONTROL_XATTR_SYNC`] for that reasoning.
+// * `poll`: the kernel treats the `ENOSYS` as success with its default poll
+//   mask and stops sending the request, so regular files and directories
+//   report ready the way they would on any local filesystem — right for a
+//   mount with no event source of its own.
 impl fuser::Filesystem for LbfsFuse {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         let max_io = self.conn.limits.max_io_size;
