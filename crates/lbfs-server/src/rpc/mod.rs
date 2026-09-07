@@ -54,11 +54,13 @@ use std::time::Duration;
 
 use lbfs_proto::frame::{
     FrameHeader, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_ATTACH_DENIED,
-    STATUS_NOT_EXPORTED, STATUS_OK, STATUS_VERSION_MISMATCH, WINDOW_CLAMP,
+    STATUS_NOT_EXPORTED, STATUS_NO_SESSION, STATUS_OK, STATUS_SESSION_BUSY,
+    STATUS_SESSION_MISMATCH, STATUS_VERSION_MISMATCH, WINDOW_CLAMP,
 };
 use lbfs_proto::io::{read_body, read_header, write_frame, IoError};
 use lbfs_proto::ops::{
     AttachReply, AttachRequest, ForgetRequest, HelloReply, HelloRequest, Opcode, ReadRequest,
+    ResumeReply, ResumeRequest,
 };
 use lbfs_proto::types::ROOT_NODE;
 use lbfs_proto::Errno;
@@ -73,7 +75,7 @@ use crate::fs::local::uring::UringExecutor;
 use crate::fs::local::LocalFs;
 use crate::fs::FileSystem;
 use dispatch::{dispatch, DataPayload};
-use registry::Registry;
+use registry::{Claim, Registry};
 
 /// Sessions that outlive their sockets (spec §7, design §8.1).
 ///
@@ -454,7 +456,22 @@ async fn session(mut sock: TcpStream, server: Arc<Server>) -> Result<(), Session
     let Some(limits) = hello(&mut sock, &server).await? else {
         return Ok(());
     };
-    let Some((fs, retained)) = attach(&mut sock, &server, limits).await? else {
+    // The second frame is either ATTACH — a fresh session — or RESUME — a claim
+    // on a retained one. The read loop below rejects both once serving starts,
+    // so this is the one place either is legal.
+    let hdr = read_header(&mut sock).await?;
+    let op = Opcode::try_from(hdr.op_or_status)
+        .map_err(|_| SessionError::Protocol("second frame must be ATTACH or RESUME"))?;
+    let served = match op {
+        Opcode::Attach => attach(&mut sock, &server, limits, hdr).await?,
+        Opcode::Resume => resume(&mut sock, &server, limits, hdr).await?,
+        _ => {
+            return Err(SessionError::Protocol(
+                "second frame must be ATTACH or RESUME",
+            ))
+        }
+    };
+    let Some((fs, retained)) = served else {
         return Ok(());
     };
     serve_requests(sock, server, limits, fs, retained).await
@@ -527,11 +544,8 @@ async fn attach(
     sock: &mut TcpStream,
     server: &Server,
     limits: Limits,
+    hdr: FrameHeader,
 ) -> Result<Option<(Arc<dyn FileSystem>, Retained)>, SessionError> {
-    let hdr = read_header(sock).await?;
-    if hdr.op_or_status != Opcode::Attach as u16 {
-        return Err(SessionError::Protocol("second frame must be ATTACH"));
-    }
     if hdr.data_len != 0 {
         return Err(SessionError::Protocol("ATTACH carries no data segment"));
     }
@@ -610,6 +624,70 @@ async fn attach(
         "attached"
     );
     Ok(Some((fs, retained)))
+}
+
+/// Step 2, the resuming path: claim a retained session and report the root's
+/// attributes, or refuse with one of the three session statuses.
+///
+/// One registry call and one `getattr`. `claim` runs every check under its own
+/// lock — the id, the constant-time secret, idle-within-deadline, and the
+/// settled `Limits` against the ones stored at mint — and a refusal of any kind
+/// mutates nothing, so there is nothing here to release and nothing to undo.
+async fn resume(
+    sock: &mut TcpStream,
+    server: &Server,
+    limits: Limits,
+    hdr: FrameHeader,
+) -> Result<Option<(Arc<dyn FileSystem>, Retained)>, SessionError> {
+    if hdr.data_len != 0 {
+        return Err(SessionError::Protocol("RESUME carries no data segment"));
+    }
+    let peer = sock.peer_addr().ok();
+    let body = read_body(sock, hdr.body_len, MAX_BODY_SIZE).await?;
+    let req: ResumeRequest =
+        postcard::from_bytes(&body).map_err(|_| SessionError::Protocol("malformed RESUME body"))?;
+
+    // The three refusals map one-to-one onto their statuses. A refused claim is
+    // the line an operator reads when a mount died, so it names the peer and
+    // the reason; the successful claim is what the reconnect drill greps for,
+    // so it names the session id.
+    let (fs, epoch) = match server.registry.claim(&req.ticket, &limits) {
+        Claim::Ok { payload, epoch } => (payload, epoch),
+        Claim::NoSession => {
+            tracing::info!(?peer, id = req.ticket.id, "RESUME refused: no such session");
+            reply(sock, hdr.request_id, STATUS_NO_SESSION, &[]).await?;
+            return Ok(None);
+        }
+        Claim::Busy => {
+            tracing::info!(?peer, id = req.ticket.id, "RESUME refused: session busy");
+            reply(sock, hdr.request_id, STATUS_SESSION_BUSY, &[]).await?;
+            return Ok(None);
+        }
+        Claim::Mismatch => {
+            tracing::info!(
+                ?peer,
+                id = req.ticket.id,
+                "RESUME refused: handshake shape differs from the retained session"
+            );
+            reply(sock, hdr.request_id, STATUS_SESSION_MISMATCH, &[]).await?;
+            return Ok(None);
+        }
+    };
+
+    let root_attr = match fs.getattr(ROOT_NODE, None).await {
+        Ok(attr) => attr,
+        Err(e) => {
+            reply(sock, hdr.request_id, e.0, &[]).await?;
+            // The claim already flipped the entry to `Attached` under this
+            // task's epoch, so teardown's `release` returns it to `Idle` for
+            // the next attempt — the same path a served session takes.
+            return Ok(Some((fs, Some((req.ticket.id, epoch)))));
+        }
+    };
+    let body = encode(&ResumeReply { root_attr })?;
+    reply(sock, hdr.request_id, STATUS_OK, &body).await?;
+    tracing::info!(?peer, id = req.ticket.id, "resumed a retained session");
+    Ok(Some((fs, Some((req.ticket.id, epoch)))))
 }
 
 /// A frame the session writes itself, before the writer task exists.

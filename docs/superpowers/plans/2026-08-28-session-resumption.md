@@ -732,7 +732,7 @@ git commit -m "feat(server): retain a session for a grace after its socket dies"
   `STATUS_OK` with the root's attributes, or one of the three refusal
   statuses.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 This is the suite that pins the contract. In `tests/tests/protocol.rs`:
 
@@ -766,9 +766,9 @@ This is the suite that pins the contract. In `tests/tests/protocol.rs`:
     the ticket `ATTACH` minted: it works. Nothing rotates, so nothing needs
     re-learning after a claim.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Write `resume`**
+- [x] **Step 3: Write `resume`**
 
 A sibling of `attach` in the handshake sequence. `session()` reads the second
 frame's opcode and branches: `Attach` → today's path, `Resume` → the new one,
@@ -788,14 +788,14 @@ Log every refusal with the peer address and the reason, and every successful
 claim with the session id — a refused claim is the line an operator reads when
 a mount died, and the claim line is what Task 13's drill greps for.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p lbfs-tests --test protocol resume`
 Expected: PASS, all eleven.
 
-- [ ] **Step 5: `make check` and `make test-loopback`**
+- [x] **Step 5: `make check` and `make test-loopback`**
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/mod.rs tests/src/lib.rs tests/tests/protocol.rs

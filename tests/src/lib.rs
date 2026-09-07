@@ -35,9 +35,10 @@ use lbfs_proto::frame::{
 };
 use lbfs_proto::io::{read_body, read_header, write_frame};
 use lbfs_proto::ops::{
-    AttachReply, AttachRequest, CreateRequest, ForgetRequest, GetattrRequest, HelloReply,
-    HelloRequest, LookupRequest, MkdirRequest, Opcode, OpenRequest, OpendirRequest, ReadRequest,
-    ReaddirRequest, ReleaseRequest, ReleasedirRequest, RmdirRequest, UnlinkRequest, WriteRequest,
+    AttachReply, AttachRequest, CreateRequest, DetachRequest, ForgetRequest, GetattrRequest,
+    HelloReply, HelloRequest, LookupRequest, MkdirRequest, Opcode, OpenRequest, OpendirRequest,
+    ReadRequest, ReaddirRequest, ReleaseRequest, ReleasedirRequest, ResumeRequest, RmdirRequest,
+    UnlinkRequest, WriteRequest,
 };
 use lbfs_proto::types::{Fh, FileAttr, NodeId, SessionTicket};
 use lbfs_server::config::{Allowlist, Config, FsyncPolicy};
@@ -537,6 +538,19 @@ impl TestClient {
             },
         )
         .await
+    }
+
+    /// RESUME as the second frame: presents a ticket to claim a retained
+    /// session. The raw reply, so a case can assert the refusal status as
+    /// readily as the success.
+    pub async fn resume(&mut self, ticket: SessionTicket) -> Reply {
+        self.call(Opcode::Resume, &ResumeRequest { ticket }).await
+    }
+
+    /// DETACH as an ordinary in-session request: drops the retained session so
+    /// a clean unmount leaves no descriptors resident for the grace.
+    pub async fn detach(&mut self, ticket: SessionTicket) -> Reply {
+        self.call(Opcode::Detach, &DetachRequest { ticket }).await
     }
 
     // --- Sugar for the ops every case needs --------------------------------
