@@ -378,6 +378,70 @@ fn the_binary_refuses_to_mount_an_export_the_server_does_not_offer() {
     );
 }
 
+/// The readahead attempt runs, fails without privileges, and names the exact
+/// command an operator needs (`docs/benchmarks/2026-08-28-readahead.md`).
+///
+/// The knob at `/sys/class/bdi/<dev>/read_ahead_kb` is `root:root` mode 644
+/// and this suite runs unprivileged, so the write earns `EACCES` — which is
+/// the case worth pinning: one WARN carrying the command, no second complaint,
+/// no claim of success, and a mount that keeps serving I/O afterwards. The
+/// `echo 1024` in the message is the negotiated 1 MiB `max_io_size` over 1024,
+/// so the same line also proves the default derivation ran end to end.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn the_binary_warns_once_with_the_readahead_command_it_may_not_run() {
+    require_fuse();
+    if rustix::process::geteuid().is_root() {
+        // Root would write the knob successfully and this case pins the
+        // unprivileged path; the ordinary suite never runs as root.
+        eprintln!("lbfs loopback: skipping the readahead WARN case under root");
+        return;
+    }
+    let (_root, export, mnt) = workspace();
+    let (_server, addr) = serve(&export);
+
+    let mut client = ClientProcess::spawn_with(addr, &export, &mnt, Stdio::piped);
+    client.wait_until_mounted();
+
+    // Non-fatal by observation: the mount serves reads and writes after the
+    // attempt has already failed.
+    std::fs::write(mnt.join("after.txt"), "still serving").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("after.txt")).unwrap(),
+        "still serving"
+    );
+
+    let log = client.terminate_capturing();
+    let warns: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains("read_ahead_kb"))
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "exactly one readahead WARN; the log was:\n{log}"
+    );
+    assert!(
+        warns[0].contains("echo 1024 | sudo tee /sys/class/bdi/"),
+        "the WARN must carry the operator's command; the line was:\n{}",
+        warns[0]
+    );
+    assert!(
+        warns[0].contains("/read_ahead_kb"),
+        "the command must name the knob; the line was:\n{}",
+        warns[0]
+    );
+    // The success line is INFO and mentions the knob; the WARN above also says
+    // "set the mount's readahead" (as "cannot set ..."), so the level is what
+    // separates a claim of success from the complaint.
+    assert!(
+        !log.lines()
+            .any(|line| line.contains("INFO") && line.contains("readahead")),
+        "an unprivileged client must not claim it set the knob:\n{log}"
+    );
+    assert!(!is_fuse_mount(&mnt), "the client left its mount behind");
+}
+
 /// The binary forces a real sync of the export on its way out (spec §11).
 ///
 /// The second of the control's two entry points, and the one no user-space test

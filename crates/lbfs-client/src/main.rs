@@ -24,6 +24,7 @@ use std::time::Duration;
 use clap::Parser;
 use lbfs_client::conn::{ConnectError, Connection};
 use lbfs_client::fuse::{session_config, LbfsFuse};
+use lbfs_client::readahead;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -102,6 +103,19 @@ struct Cli {
     /// `--fuse-threads` too.
     #[arg(long)]
     fuse_clone_fd: bool,
+
+    /// Readahead to ask the kernel for on this mount's backing device, in KiB.
+    ///
+    /// Defaults to the negotiated `max_io_size / 1024`, where the measured
+    /// throughput curve flattens (`docs/benchmarks/2026-08-28-readahead.md`),
+    /// and never derives below the kernel's own default of 128; `0` skips the
+    /// attempt entirely. Written to the mount's
+    /// `/sys/class/bdi/<dev>/read_ahead_kb` after the mount comes up, best
+    /// effort: the knob is root-owned, so an unprivileged client logs the
+    /// command an operator needs and carries on at the kernel's default of
+    /// 128 — about half of buffered sequential read throughput.
+    #[arg(long)]
+    readahead_kb: Option<u32>,
 }
 
 /// Everything that can go wrong before the mount exists.
@@ -120,6 +134,11 @@ enum StartupError {
     FuseThreads,
     #[error("the remote path must be absolute")]
     RelativeRemotePath,
+    #[error("resolving the mountpoint {path}: {source}")]
+    Mountpoint {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("starting the runtime: {0}")]
     Runtime(std::io::Error),
     #[error("connecting to {addr}: {source}")]
@@ -167,6 +186,20 @@ fn run() -> Result<(), StartupError> {
     let addr = resolve(&cli.server)?;
     let writeback = !cli.no_writeback;
 
+    // Resolved now, while the mountpoint is still a plain directory.
+    // Canonicalizing after `spawn_mount` would `lstat` the FUSE root — a
+    // `GETATTR` round trip back into this very process, blocking this thread
+    // before it reaches `wait_for_shutdown` if the server wedges in that
+    // window. mountinfo prints mount points post-resolution, so this is also
+    // the exact path the readahead lookup below has to match.
+    let mountpoint = cli
+        .mountpoint
+        .canonicalize()
+        .map_err(|source| StartupError::Mountpoint {
+            path: cli.mountpoint.display().to_string(),
+            source,
+        })?;
+
     // Multi-threaded on purpose: one FUSE dispatch thread feeds it, and the
     // whole point of the bridge is that the requests it spawns overlap.
     let rt = tokio::runtime::Runtime::new().map_err(StartupError::Runtime)?;
@@ -202,16 +235,26 @@ fn run() -> Result<(), StartupError> {
         writeback,
     );
     let session =
-        fuser::spawn_mount(fs, &cli.mountpoint, &cfg).map_err(|source| StartupError::Mount {
-            path: cli.mountpoint.display().to_string(),
+        fuser::spawn_mount(fs, &mountpoint, &cfg).map_err(|source| StartupError::Mount {
+            path: mountpoint.display().to_string(),
             source,
         })?;
     tracing::info!(
-        mountpoint = %cli.mountpoint.display(),
+        mountpoint = %mountpoint.display(),
         %addr,
         remote = %cli.remote_path.display(),
         "mounted"
     );
+
+    // After the mount, because that is when the bdi exists; best effort,
+    // because the knob is root-owned and throughput is not correctness. The
+    // kernel clamps the `INIT` readahead to this sysfs value, so without the
+    // write a buffered sequential read runs at about half speed
+    // (docs/benchmarks/2026-08-28-readahead.md). The path was resolved before
+    // the mount went up, so this makes no FUSE round trip into the client.
+    if let Some(kb) = readahead::effective_readahead_kb(cli.readahead_kb, limits.max_io_size) {
+        readahead::apply(&mountpoint, kb);
+    }
 
     let ending = rt.block_on(wait_for_shutdown(&mut signals, &session));
 
@@ -421,6 +464,34 @@ mod tests {
         assert!(!cli.no_writeback);
         assert!(!cli.allow_other);
         assert!(!cli.auto_unmount);
+        assert_eq!(cli.readahead_kb, None);
+    }
+
+    /// Absent means "derive from the negotiated `max_io_size`", which only the
+    /// handshake can resolve, so the flag parses to an `Option` and the
+    /// derivation lives in [`lbfs_client::readahead::effective_readahead_kb`].
+    /// Zero parses as zero — the disable case — rather than being refused.
+    #[test]
+    fn the_readahead_flag_parses() {
+        let explicit = Cli::parse_from([
+            "lbfs-client",
+            "--readahead-kb",
+            "2048",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(explicit.readahead_kb, Some(2048));
+
+        let disabled = Cli::parse_from([
+            "lbfs-client",
+            "--readahead-kb",
+            "0",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(disabled.readahead_kb, Some(0));
     }
 
     /// Absent means "the same as the attribute lifetime", which is what every

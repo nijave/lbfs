@@ -772,7 +772,12 @@ impl fuser::Filesystem for LbfsFuse {
         }
         // Advisory: the kernel reports its own ceiling and refuses anything
         // above it, which is fine — readahead below the I/O size costs
-        // throughput, never correctness.
+        // throughput, never correctness. And the ceiling is real: the kernel
+        // takes the smaller of this value and the bdi's `read_ahead_kb`,
+        // whose default of 128 costs about half of buffered sequential read
+        // throughput (docs/benchmarks/2026-08-28-readahead.md). This call
+        // cannot win that fight on its own — `readahead::apply`, run once the
+        // mount exists, writes the sysfs half.
         if let Err(nearest) = config.set_max_readahead(max_io) {
             tracing::debug!(max_io, nearest, "max_readahead clamped by the kernel");
         }
