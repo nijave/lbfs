@@ -1133,6 +1133,83 @@ async fn a_reply_already_on_the_wire_survives_the_disconnect_behind_it() {
 }
 
 // ---------------------------------------------------------------------------
+// The death signal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn closed_stays_pending_while_the_connection_lives() {
+    let fake = Fake::bind().await;
+    let (conn, _sess) = plain(&fake).await;
+
+    // Nothing has gone wrong, so nothing may wake: a `closed()` that completed
+    // here would have a reconnect supervisor redialling a healthy mount.
+    assert!(
+        tokio::time::timeout(NEVER, conn.closed()).await.is_err(),
+        "closed() must not complete on a live connection"
+    );
+    assert!(!conn.is_dead());
+}
+
+#[tokio::test]
+async fn closed_completes_when_the_server_drops_the_socket() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+
+    let waiter = {
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move { conn.closed().await })
+    };
+    // Still parked, because the connection is still up.
+    tokio::time::sleep(NEVER).await;
+    assert!(!waiter.is_finished());
+
+    drop(sess);
+    tokio::time::timeout(ARRIVES, waiter)
+        .await
+        .expect("closed() wakes on the death")
+        .unwrap();
+    assert!(conn.is_dead());
+}
+
+#[tokio::test]
+async fn closed_returns_at_once_on_a_connection_that_already_died() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+    drop(sess);
+    // Observe the death through a call, so the reader task has certainly run.
+    assert_eq!(conn.getattr(1, None).await.unwrap_err(), Errno::EIO);
+
+    // The waiter arrives after the notification, which is the case a bare
+    // `Notify` would miss for ever.
+    tokio::time::timeout(ARRIVES, conn.closed())
+        .await
+        .expect("closed() on a dead connection returns immediately");
+}
+
+#[tokio::test]
+async fn two_waiters_both_learn_of_one_death() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let conn = Arc::clone(&conn);
+        waiters.push(tokio::spawn(async move { conn.closed().await }));
+    }
+    tokio::time::sleep(NEVER).await;
+    drop(sess);
+
+    // Both, not whichever registered first: a permit handed to one waiter would
+    // leave the other parked on a connection that is never coming back.
+    for waiter in waiters {
+        tokio::time::timeout(ARRIVES, waiter)
+            .await
+            .expect("every waiter learns of the death")
+            .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Frames the client must not send
 // ---------------------------------------------------------------------------
 

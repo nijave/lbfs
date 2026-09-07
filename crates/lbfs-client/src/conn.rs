@@ -41,11 +41,13 @@
 //!   segment under the *body* bound rather than the I/O bound. A client that
 //!   policed inbound data with `max_io_size` alone would kill its own
 //!   connection on a legal 64 KiB xattr over a session that settled on 4096.
-//! * **A dead connection stays dead.** There is no reconnect in v1 (spec §7):
-//!   node ids, handles and lookup counts are session state the server drops
-//!   with the socket, so pretending otherwise would hand the caller a handle
-//!   that names nothing. Every pending caller gets `EIO`, every later call
-//!   gets `EIO` immediately, and the mount stays unmountable-clean.
+//! * **A dead connection stays dead.** Node ids, handles and lookup counts are
+//!   session state, so a `Connection` that has failed cannot be revived without
+//!   handing the caller a handle that names nothing. Every pending caller gets
+//!   `EIO`, every later call gets `EIO` immediately, and the mount stays
+//!   unmountable-clean. [`Connection::closed`] reports that death to whoever
+//!   wants to dial a *new* connection; it does not undo it, and nothing here
+//!   reconnects.
 
 use std::collections::HashMap;
 use std::io;
@@ -79,7 +81,7 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 /// The smallest I/O ceiling this client will accept from a server.
@@ -277,6 +279,9 @@ struct Shared {
     /// of the batcher was full. Only the first is worth a warning; the rest
     /// would be a log flood at exactly the moment the connection is in trouble.
     dropped_forgets: AtomicU64,
+    /// Woken once, by [`Shared::kill`], for every waiter parked in
+    /// [`Connection::closed`].
+    died: Arc<Notify>,
 }
 
 impl Shared {
@@ -335,6 +340,13 @@ impl Shared {
             Table::Dead => return,
         };
         self.dead.store(true, Ordering::Release);
+        // After the store, never before: a waiter that misses the notification
+        // re-reads `dead` and finds it set. See [`Connection::closed`].
+        //
+        // `notify_waiters` rather than `notify_one`, because every waiter has to
+        // learn — and a stored permit for a waiter that has not arrived yet
+        // would be wrong here, since that waiter reads `dead` instead.
+        self.died.notify_waiters();
         // Wakes callers parked waiting for a permit, which would otherwise
         // wait on a window that can never open again.
         self.window.close();
@@ -444,6 +456,7 @@ impl Connection {
             next_id: AtomicU64::new(3),
             window: Arc::new(Semaphore::new(settled.max_inflight as usize)),
             dropped_forgets: AtomicU64::new(0),
+            died: Arc::new(Notify::new()),
         });
         let (out_tx, out_rx) = mpsc::channel(settled.max_inflight as usize + OUT_SLACK);
         let (forget_tx, forget_rx) = mpsc::channel(FORGET_QUEUE);
@@ -476,6 +489,33 @@ impl Connection {
     /// Whether the connection has failed. Once true, never false again.
     pub fn is_dead(&self) -> bool {
         self.shared.is_dead()
+    }
+
+    /// Resolve when this connection dies, and at once if it already has.
+    ///
+    /// The signal a caller above this layer needs to dial a replacement without
+    /// polling `is_dead`. It reports the death and changes nothing about it: a
+    /// dead `Connection` still answers `EIO` for ever, and whatever wakes here
+    /// builds a *new* one.
+    ///
+    /// The two checks around the registration are the whole of the correctness.
+    /// `notify_waiters` wakes the waiters registered at the moment it runs and
+    /// stores nothing for later, so a death between the first check and the
+    /// registration would be missed for ever. `enable` registers the waiter
+    /// before the future is awaited, which lets the second check cover exactly
+    /// that window — `kill` stores `dead` before it notifies, so a waiter that
+    /// misses the notification reads the flag instead.
+    pub async fn closed(&self) {
+        if self.shared.is_dead() {
+            return;
+        }
+        let notified = self.shared.died.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.shared.is_dead() {
+            return;
+        }
+        notified.await;
     }
 
     /// One request, one reply, correlated.

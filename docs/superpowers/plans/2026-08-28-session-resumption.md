@@ -863,15 +863,15 @@ git commit -m "feat(server): DETACH drops a session at a clean unmount"
 - Produces: `pub async fn closed(&self)`, which returns when the connection
   dies and returns immediately if it already has.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `mux.rs`: `closed()` on a live connection stays pending; it completes when
 the scripted server drops the socket; it completes immediately on a connection
 that already died; and two concurrent waiters both complete.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Add the signal**
+- [x] **Step 3: Add the signal**
 
 `Shared` grows a `died: Arc<Notify>`; `Shared::kill` calls `notify_waiters`
 after it stores `dead`. `Connection::closed` checks `is_dead()` first, then
@@ -884,9 +884,9 @@ the `is_dead()` check already covers that case.
 answers `EIO` forever and is never revived. `closed()` reports the death; it
 does not undo it.
 
-- [ ] **Step 4: Run the tests, then `make check`**
+- [x] **Step 4: Run the tests, then `make check`**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/lbfs-client/src/conn.rs crates/lbfs-client/tests/mux.rs
