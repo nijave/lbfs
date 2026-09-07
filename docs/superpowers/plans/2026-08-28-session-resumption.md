@@ -388,9 +388,6 @@ pub struct ResumeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeReply {
     pub root_attr: FileAttr,
-    /// A ticket with a fresh secret. One reconnect invalidates whatever an
-    /// observer read out of the `ATTACH` reply.
-    pub ticket: SessionTicket,
 }
 
 /// No reply body. Drops the session and everything it holds, so a clean
@@ -440,14 +437,15 @@ git commit -m "feat(proto): version 3 with session tickets, RESUME and DETACH"
 
 **Interfaces:**
 - Consumes: `lbfs_proto::types::SessionTicket`.
-- Produces: `Registry<T>` — generic over the payload so its own tests need no
-  filesystem — plus `pub type SessionRegistry = Registry<Arc<dyn FileSystem>>`
-  in `rpc::mod`. Methods: `mint`, `claim`, `release`, `drop_session`,
-  `reap_expired`, `len`.
+- Produces: `Registry<T, G>` — generic over the payload and over an opaque
+  shape guard, so its own tests need no filesystem and no handshake — plus
+  `pub type SessionRegistry = Registry<Arc<dyn FileSystem>, (Limits, bool)>`
+  in `rpc::mod`, the guard being the settled limits and the `writeback` flag.
+  Methods: `mint`, `claim`, `release`, `drop_session`, `reap_expired`, `len`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Cover, against `Registry<u32>`:
+Cover, against `Registry<u32, u32>`:
 
 1. `mint` returns a ticket whose id is fresh and whose secret differs between
    two mints.
@@ -466,8 +464,12 @@ Cover, against `Registry<u32>`:
 8. `drop_session` removes the entry; a later claim answers `NoSession`.
 9. `mint` past `max_sessions` returns `None`, and the caller treats that as
    "no ticket", not as an error.
-10. A claim rotates the secret: the ticket the claim returns differs from the
-    one it consumed, and the consumed one no longer works.
+10. A claim whose guard differs answers `Mismatch` and mutates nothing: the
+    same ticket with the matching guard straight afterwards succeeds, and the
+    entry's deadline has not moved.
+11. A claim on an `Idle` entry past its deadline answers `NoSession` even
+    though the reaper has not run. Expiry is the clock's fact, not the reaper's
+    schedule.
 
 - [ ] **Step 2: Run them and watch them fail**
 
@@ -480,25 +482,31 @@ The shape:
 
 ```rust
 pub enum Claim<T> {
-    Ok { payload: T, epoch: u64, ticket: SessionTicket },
+    Ok { payload: T, epoch: u64 },
     NoSession,
     Busy,
+    Mismatch,
 }
 
 enum State {
-    Attached { epoch: u64 },
+    Attached,
     Idle { deadline: Instant },
 }
 
-struct Entry<T> {
+struct Entry<T, G> {
     payload: T,
+    /// The negotiated shape, stored at mint. Opaque to the registry: a claim
+    /// must present an equal value, and that comparison is everything the
+    /// registry knows about handshakes.
+    guard: G,
     secret: [u8; 16],
+    /// The single home of the epoch. `State::Attached` carries no copy.
     epoch: u64,
     state: State,
 }
 
-pub struct Registry<T> {
-    inner: Mutex<Inner<T>>,
+pub struct Registry<T, G: PartialEq> {
+    inner: Mutex<Inner<T, G>>,
     grace: Duration,
     max_sessions: usize,
 }
@@ -506,16 +514,23 @@ pub struct Registry<T> {
 
 Rules, all under the one lock:
 
-- `mint(payload) -> Option<(SessionTicket, u64)>` — `None` past
-  `max_sessions`; otherwise a fresh id, 16 bytes from `rustix::rand::getrandom`,
-  `State::Attached { epoch: 0 }`.
-- `claim(&SessionTicket) -> Claim<T>` — unknown id or a secret that fails
-  `secret_eq` gives `NoSession`; `State::Attached` gives `Busy`; otherwise bump
-  the epoch, rotate the secret, set `Attached`, and return a clone of the
-  payload with the new ticket. **Limits are not checked here** — the caller
-  compares them, because the registry knows nothing about handshakes.
+- `mint(payload, guard) -> Option<(SessionTicket, u64)>` — `None` past
+  `max_sessions`; otherwise a fresh id and 16 secret bytes via
+  `rustix::rand::getrandom(&mut secret, GetRandomFlags::empty())`, looped until
+  all 16 bytes fill — the call reports how many bytes it wrote, and a short
+  read here is a silently weak secret. Entry starts `Attached` with epoch `0`.
+- `claim(&SessionTicket, guard: &G) -> Claim<T>` — checked in this order: an
+  unknown id or a secret that fails `secret_eq` gives `NoSession`;
+  `State::Attached` gives `Busy`; an `Idle` entry past its deadline gives
+  `NoSession`, because expiry is the clock's fact rather than the reaper's
+  schedule; a guard that differs from the stored one gives `Mismatch`.
+  **A refusal of any kind mutates nothing** — not the secret, the state, the
+  epoch, or the deadline — so a corrected claim succeeds and a wrong one cannot
+  extend retention. Only success changes the entry: bump the epoch, set
+  `Attached`, return a clone of the payload with the new epoch.
 - `release(id, epoch)` — flips to `Idle { deadline: now + grace }` only when
-  `state == Attached { epoch }`. Any other state does nothing.
+  the state is `Attached` and the entry's epoch equals the argument. Any other
+  state does nothing.
 - `drop_session(&SessionTicket) -> bool` — verifies the secret, then removes.
 - `reap_expired() -> Vec<T>` — removes every `Idle` entry past its deadline and
   returns the payloads.
@@ -529,7 +544,7 @@ socket resolves itself inside the keepalive budget).
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p lbfs-server registry`
-Expected: PASS, all ten.
+Expected: PASS, all eleven.
 
 - [ ] **Step 5: `make check`**
 
@@ -632,7 +647,8 @@ for resumption and the server retains anything, else `0`. Carry the client's
 
 - [ ] **Step 5: `attach` mints**
 
-After `LocalFs::from_root_fd` succeeds and before the reply, mint. A `None`
+After `LocalFs::from_root_fd` succeeds and before the reply, mint, storing the
+settled `Limits` and `writeback` as the entry's guard. A `None`
 from the registry — the `max_resumable_sessions` cap — means the reply carries
 `ticket: None` and the session behaves as it does today. Log the refusal once
 per occurrence with the cap in the line.
@@ -690,8 +706,8 @@ git commit -m "feat(server): retain a session for a grace after its socket dies"
 **Interfaces:**
 - Consumes: Task 5.
 - Produces: `RESUME` as the alternative second frame. The server answers
-  `STATUS_OK` with the root's attributes and a rotated ticket, or one of the
-  three refusal statuses.
+  `STATUS_OK` with the root's attributes, or one of the three refusal
+  statuses.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -723,8 +739,9 @@ This is the suite that pins the contract. In `tests/tests/protocol.rs`:
     `Fh` still reads the *original* bytes, and a fresh `LOOKUP` yields a
     different `NodeId` and a different `generation` from the one the first
     connection held. **This is the case the whole design exists to get right.**
-11. **The rotated ticket.** The ticket `RESUME` returns works for a second
-    resume; the one it consumed answers `STATUS_NO_SESSION`.
+11. **The ticket is stable.** Resume, drop the socket again, resume again with
+    the ticket `ATTACH` minted: it works. Nothing rotates, so nothing needs
+    re-learning after a claim.
 
 - [ ] **Step 2: Run them and watch them fail**
 
@@ -735,18 +752,17 @@ frame's opcode and branches: `Attach` → today's path, `Resume` → the new one
 anything else → `SessionError::Protocol("second frame must be ATTACH or
 RESUME")`.
 
-`resume` checks in order, and stops at the first failure:
+`resume` is one registry call and one `getattr`:
 
-1. `registry.claim(&ticket)` → `NoSession` or `Busy` map straight to their
-   statuses.
-2. The claimed session's stored `Limits` against the ones this handshake
-   settled, `writeback` included. A mismatch answers
-   `STATUS_SESSION_MISMATCH`, and **releases the claim** so the session returns
-   to idle rather than staying attached to a connection that is about to close.
-3. `fs.getattr(ROOT_NODE, None)` for the reply's `root_attr`.
+1. `registry.claim(&ticket, &guard)`, where the guard is this handshake's
+   settled `Limits` and `writeback`. `NoSession`, `Busy` and `Mismatch` map
+   straight to their statuses. A refusal mutates nothing inside the registry,
+   so there is nothing to release and nothing to undo.
+2. `fs.getattr(ROOT_NODE, None)` for the reply's `root_attr`.
 
-Log every refusal with the peer address and the reason; a refused claim is the
-line an operator reads when a mount died.
+Log every refusal with the peer address and the reason, and every successful
+claim with the session id — a refused claim is the line an operator reads when
+a mount died, and the claim line is what Task 13's drill greps for.
 
 - [ ] **Step 4: Run the tests**
 
@@ -889,7 +905,8 @@ pub struct Session {
     addr: SocketAddr,
     export: Vec<u8>,
     proposal: Proposal,
-    ticket: Mutex<Option<SessionTicket>>,
+    /// Fixed at attach. Nothing rotates (design §7.6).
+    ticket: Option<SessionTicket>,
     /// Clamped to the server's advertised grace. Zero disables reconnection.
     deadline: Duration,
     /// The settled limits, which a resumed session must match. `LbfsFuse::init`
@@ -960,8 +977,8 @@ Against a scripted server in `mux.rs`:
    elapsed time, because a hang is the failure this bound exists to prevent.
 7. **A mismatched version on the second connection is final**, like a refused
    claim.
-8. **Ticket rotation lands.** After a claim the session holds the ticket the
-   reply carried, and a second reconnect presents that one.
+8. **One ticket, many claims.** A second death and reconnect presents the same
+   ticket the `ATTACH` reply carried, and the scripted server sees it twice.
 
 - [ ] **Step 2: Run them and watch them fail**
 
@@ -982,7 +999,7 @@ wait for the current connection's closed()
   → set Reconnecting
   → until the deadline:
         dial + HELLO + RESUME
-        Ok           → install the new connection, store the rotated ticket, set Live
+        Ok           → install the new connection, set Live
         NoSession    → set Dead, stop
         SessionMismatch → set Dead, stop
         VersionMismatch → set Dead, stop
@@ -1284,6 +1301,7 @@ git commit -m "test(vm): a severed connection costs latency, not the mount"
   touches no session state.
 - **A ticket is a bearer capability on a protocol with no authentication.** An
   observer on the wire reads it out of the `ATTACH` reply, and can also read
-  every byte of every file the session carries. Rotation on each resume bounds
-  a leaked secret's useful life to one gap. mTLS remains the answer, and spec
-  §11 already carries it.
+  every byte of every file the session carries. The ticket never rotates —
+  design §7.6 prices what rotation would buy and names the dead mount a lost
+  `ResumeReply` would cost. mTLS remains the answer, and spec §11 already
+  carries it.

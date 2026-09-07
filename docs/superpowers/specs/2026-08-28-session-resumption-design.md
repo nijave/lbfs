@@ -287,8 +287,10 @@ pub struct SessionTicket {
 ```
 
 The client holds it for the life of the mount and presents it in `RESUME`. The
-server compares the secret in constant time and treats an unknown id and a
-wrong secret identically, so a guesser learns nothing from the difference.
+same ticket serves every claim the session ever makes; §7.6 records why
+nothing rotates. The server compares the secret in constant time and treats an
+unknown id and a wrong secret identically, so a guesser learns nothing from
+the difference.
 
 ### 6.2 What a stolen ticket buys, in a protocol with no authentication
 
@@ -388,16 +390,15 @@ pub struct ResumeRequest {
 pub struct ResumeReply {
     /// Freshly stat'd, exactly as `ATTACH` reports it.
     pub root_attr: FileAttr,
-    /// The same ticket, or a rotated one. §7.6.
-    pub ticket: SessionTicket,
 }
 ```
 
-The server checks, in order: the id exists; the secret matches in constant
-time; the entry is idle rather than attached; the settled `Limits` and
-`writeback` equal the retained session's. A failure at any step answers the
-status from §4's table and leaves the retained session untouched, so a client
-that corrects itself can claim again.
+The registry runs every check under its one lock: the id exists; the secret
+matches in constant time; the entry is idle, and idle within its deadline; the
+settled `Limits` and `writeback` equal the values stored at mint. A refusal at
+any step answers the status from §4's table and mutates nothing — not the
+secret, not the state, not the deadline — so a client that corrects itself can
+claim again, and a wrong claim cannot extend retention.
 
 ### 7.5 `DETACH` — opcode 35
 
@@ -411,11 +412,19 @@ during shutdown, before dropping the connection, and waits for the reply. A
 client that dies without sending one leaves its session to the reaper, which is
 the intended behaviour.
 
-### 7.6 Ticket rotation
+### 7.6 The ticket does not rotate
 
-`ResumeReply` returns a ticket with a fresh secret. One reconnect invalidates
-whatever an observer captured from the `ATTACH` reply. Cheap, and
-it bounds the useful life of a leaked secret to one gap.
+An earlier draft returned a fresh secret on every claim, to bound a leaked
+secret's useful life to one gap. Dropped, for a failure the flaky link makes
+routine: the server rotates inside the claim, the `ResumeReply` dies on the
+wire — a second break during the reconnect, precisely the scenario retention
+targets — and the client now holds a consumed secret. Its next claim answers
+`STATUS_NO_SESSION` and the mount dies in the one case the feature exists to
+survive. Making rotation safe means acknowledging delivery of the new secret,
+which is the retired-reply machinery §3.1 declines. What rotation bought was
+already small: §6.2's observer, the only adversary who can read a ticket, can
+also read every byte of every file. One secret serves the session's whole
+life, and mTLS remains the real answer (main spec §11).
 
 ### 7.7 New statuses
 
@@ -442,28 +451,33 @@ because a session must outlive the connection that made it:
 ```rust
 struct Retained {
     fs: Arc<dyn FileSystem>,
+    /// The negotiated shape at mint. A claim must present an equal one.
     limits: Limits,
     secret: [u8; 16],
-    /// Incremented on every claim. A session task hands its own epoch back at
-    /// teardown and does nothing when the value has moved on.
+    /// Incremented on every claim, and the single home of the value: a
+    /// session task hands its own epoch back at teardown and does nothing
+    /// when the entry's has moved on.
     epoch: u64,
     state: State,
 }
 
 enum State {
-    Attached { epoch: u64 },
+    Attached,
     Idle { deadline: Instant },
 }
 ```
 
 Four operations, each under one lock:
 
-- **`mint`** — `ATTACH` registers a fresh session as `Attached { epoch: 0 }`.
-- **`claim`** — `RESUME` verifies the ticket, requires `Idle`, bumps the epoch
-  and returns the `Arc<dyn FileSystem>`.
+- **`mint`** — `ATTACH` registers a fresh session, shape and all, as
+  `Attached` with epoch `0`.
+- **`claim`** — `RESUME` verifies the ticket and the caller's settled shape
+  against the stored one, requires `Idle` within its deadline, bumps the epoch
+  and returns the `Arc<dyn FileSystem>`. Every refusal — wrong secret, busy,
+  expired, mismatched shape — mutates nothing.
 - **`release`** — the session task, at teardown, presents its epoch. A match
-  flips the entry to `Idle { deadline: now + grace }`; a mismatch means another
-  socket already claimed it, and the call does nothing.
+  against an `Attached` entry flips it to `Idle { deadline: now + grace }`; a
+  mismatch means another socket already claimed it, and the call does nothing.
 - **`drop`** — `DETACH`, and the reaper on expiry, remove the entry.
 
 **Teardown flips to `Idle` before the drain, not after.** `serve_requests`
