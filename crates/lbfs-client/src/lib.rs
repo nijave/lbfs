@@ -9,3 +9,4 @@
 
 pub mod conn;
 pub mod fuse;
+pub mod readahead;

@@ -166,6 +166,7 @@ mismatch prints a plain error instead of leaving an `EIO` mountpoint behind.
 | `--fuse-threads N` | off (one) | Run N fuser event-loop threads. Off by default and expected to stay off on a two-vCPU guest: the session thread peaks at 15.6% of a core under the heaviest measured shape, and the A/B in `docs/benchmarks/2026-08-22-bottleneck-analysis.md` moved nothing. Each thread allocates a 16 MiB receive buffer, of which about 2 MB turns resident under a 1 MiB negotiated I/O size. Pair with `--fuse-clone-fd`. Linux only, 1 to 64. |
 | `--fuse-clone-fd` | off | Give each event-loop thread its own `/dev/fuse` descriptor (`FUSE_DEV_IOC_CLONE`, Linux 4.5+). Without it the threads share one queue. Means nothing without `--fuse-threads`. |
 | `--no-writeback` | off | Write through to the server instead of letting the kernel batch dirty pages. |
+| `--readahead-kb <KiB>` | negotiated `max_io_size / 1024`, never below 128 | After mounting, the client writes this into the mount's `/sys/class/bdi/<dev>/read_ahead_kb`, best effort. The kernel clamps readahead to that knob, whose default of 128 costs about half of buffered sequential read throughput (`docs/benchmarks/2026-08-28-readahead.md`). Root owns the knob, so an unprivileged client logs the exact `sudo tee` command for an operator and carries on. `0` skips the attempt. The knob resets on every mount. |
 
 The writeback cache stays on by default because coalescing small writes is the
 largest single win for build workloads. The flag travels in the handshake: the

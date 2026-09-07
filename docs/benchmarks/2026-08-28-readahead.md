@@ -147,3 +147,8 @@ mount, so unprivileged deployments need it documented as an operator step.
 cannot win, because the kernel takes the smaller of the INIT reply's
 `max_readahead` and the bdi's existing 128 KiB. The comment above it already
 says the kernel reports its own ceiling; it now has a number behind it.
+
+2026-09-07: `--readahead-kb` landed in `lbfs-client` with exactly this shape —
+the default derives from `max_io_size / 1024` and never falls below the
+kernel's own 128, `0` disables the attempt, and an unprivileged client logs one
+WARN carrying the operator's command.
