@@ -8,6 +8,11 @@ unexecuted: another agent holds 192.168.77.10/.11 for the session-resumption
 work, so this branch verifies at the loopback level only, and Task 7 records the
 one step a later session must run.
 
+**2026-09-07:** that later session ran Task 7 on the VM pair, and the plan is
+now complete end to end. The unforced control lost its file to the power cut,
+the forced run kept its file, and the client logged its exit sync — the dated
+results subsection under Task 7 carries the evidence.
+
 Two things the execution learned that the plan did not know:
 
 - **`LbfsFuse::destroy` is the wrong home for the driver's sync, and the first
@@ -409,17 +414,50 @@ loopback case asserts it across a real socket.
 Another agent holds 192.168.77.10/.11 for the session-resumption work, so this
 branch stops at the loopback level. A later session runs, in order:
 
-- [ ] `make build-guest && make vm-deploy`.
-- [ ] Server on `fsync = "ignore"`, mount from the client guest, write a file,
+- [x] `make build-guest && make vm-deploy`.
+- [x] Server on `fsync = "ignore"`, mount from the client guest, write a file,
       then `setfattr -n user.lbfs.sync -v 1 /mnt/lbfs` and confirm exit 0.
-- [ ] The one step no host test reaches: write, force the sync, then cut the
+- [x] The one step no host test reaches: write, force the sync, then cut the
       server guest's power (`virsh destroy`, never a clean shutdown) and confirm
       the bytes survive the reboot. Run the same shape without the forced sync as
       the control — that run may lose them, and a control that never loses them
       means the export's filesystem flushed on its own and the case proves
       nothing either way.
-- [ ] Unmount the client and confirm the server logs the driver-initiated sync.
-- [ ] Record the result at the top of this plan.
+- [x] Unmount the client and confirm the server logs the driver-initiated sync.
+- [x] Record the result at the top of this plan.
+
+### Results — 2026-09-07, the power-cut run
+
+A later session ran this task against a fresh `make build-guest && make
+vm-deploy` of current main (`f07da9c`), with the guest's `/etc/lbfs.toml`
+flipped to `fsync = "ignore"` for the drill and back to `"honor"` afterwards.
+Each scenario mounted fresh, wrote a distinctive end-of-file marker through the
+mount, and ran `dd conv=fsync` so the application's own `fsync(2)` — which the
+policy ignores — pushed every byte into the server's page cache before the cut.
+
+- **Control (unforced): the bytes died.** The 33-byte marker file reached the
+  server (content readable over ssh, `Dirty: 984 kB`, `Writeback: 0 kB` in
+  `/proc/meminfo`), and `virsh destroy` roughly two seconds later erased it:
+  after reboot and journal replay the file did not exist at all. The control
+  earned its keep on the first attempt — no self-flush beat the cut, so an
+  application `fsync` under `ignore` buys nothing across a power loss.
+- **Forced: the bytes survived.** Same shape, fresh marker, then
+  `setfattr -n user.lbfs.sync -v 1 /mnt/lbfs` — exit 0, so the reply carried
+  the acknowledgement. `virsh destroy` came right after, and the reboot found
+  the file whole: size 32, marker still the last line. The platter now backs
+  what Task 3 could only prove at the syscall level.
+- **Exit sync: the driver reported it.** A clean `fusermount3 -u` let the
+  client exit on its own, and its log holds the witness:
+  `INFO lbfs_client: forced a sync of the export before exit`.
+
+One correction to this task's wording: the unmount step says "confirm the
+server logs the driver-initiated sync", but the server logs nothing on that
+path — the client's exit line is the only witness, exactly as the Task 5
+loopback case already documented. The drill read the client's log instead.
+
+The run left the pair healthy: `fsync = "honor"` restored and the service
+active, the export empty, no stray client process or mount, and a final
+mount–write–read–unmount smoke check green.
 
 ---
 
