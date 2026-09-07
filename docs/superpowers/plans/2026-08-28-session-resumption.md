@@ -61,6 +61,13 @@ tempfile; Linux 7.0 guests under libvirt.
   that branch lands, `FLAG_FORCE_SYNC` after.
 - Protocol magic `LBFS`; version moves `2` → `3`, exact match on both ends.
   Task 2 owns that move and no other task touches the number.
+- **Resumption is opt-in at the handshake, and the library default is off.**
+  `Proposal`/`Connection::connect` default to `resume: false`, so every direct
+  caller — the loopback harness, `live.rs`, `mux.rs`, `loopback_cli.rs`,
+  `lbfs-bench` — keeps today's teardown semantics until a test opts in. The
+  shipped binary asks for resumption by default (Task 11), and
+  `--no-reconnect` clears the request as well as the deadline, restoring
+  today's behaviour exactly.
 - Status field: `0` OK, `1..=4095` Linux errno, `>= 0xFF00` protocol statuses.
   Three new protocol statuses, contiguous after the existing three.
 - Defaults: port `9423`, window `128` (clamp 8..=1024), max body `64 KiB`.
@@ -151,12 +158,14 @@ carries the epoch its caller last attached under.
 
 `vm/tests/disconnect.sh` stops the server outright, which empties the registry,
 so every claim answers `STATUS_NO_SESSION` and the mount dies exactly as the
-drill asserts. One number matters: the drill wraps its post-mortem `ls` in
-`timeout 20`, and `tests/tests/loopback.rs`'s
-`a_dead_server_leaves_an_eio_mount_that_still_unmounts` waits `SETTLE_TIMEOUT`
-(30 s) for the first `EIO`. **The client's reconnect deadline must stay well
-under both**, which is why Task 10 sets it to 10 seconds by default. A larger
-default turns a passing drill into a hang.
+drill asserts — ten seconds later than today, because the shipped binary asks
+to resume by default. One number matters: the drill wraps its post-mortem `ls`
+in `timeout 20`, so **the client's reconnect deadline must stay well under
+it**, which is why Task 10 sets 10 seconds by default; a larger default turns
+a passing drill into a hang. The loopback suite's
+`a_dead_server_leaves_an_eio_mount_that_still_unmounts` does not move at all:
+the harness never asks to resume, so its mount dies on today's clock, well
+inside `SETTLE_TIMEOUT` (30 s).
 
 ### 5. Where the randomness comes from
 
@@ -683,10 +692,10 @@ Run: `cargo test -p lbfs-tests --test protocol resume` then `make check` and
 Expected: PASS. `make test-loopback` matters here: the loopback suite counts
 the server's descriptors over the export
 (`Loopback::export_fds`), and a session held past an unmount would show up as a
-descriptor that never comes back. With no `DETACH` yet, the loopback harness's
-own unmount leaves the session idle until the reaper takes it — so confirm the
-existing fd-census cases still pass, and if a case fails on timing rather than
-on a leak, note it for Task 7 rather than loosening it.
+descriptor that never comes back. The harness never asks to resume — the
+library default is off — so no session survives its unmounts, nothing waits on
+the reaper, and every fd-census case passes exactly as before. A failure here
+is a real leak, not timing.
 
 - [ ] **Step 10: Commit**
 
@@ -1032,7 +1041,8 @@ log line reports the total.
 
 `Session::shutdown()` sets `Dead`, which stops the supervisor and fails
 everything parked. `main.rs` calls it before it drops the runtime, or a
-supervisor still dialling holds the process open past the unmount.
+supervisor still dialling holds the process open past the unmount. Task 11
+teaches the same method to send `DETACH` before it marks the state.
 
 - [ ] **Step 7: Run the tests, then `make check` and `make test-loopback`**
 
@@ -1054,7 +1064,8 @@ git commit -m "feat(client): re-attach to a retained session after a disconnect"
 **Interfaces:**
 - Consumes: Task 10.
 - Produces: `--reconnect-timeout <SECONDS>` (default 10) and `--no-reconnect`;
-  a `DETACH` on the shutdown path.
+  the binary asks to resume by default; `DETACH` lands in
+  `Session::shutdown()`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1071,18 +1082,26 @@ Ten seconds by default, and the doc comment carries the reason: it has to stay
 under the twenty-second `timeout` that `vm/tests/disconnect.sh` puts around its
 post-mortem `ls` and under the loopback suite's thirty-second settle window,
 because a mount that parks longer than a test waits looks exactly like a hang.
-`Session` clamps whatever it gets to the server's advertised `grace_ms` — a
-client still dialling for a session the reaper already dropped is a client
-burning time on a guaranteed refusal.
+`Session` clamps whatever it gets to three-quarters of the server's advertised
+`grace_ms` — a client still dialling for a session the reaper already dropped
+is a client burning time on a guaranteed refusal, and a clamp that could land
+*on* the grace would leave it dialling at the exact moment the reaper fires.
+
+The binary asks for resumption whenever the deadline is non-zero:
+`--no-reconnect` clears the handshake request too, so it restores today's
+behaviour on the wire as well as in the client.
 
 - [ ] **Step 4: `DETACH` on the way out**
 
-`main.rs` unmounts, drains, and then — before dropping the runtime — sends
-`DETACH` on the live connection and waits for its reply. A failure goes to the
-log and no further: the session expires by itself, and a client that cannot
-detach must still exit.
+The detach lives in `Session::shutdown()`, not in `main.rs`: on a live
+connection of a session that holds a ticket, shutdown sends `DETACH`, waits
+briefly for the reply, and then marks the session dead. `main.rs` gets it by
+calling `shutdown()` where Task 10 already put the call, and every other
+embedder — the loopback harness in Task 12 — gets it from the same place. A
+failure goes to the log and no further: the session expires by itself, and a
+client that cannot detach must still exit.
 
-Order matters. `DETACH` goes *after* the unmount drain, because the drain
+Order matters. `shutdown()` runs *after* the unmount drain, because the drain
 flushes writeback and the `FORGET`s the kernel emits for every evicted inode,
 and both need the session.
 
@@ -1119,9 +1138,12 @@ The loopback harness starts its server in-process and the client connects
 straight to it, so no test can sever the socket without killing the server —
 which is the one thing this feature must survive. `Breaker` listens on
 `127.0.0.1:0`, dials the real server for each accepted connection, copies both
-directions, and holds the halves so `sever()` can drop them. `Opts` grows a
-`breaker: bool`; when set, `Loopback::start` puts one in the path and points the
-client at it.
+directions, and holds the halves so `sever()` can drop them. `Opts` grows two switches: `breaker: bool` puts the
+proxy in the path and points the client at it, and `resume: bool` makes the
+harness's client ask for resumption — the library default stays off, so only
+these cases opt in. The harness keeps its `Arc<Session>`, and its teardown
+calls `Session::shutdown()` — the same call `main.rs` makes — so a case that
+opted in detaches before the fd census reads.
 
 Keep it small, and say plainly what it stands for: a test double for a flaky
 network, not a proxy anybody ships.
@@ -1148,9 +1170,11 @@ network, not a proxy anybody ships.
    name reads the new ones. This is the loopback twin of Task 6's identity
    cases, and the one that fails loudly if anybody ever replaces retention
    with a re-open.
-5. **Descriptors come back.** After the unmount, `export_fds()` returns to
-   baseline, because Task 11's `DETACH` dropped the session rather than leaving
-   it to the reaper.
+5. **Descriptors come back.** After the unmount of a mount that opted into
+   resumption,
+   `export_fds()` returns to baseline without waiting out the grace, because
+   the teardown's `Session::shutdown()` sent `DETACH` rather than leaving the
+   session to the reaper.
 
 - [ ] **Step 3: Run the cases**
 
@@ -1160,9 +1184,9 @@ Expected: PASS.
 - [ ] **Step 4: Run the whole loopback suite and `make check`**
 
 Expected: PASS, including
-`a_dead_server_leaves_an_eio_mount_that_still_unmounts` unchanged — a server
-that died has no session, so the mount dies as it always did, ten seconds later
-than before and well inside `SETTLE_TIMEOUT`.
+`a_dead_server_leaves_an_eio_mount_that_still_unmounts` unchanged and on
+today's clock — its mount never asks to resume, so there is no ten-second park
+and no timing shift at all.
 
 - [ ] **Step 5: Commit**
 
@@ -1262,8 +1286,12 @@ git commit -m "test(vm): a severed connection costs latency, not the mount"
    an expiry.
 10. After a clean unmount the server's descriptor count over the export returns
     to baseline without waiting for the grace.
-11. The protocol version is `3` on both ends, `FLAG_FORCE_SYNC_RESERVED` is
+11. The protocol version is `3` on both ends, `FLAG_FORCE_SYNC` is
     untouched, and `git diff` shows no change to frame flag bit 1.
+12. A client that does not ask for resumption — any library caller by default,
+    or the binary under `--no-reconnect` — behaves as today end to end: no
+    ticket in its `ATTACH` reply, no retained session after its socket dies,
+    no parking.
 
 ## Open Risks
 

@@ -524,6 +524,14 @@ LbfsFuse ──▶ Session ──▶ Arc<Connection>   (swapped on reconnect)
 `Reconnecting`, `Dead`). `LbfsFuse` holds an `Arc<Session>` where it holds an
 `Arc<Connection>` today, and `fn ctx` reads the current connection out of it.
 
+**The client asks for resumption; nothing assumes it.** The `Proposal` gains a `resume`
+flag that defaults to **off**, so every embedder of the client library — the
+loopback harness, the driver tests, `lbfs-bench` — keeps today's teardown
+semantics untouched: no ticket, no retention, no parking. The shipped
+`lbfs-client` binary asks for resumption by default, and `--no-reconnect`
+clears the handshake request as well as the deadline, restoring today's
+behaviour exactly.
+
 `Connection` gains one method — `closed().await`, waking when `Shared::kill`
 runs — so the supervisor learns of a death without polling. Adding a `Notify` to
 `Shared::kill` is the whole of it.
@@ -541,17 +549,19 @@ succeeds or its deadline runs out, and it distinguishes two failures:
   server has the session and has not yet noticed the old socket. Keep trying
   until the deadline.
 
-**The deadline defaults to 10 seconds**, clamped down to the server's advertised
-`resume_grace_ms`. Ten seconds covers a reset plus a redial and a service
+**The deadline defaults to 10 seconds**, clamped to three-quarters of the
+server's advertised `resume_grace_ms`. Ten seconds covers a reset plus a redial and a service
 restart, and it stays comfortably inside the 20-second `timeout` that
 `vm/tests/disconnect.sh` puts around its post-mortem `ls`, and inside the
 30-second `SETTLE_TIMEOUT` the loopback suite waits for the first `EIO`. A CLI
 flag `--reconnect-timeout` moves it; `--no-reconnect` sets it to zero and
 restores today's behaviour exactly.
 
-The client-side deadline stays below the server-side grace on purpose: a client
-still dialling for a session the reaper already dropped is a client burning
-time on a guaranteed refusal.
+The client-side deadline stays strictly below the server-side grace on
+purpose, and three-quarters rather than merely-not-above: a client still
+dialling for a session the reaper already dropped is a client burning time on
+a guaranteed refusal, and a clamp that could land *on* the grace would leave
+it dialling at the exact moment the reaper fires.
 
 ## 9. What leaks, and the bound on it
 
@@ -599,8 +609,12 @@ immediately, and 10 seconds sits inside its 20-second `timeout`. A new drill
 (§12) covers the case the existing one cannot: a severed connection to a server
 that is still running.
 
-**`a_dead_server_leaves_an_eio_mount_that_still_unmounts` passes unchanged**,
-for the same reason and inside the same 30-second settle window.
+**`a_dead_server_leaves_an_eio_mount_that_still_unmounts` passes unchanged**
+and on today's clock: the loopback harness never asks to resume (§8.2), so its
+mount dies without a reconnect park. The same holds for every existing
+loopback and driver test — with the library default off, no session lingers
+and the fd-census cases measure exactly what they measured before. Only the
+severed-connection cases of §12 opt in.
 
 **Unmount must cancel reconnection.** `main.rs` unmounts, drains and exits. A
 supervisor still dialling would hold the runtime open. Shutdown marks the
@@ -665,7 +679,8 @@ that never comes back into `EIO`.
 
 **Loopback**, which needs a way to sever a connection without killing the
 server. The harness grows a small forwarding proxy between client and server
-with a `sever()` method. Cases: a `std::fs::File` held open across a sever
+with a `sever()` method, and an opt-in switch so exactly these cases request
+resumption. Cases: a `std::fs::File` held open across a sever
 still reads and writes; a directory walk in progress still completes; the mount
 unmounts cleanly while a reconnect is in flight; and the export's descriptor
 count returns to baseline after `DETACH`.
