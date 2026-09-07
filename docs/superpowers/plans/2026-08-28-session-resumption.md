@@ -985,7 +985,7 @@ git commit -m "refactor(client): a Session above the connection"
   `connect`; a supervisor task inside `Session` that dials, resumes and
   installs; `Session::current()` that parks while `Reconnecting`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Against a scripted server in `mux.rs`:
 
@@ -1008,9 +1008,9 @@ Against a scripted server in `mux.rs`:
 8. **One ticket, many claims.** A second death and reconnect presents the same
    ticket the `ATTACH` reply carried, and the scripted server sees it twice.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: `Connection::resume`**
+- [x] **Step 3: `Connection::resume`**
 
 A sibling of `connect_with` that runs `HELLO` and then `RESUME` in place of
 `ATTACH`, under the same end-to-end timeout, with the same `check_settled`
@@ -1018,7 +1018,7 @@ afterwards. It returns `ConnectError::NoSession`, `SessionBusy` or
 `SessionMismatch` for the three refusal statuses, so the supervisor can tell a
 retry from a surrender without parsing a string.
 
-- [ ] **Step 4: The supervisor**
+- [x] **Step 4: The supervisor**
 
 One task, spawned alongside the `Session`, in a loop:
 
@@ -1043,7 +1043,7 @@ a 10 s outage costs a dozen rather than two hundred.
 before the first dial, so a call arriving between the death and the
 first dial parks rather than seeing a stale `Live`.
 
-- [ ] **Step 5: Parked calls**
+- [x] **Step 5: Parked calls**
 
 `Session::current()` went `async` back in Task 9; this step adds the parking
 arm. `Live` returns at once, `Dead` returns
@@ -1057,16 +1057,18 @@ thread (`conn.rs` says why). While reconnecting it drops the forget and counts
 it, which is what the connection already does when its queue is full. Task 11's
 log line reports the total.
 
-- [ ] **Step 6: Shutdown cancels reconnection**
+- [x] **Step 6: Shutdown cancels reconnection**
 
 `Session::shutdown()` sets `Dead`, which stops the supervisor and fails
-everything parked. `main.rs` calls it before it drops the runtime, or a
-supervisor still dialling holds the process open past the unmount. Task 11
-teaches the same method to send `DETACH` before it marks the state.
+everything parked. The binary calls it after its unmount drain, or a supervisor
+still dialling holds the process open past the unmount — and that call lands in
+Task 11, which stages `main.rs` and teaches the same method to send `DETACH`
+before it marks the state. Nothing the binary builds reconnects until then, so
+there is nothing for it to cancel here.
 
-- [ ] **Step 7: Run the tests, then `make check` and `make test-loopback`**
+- [x] **Step 7: Run the tests, then `make check` and `make test-loopback`**
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/lbfs-client/src/session.rs crates/lbfs-client/src/conn.rs crates/lbfs-client/tests/mux.rs
