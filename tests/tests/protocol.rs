@@ -28,8 +28,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use lbfs_proto::frame::{
-    FrameHeader, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_ATTACH_DENIED,
-    STATUS_NOT_EXPORTED, WINDOW_CLAMP,
+    FrameHeader, FLAG_FORCE_SYNC, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE, PROTOCOL_VERSION,
+    STATUS_ATTACH_DENIED, STATUS_NOT_EXPORTED, WINDOW_CLAMP,
 };
 use lbfs_proto::ops::*;
 use lbfs_proto::types::*;
@@ -979,6 +979,186 @@ async fn fsync_ignore_acknowledges_without_the_syscall() {
     )
     .await
     .expect_errno(libc::EBADF);
+}
+
+/// The forced sync runs the syscall `ignore` would have skipped (spec §6, §11).
+///
+/// The FIFO carries the whole proof. `fsync(2)` answers `EINVAL` on one, so the
+/// two frames below differ in a single flag bit and in nothing else, and they
+/// come back with different answers: `OK` when the policy decided, `EINVAL` when
+/// the kernel did. An errno only the syscall can produce is the syscall
+/// reporting that it ran.
+#[tokio::test]
+async fn a_forced_fsync_reaches_the_syscall_under_the_ignore_policy() {
+    let srv = TestServer::with(FsyncPolicy::Ignore, SERVER_WINDOW, SERVER_IO).await;
+    make_fifo(&srv.join("p"));
+    let mut c = srv.attached().await;
+
+    let p: Entry = c.lookup(ROOT_NODE, b"p").await.ok();
+    let pfh: OpenReply = c.open(p.node, libc::O_RDONLY | libc::O_NONBLOCK).await.ok();
+    let req = FsyncRequest {
+        node: p.node,
+        fh: pfh.fh,
+        datasync: false,
+    };
+
+    // Unforced: the policy answers, and no acknowledgement rides back because
+    // nothing was forced.
+    let plain = c.call_flagged(Opcode::Fsync, &req, 0).await;
+    plain.ok_unit();
+    assert!(!plain.forced_sync_acked());
+
+    // Forced: the same frame, one bit different, and the kernel answers.
+    c.call_flagged(Opcode::Fsync, &req, FLAG_FORCE_SYNC)
+        .await
+        .expect_errno(libc::EINVAL);
+}
+
+/// A forced sync that succeeds says so, and an unforced one never does.
+///
+/// The acknowledgement is what a client has instead of a version number. A
+/// server built before this control ignores the request flag and answers
+/// `STATUS_OK` with `flags = 0`, which is indistinguishable from a sync that
+/// ran — unless the server that *did* run one marks its reply. Both policies
+/// acknowledge, because under either one the forced call reaches the syscall.
+#[tokio::test]
+async fn a_forced_sync_acknowledges_itself_on_the_reply() {
+    for policy in [FsyncPolicy::Honor, FsyncPolicy::Ignore] {
+        let srv = TestServer::with(policy, SERVER_WINDOW, SERVER_IO).await;
+        std::fs::write(srv.join("f"), b"bytes").unwrap();
+        let mut c = srv.attached().await;
+
+        let f: Entry = c.lookup(ROOT_NODE, b"f").await.ok();
+        let fh: OpenReply = c.open(f.node, libc::O_RDWR).await.ok();
+        let fsync = FsyncRequest {
+            node: f.node,
+            fh: fh.fh,
+            datasync: false,
+        };
+        let forced = c.call_flagged(Opcode::Fsync, &fsync, FLAG_FORCE_SYNC).await;
+        forced.ok_unit();
+        assert!(
+            forced.forced_sync_acked(),
+            "{policy:?}: a forced FSYNC that succeeded must say so"
+        );
+        let plain = c.call_flagged(Opcode::Fsync, &fsync, 0).await;
+        plain.ok_unit();
+        assert!(
+            !plain.forced_sync_acked(),
+            "{policy:?}: an unforced FSYNC must not claim a forced sync"
+        );
+
+        // FSYNCDIR on the export root: the whole-export control, which runs
+        // `syncfs` rather than a per-inode `fsync`. `syncfs` succeeds on any
+        // descriptor, so the acknowledgement is the only witness that the
+        // forced branch ran at all.
+        let dh: OpendirReply = c.opendir(ROOT_NODE).await.ok();
+        let fsyncdir = FsyncdirRequest {
+            node: ROOT_NODE,
+            dh: dh.dh,
+            datasync: false,
+        };
+        let forced = c
+            .call_flagged(Opcode::Fsyncdir, &fsyncdir, FLAG_FORCE_SYNC)
+            .await;
+        forced.ok_unit();
+        assert!(
+            forced.forced_sync_acked(),
+            "{policy:?}: a forced FSYNCDIR that succeeded must say so"
+        );
+        let plain = c.call_flagged(Opcode::Fsyncdir, &fsyncdir, 0).await;
+        plain.ok_unit();
+        assert!(!plain.forced_sync_acked(), "{policy:?}");
+    }
+}
+
+/// A forced sync that failed does not acknowledge, because it did not happen.
+#[tokio::test]
+async fn a_forced_sync_that_failed_carries_no_acknowledgement() {
+    let srv = TestServer::with(FsyncPolicy::Ignore, SERVER_WINDOW, SERVER_IO).await;
+    make_fifo(&srv.join("p"));
+    let mut c = srv.attached().await;
+
+    let p: Entry = c.lookup(ROOT_NODE, b"p").await.ok();
+    let pfh: OpenReply = c.open(p.node, libc::O_RDONLY | libc::O_NONBLOCK).await.ok();
+    let failed = c
+        .call_flagged(
+            Opcode::Fsync,
+            &FsyncRequest {
+                node: p.node,
+                fh: pfh.fh,
+                datasync: false,
+            },
+            FLAG_FORCE_SYNC,
+        )
+        .await;
+    failed.expect_errno(libc::EINVAL);
+    assert!(!failed.forced_sync_acked());
+
+    // A handle the session never issued fails before any sync could run.
+    let stale = c
+        .call_flagged(
+            Opcode::Fsync,
+            &FsyncRequest {
+                node: p.node,
+                fh: 4_242,
+                datasync: false,
+            },
+            FLAG_FORCE_SYNC,
+        )
+        .await;
+    stale.expect_errno(libc::EBADF);
+    assert!(!stale.forced_sync_acked());
+}
+
+/// `FLAG_FORCE_SYNC` on an opcode that syncs nothing is inert.
+///
+/// This is the compatibility property the whole design rests on, so the suite
+/// asserts it rather than assuming it. The server has never masked frame flags
+/// or refused an unknown bit — which is what let bit 1 go live without a
+/// protocol version — and a stray bit must therefore change no answer, earn no
+/// acknowledgement, and above all not kill the connection, since a protocol
+/// violation here has no in-band recovery (spec §3.1).
+#[tokio::test]
+async fn the_force_sync_flag_is_inert_on_every_other_opcode() {
+    let srv = TestServer::with(FsyncPolicy::Ignore, SERVER_WINDOW, SERVER_IO).await;
+    std::fs::write(srv.join("f"), b"bytes").unwrap();
+    let mut c = srv.attached().await;
+
+    let flagged = c
+        .call_flagged(
+            Opcode::Getattr,
+            &GetattrRequest {
+                node: ROOT_NODE,
+                fh: None,
+            },
+            FLAG_FORCE_SYNC,
+        )
+        .await;
+    let attr: FileAttr = flagged.ok();
+    assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+    assert!(
+        !flagged.forced_sync_acked(),
+        "GETATTR syncs nothing and must not claim to have"
+    );
+
+    // Both live flag bits at once, on an opcode that wants neither.
+    let both = c
+        .call_flagged(
+            Opcode::Lookup,
+            &LookupRequest {
+                parent: ROOT_NODE,
+                name: b"f".to_vec(),
+            },
+            FLAG_FORCE_SYNC | FLAG_NO_REPLY,
+        )
+        .await;
+    let _: Entry = both.ok();
+    assert!(!both.forced_sync_acked());
+
+    // The session is still serving, which is the assertion that matters most:
+    // an unknown flag bit is not a violation and never was.
+    c.getattr(ROOT_NODE).await.expect_ok();
 }
 
 // ---------------------------------------------------------------------------

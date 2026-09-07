@@ -118,6 +118,33 @@ file would bring back the latency the option exists to remove.
 > to find out which. Choose it for scratch space and build trees. Do not choose
 > it for anything whose loss would cost more than a rebuild.
 
+**Forcing a sync anyway.** One control overrides the policy for a moment of
+your choosing — before a snapshot, at the end of a job — without giving up the
+latency the rest of the time:
+
+```sh
+setfattr -n user.lbfs.sync -v 1 /mnt/lbfs   # the mountpoint itself
+```
+
+The client turns that one name on the **mount root** into a forced sync of the
+whole export, which the server performs whatever its `fsync` setting says. The
+client reads no part of the value; exit 0 means the server confirmed it ran the
+sync. The client runs the same control itself on the way out, after the unmount
+has drained every dirty page, and logs what came of it.
+
+Three things worth knowing:
+
+- `user.lbfs.sync` is a control on the mount root and nothing else. The same
+  name on any other file in the mount is an ordinary attribute, stored and read
+  back like any other. On the root it stores nothing, so it reads back absent
+  and never appears in a listing.
+- Nothing about an application's own `fsync(2)` changes. `"ignore"` still means
+  what it says for ordinary I/O — only the two explicit entry points above force
+  anything.
+- `EOPNOTSUPP` from the `setfattr` means the server is older than the control
+  and quietly ignored it; upgrade the server, because its policy is still the
+  one deciding.
+
 ## Client
 
 ```sh

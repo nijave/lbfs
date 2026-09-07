@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use lbfs_proto::ops::{ReaddirReply, ReaddirplusReply};
 use lbfs_proto::types::{
     DirEntry, DirEntryPlus, Entry, Fh, FileAttr, FileKind, NodeId, SetattrArgs, StatfsReply,
-    TimeSet,
+    TimeSet, ROOT_NODE,
 };
 use lbfs_proto::Errno;
 
@@ -568,11 +568,36 @@ impl LocalFs {
     /// touching disk, the same trade an NFS `async` export makes — latency for
     /// crash durability. `FSYNC` and `FSYNCDIR` both land here, which is what
     /// keeps one policy from applying to files and another to directories.
-    async fn maybe_fsync(&self, fd: &Arc<OwnedFd>, datasync: bool) -> FsResult<()> {
-        match self.fsync_policy {
-            FsyncPolicy::Honor => self.uring.fsync(fd, datasync).await.map_err(errno),
-            FsyncPolicy::Ignore => Ok(()),
+    ///
+    /// `force` is the client's `FLAG_FORCE_SYNC` and overrides `ignore` for this
+    /// one call. It leaves `honor` exactly where it was — that branch already
+    /// runs the syscall — and it deliberately says nothing about `O_SYNC`, which
+    /// [`LocalFs::mask_open_flags`] fixed when the descriptor was opened and no
+    /// later request can revisit.
+    async fn maybe_fsync(&self, fd: &Arc<OwnedFd>, datasync: bool, force: bool) -> FsResult<()> {
+        if force || self.fsync_policy == FsyncPolicy::Honor {
+            return self.uring.fsync(fd, datasync).await.map_err(errno);
         }
+        Ok(())
+    }
+
+    /// Flush the whole filesystem backing this descriptor.
+    ///
+    /// The forced sync of the export root, and the only syscall that answers
+    /// what spec §11 asks the control for. `fsync` on a directory descriptor
+    /// writes that directory's own metadata and nothing else, so it would leave
+    /// every dirty file page exactly where `fsync = "ignore"` put it — the
+    /// bytes a snapshot is about to miss.
+    ///
+    /// Blocking rather than on the ring: io_uring has no `syncfs` opcode (spec
+    /// §5.3 makes the same point about `statfs`, which sits next door on a
+    /// blocking thread for the same reason), and this call can take as long as
+    /// the dirty set demands.
+    async fn syncfs(&self, fd: &Arc<OwnedFd>) -> FsResult<()> {
+        let fd = Arc::clone(fd);
+        tokio::task::spawn_blocking(move || rustix::fs::syncfs(&*fd).map_err(rustix_errno))
+            .await
+            .map_err(join_errno)?
     }
 
     #[cfg(test)]
@@ -1294,9 +1319,9 @@ impl FileSystem for LocalFs {
         Ok(())
     }
 
-    async fn fsync(&self, node: NodeId, fh: Fh, datasync: bool) -> FsResult<()> {
+    async fn fsync(&self, node: NodeId, fh: Fh, datasync: bool, force: bool) -> FsResult<()> {
         let fd = self.file_fd(node, fh)?;
-        self.maybe_fsync(&fd, datasync).await
+        self.maybe_fsync(&fd, datasync, force).await
     }
 
     async fn fallocate(
@@ -1572,11 +1597,18 @@ impl FileSystem for LocalFs {
         Ok(())
     }
 
-    async fn fsyncdir(&self, node: NodeId, dh: Fh, datasync: bool) -> FsResult<()> {
+    async fn fsyncdir(&self, node: NodeId, dh: Fh, datasync: bool, force: bool) -> FsResult<()> {
         let handle = self.dir_handle(node, dh)?;
+        // A forced sync of the export root is the whole-export control (spec
+        // §11), and `syncfs` is the only syscall that performs it. Every other
+        // directory keeps the narrow reading, so the widening is confined to
+        // the one node whose name already means "the export".
+        if force && node == ROOT_NODE {
+            return self.syncfs(&handle.fd).await;
+        }
         // The durability policy is one policy (spec §6), and this is the
         // descriptor `OPENDIR` reopened so a directory could honor it.
-        self.maybe_fsync(&handle.fd, datasync).await
+        self.maybe_fsync(&handle.fd, datasync, force).await
     }
 
     async fn statfs(&self, node: NodeId) -> FsResult<StatfsReply> {
@@ -1747,7 +1779,6 @@ async fn test_fs_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lbfs_proto::types::ROOT_NODE;
 
     #[tokio::test]
     async fn lookup_returns_entry_and_missing_returns_enoent() {
@@ -1988,7 +2019,7 @@ mod tests {
         assert_eq!(out.as_slice(), b"lo");
 
         fs.flush(entry.node, fh).await.unwrap();
-        fs.fsync(entry.node, fh, true).await.unwrap();
+        fs.fsync(entry.node, fh, true, false).await.unwrap();
         fs.release(entry.node, fh).await.unwrap();
         assert_eq!(fs.read(entry.node, fh, 0, 1).await.err(), Some(EBADF));
         // A FLUSH can still arrive for a handle already retired - a RELEASE
@@ -2572,7 +2603,7 @@ mod tests {
             0,
             "O_SYNC must be masked under fsync=ignore"
         );
-        fs.fsync(e.node, fh, false).await.unwrap(); // acked without touching disk
+        fs.fsync(e.node, fh, false, false).await.unwrap(); // acked without touching disk
     }
 
     /// The counterpart: `honor` is the default and must leave a sync-opened
@@ -2591,7 +2622,7 @@ mod tests {
             libc::O_SYNC,
             "fsync=honor must keep the client's O_SYNC"
         );
-        fs.fsync(e.node, fh, false).await.unwrap();
+        fs.fsync(e.node, fh, false, false).await.unwrap();
     }
 
     /// Whether `honor` really reaches the kernel is otherwise invisible from
@@ -2619,7 +2650,11 @@ mod tests {
                 .open(e.node, (libc::O_RDONLY | libc::O_NONBLOCK) as u32)
                 .await
                 .unwrap();
-            assert_eq!(fs.fsync(e.node, fh, false).await, expected, "{policy:?}");
+            assert_eq!(
+                fs.fsync(e.node, fh, false, false).await,
+                expected,
+                "{policy:?}"
+            );
         }
     }
 
@@ -2730,7 +2765,10 @@ mod tests {
             EBADF
         );
         assert_eq!(fs.flush(b.node, fha).await.unwrap_err(), EBADF);
-        assert_eq!(fs.fsync(b.node, fha, false).await.unwrap_err(), EBADF);
+        assert_eq!(
+            fs.fsync(b.node, fha, false, false).await.unwrap_err(),
+            EBADF
+        );
         assert_eq!(fs.fallocate(b.node, fha, 0, 1, 0).await.unwrap_err(), EBADF);
         assert_eq!(fs.lseek(b.node, fha, 0, 0).await.unwrap_err(), EBADF);
         assert_eq!(
@@ -3278,7 +3316,10 @@ mod tests {
             fs.readdirplus(sub.node, dh, 0, 4096).await.unwrap_err(),
             EBADF
         );
-        assert_eq!(fs.fsyncdir(sub.node, dh, false).await.unwrap_err(), EBADF);
+        assert_eq!(
+            fs.fsyncdir(sub.node, dh, false, false).await.unwrap_err(),
+            EBADF
+        );
         assert_eq!(fs.releasedir(sub.node, dh).await.unwrap_err(), EBADF);
         assert_eq!(
             fs.readdir(ROOT_NODE, 9999, 0, 4096).await.unwrap_err(),
@@ -3286,7 +3327,7 @@ mod tests {
         );
 
         // Rejected, not consumed: the handle still works on its own node.
-        fs.fsyncdir(ROOT_NODE, dh, true).await.unwrap();
+        fs.fsyncdir(ROOT_NODE, dh, true, false).await.unwrap();
         fs.releasedir(ROOT_NODE, dh).await.unwrap();
         // A RELEASEDIR whose reply was lost gets retried; the second one must
         // not fail the application's closedir(3).
@@ -3313,9 +3354,118 @@ mod tests {
         for policy in [FsyncPolicy::Honor, FsyncPolicy::Ignore] {
             let (_dir, fs) = test_fs(policy).await;
             let dh = fs.opendir(ROOT_NODE).await.unwrap();
-            fs.fsyncdir(ROOT_NODE, dh, false).await.unwrap();
-            fs.fsyncdir(ROOT_NODE, dh, true).await.unwrap();
+            fs.fsyncdir(ROOT_NODE, dh, false, false).await.unwrap();
+            fs.fsyncdir(ROOT_NODE, dh, true, false).await.unwrap();
             fs.releasedir(ROOT_NODE, dh).await.unwrap();
+        }
+    }
+
+    /// The forced sync runs the syscall the policy would have skipped.
+    ///
+    /// A FIFO is the witness, and the only one available: `fsync(2)` answers
+    /// `EINVAL` on one, so an `EINVAL` here is the kernel reporting a call that
+    /// reached it. `Ok` from the same handle without the flag is the same
+    /// policy declining to make that call. Nothing else in userspace separates
+    /// a sync that ran from a sync that was skipped — both look like success.
+    #[tokio::test]
+    async fn a_forced_fsync_runs_the_syscall_the_ignore_policy_skips() {
+        let (dir, fs) = test_fs(FsyncPolicy::Ignore).await;
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join("p"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let p = fs.lookup(ROOT_NODE, b"p").await.unwrap();
+        // O_NONBLOCK, or opening a peerless FIFO's read end never returns.
+        let fh = fs
+            .open(p.node, (libc::O_RDONLY | libc::O_NONBLOCK) as u32)
+            .await
+            .unwrap();
+
+        // The policy alone: no syscall, so no error to report.
+        fs.fsync(p.node, fh, false, false).await.unwrap();
+        fs.fsync(p.node, fh, true, false).await.unwrap();
+
+        // Forced: the syscall runs and the FIFO refuses it, in both flavours.
+        let einval = Errno(libc::EINVAL as u16);
+        assert_eq!(fs.fsync(p.node, fh, false, true).await.unwrap_err(), einval);
+        assert_eq!(fs.fsync(p.node, fh, true, true).await.unwrap_err(), einval);
+
+        // `honor` needs no flag to reach the same place.
+        let (dir, honest) = test_fs(FsyncPolicy::Honor).await;
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join("p"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let p = honest.lookup(ROOT_NODE, b"p").await.unwrap();
+        let fh = honest
+            .open(p.node, (libc::O_RDONLY | libc::O_NONBLOCK) as u32)
+            .await
+            .unwrap();
+        for force in [false, true] {
+            assert_eq!(
+                honest.fsync(p.node, fh, false, force).await.unwrap_err(),
+                einval,
+                "under honor the flag changes nothing"
+            );
+        }
+    }
+
+    /// A forced sync on a regular file still succeeds, under either policy.
+    ///
+    /// The FIFO case above proves the syscall runs; this one proves the forced
+    /// path does not turn an ordinary durable write into an error.
+    #[tokio::test]
+    async fn a_forced_fsync_on_a_regular_file_succeeds_under_either_policy() {
+        for policy in [FsyncPolicy::Honor, FsyncPolicy::Ignore] {
+            let (dir, fs) = test_fs(policy).await;
+            std::fs::write(dir.path().join("f"), b"bytes").unwrap();
+            let f = fs.lookup(ROOT_NODE, b"f").await.unwrap();
+            let fh = fs.open(f.node, libc::O_RDWR as u32).await.unwrap();
+            for (datasync, force) in [(false, false), (true, false), (false, true), (true, true)] {
+                fs.fsync(f.node, fh, datasync, force).await.unwrap();
+            }
+            fs.release(f.node, fh).await.unwrap();
+        }
+    }
+
+    /// A forced `FSYNCDIR` on the export root syncs the export, not one inode.
+    ///
+    /// `syncfs(2)` rather than `fsync(2)`, because both entry points spec §11
+    /// names — the mount-root control and the unmount call — mean "make the
+    /// export durable", and `fsync` on a directory descriptor flushes that
+    /// directory's own metadata while leaving every dirty file page where
+    /// `fsync = "ignore"` left it. `syncfs` succeeds on any descriptor, so all
+    /// this case can show is that the branch answers; the acknowledgement bit
+    /// the RPC layer sets is what pins *which* branch ran, and the protocol
+    /// suite asserts that.
+    #[tokio::test]
+    async fn a_forced_fsyncdir_answers_on_the_root_and_on_a_subdirectory() {
+        for policy in [FsyncPolicy::Honor, FsyncPolicy::Ignore] {
+            let (dir, fs) = test_fs(policy).await;
+            std::fs::create_dir(dir.path().join("sub")).unwrap();
+            let sub = fs.lookup(ROOT_NODE, b"sub").await.unwrap();
+
+            let root_dh = fs.opendir(ROOT_NODE).await.unwrap();
+            let sub_dh = fs.opendir(sub.node).await.unwrap();
+            for datasync in [false, true] {
+                // The root: `syncfs`.
+                fs.fsyncdir(ROOT_NODE, root_dh, datasync, true)
+                    .await
+                    .unwrap();
+                // A subdirectory: the narrow reading, a real `fsync` on the
+                // directory's own descriptor.
+                fs.fsyncdir(sub.node, sub_dh, datasync, true).await.unwrap();
+            }
+            fs.releasedir(sub.node, sub_dh).await.unwrap();
+            fs.releasedir(ROOT_NODE, root_dh).await.unwrap();
         }
     }
 

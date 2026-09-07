@@ -13,8 +13,19 @@ pub const DEFAULT_MAX_IO_SIZE: u32 = 1 << 20;
 pub const MAX_BODY_SIZE: u32 = 64 << 10;
 
 pub const FLAG_NO_REPLY: u16 = 1 << 0;
-/// Reserved for the forced-sync fast-follow (spec §11). Never set in product v1.
-pub const FLAG_FORCE_SYNC_RESERVED: u16 = 1 << 1;
+/// The forced-sync control, in both directions (spec §3.1, §6).
+///
+/// On a `FSYNC` or `FSYNCDIR` **request** it overrides the server's durability
+/// policy: the sync that opcode names runs for real even under
+/// `fsync = "ignore"`. On any other opcode it means nothing and the server
+/// leaves it alone — unknown flag bits have never been fatal, which is what let
+/// this bit go live without a protocol version.
+///
+/// On a **reply** it is the server's acknowledgement that it performed the
+/// forced sync. A server built before the control existed answers `flags = 0`
+/// while still reporting `STATUS_OK`, so this bit is the only way a client can
+/// separate a sync that ran from one that was silently skipped.
+pub const FLAG_FORCE_SYNC: u16 = 1 << 1;
 
 pub const STATUS_OK: u16 = 0;
 pub const STATUS_VERSION_MISMATCH: u16 = 0xFF01;
@@ -88,6 +99,36 @@ mod tests {
         assert_eq!(&b[12..16], &4u32.to_le_bytes());
         assert_eq!(&b[16..20], &5u32.to_le_bytes());
         assert_eq!(&b[20..24], &0u32.to_le_bytes()); // reserved
+    }
+
+    /// The two live flags own one bit each, and never the same one.
+    ///
+    /// Worth pinning rather than reading off the shifts: bit 1 carries two
+    /// meanings now — "force this sync" outbound and "I forced it" inbound — and
+    /// a third flag that landed on top of either bit would be a wire bug no
+    /// decoder could report, since a frame with a stray flag stays perfectly
+    /// well formed.
+    #[test]
+    fn the_two_frame_flags_are_distinct_single_bits() {
+        assert_eq!(FLAG_NO_REPLY, 0b01);
+        assert_eq!(FLAG_FORCE_SYNC, 0b10);
+        assert_eq!(FLAG_NO_REPLY & FLAG_FORCE_SYNC, 0);
+        // Both survive the header round trip, together and apart.
+        for flags in [
+            0,
+            FLAG_NO_REPLY,
+            FLAG_FORCE_SYNC,
+            FLAG_NO_REPLY | FLAG_FORCE_SYNC,
+        ] {
+            let h = FrameHeader {
+                request_id: 9,
+                op_or_status: 20,
+                flags,
+                body_len: 0,
+                data_len: 0,
+            };
+            assert_eq!(FrameHeader::decode(&h.encode()).flags, flags);
+        }
     }
 
     proptest! {

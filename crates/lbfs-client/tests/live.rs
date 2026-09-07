@@ -45,6 +45,11 @@ struct Live {
 
 impl Live {
     async fn start() -> Live {
+        Live::start_with(FsyncPolicy::Honor).await
+    }
+
+    /// The same, for the cases whose subject is the durability policy.
+    async fn start_with(fsync: FsyncPolicy) -> Live {
         let export = tempfile::tempdir().unwrap();
         // The allowlist is matched against the path the server resolves from
         // its own descriptor, so an unresolved `/tmp` symlink would be denied.
@@ -54,7 +59,7 @@ impl Live {
             allowed_paths: vec![resolved.to_str().unwrap().to_string()],
             max_inflight: DEFAULT_MAX_INFLIGHT,
             max_io_size: DEFAULT_MAX_IO_SIZE,
-            fsync: FsyncPolicy::Honor,
+            fsync,
         };
         let allow = Allowlist::new(&cfg.allowed_paths).unwrap();
         let server = Server::new(Arc::new(cfg), Arc::new(allow)).unwrap();
@@ -371,4 +376,56 @@ async fn every_typed_call_reaches_its_own_opcode() {
         !conn.is_dead(),
         "thirty opcodes and the session is still up"
     );
+}
+
+/// The forced-sync control reaches a real server and comes back acknowledged.
+///
+/// Two halves, and the second is the one worth writing. The control succeeding
+/// under `ignore` shows the client can drive it; a plain `fsync` on a FIFO
+/// still answering `Ok` under that same policy shows the client did *not*
+/// quietly start forcing every application's sync — which would drain
+/// `fsync = "ignore"` of the only thing it means. A forced sync on that same
+/// FIFO answers `EINVAL`, because the syscall runs and the FIFO refuses it.
+#[tokio::test]
+async fn the_forced_sync_control_reaches_the_server_under_the_ignore_policy() {
+    let live = Live::start_with(FsyncPolicy::Ignore).await;
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        live.join("p"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let conn = live.attach().await;
+
+    // The whole-export control: OPENDIR, forced FSYNCDIR, RELEASEDIR.
+    conn.force_sync_export()
+        .await
+        .expect("the server acknowledges a forced sync of the export");
+
+    // The ordinary path is untouched: the policy still decides.
+    let p = conn.lookup(ROOT_NODE, b"p").await.unwrap();
+    // O_NONBLOCK, or opening a peerless FIFO's read end never returns.
+    let fh = conn
+        .open(p.node, (libc::O_RDONLY | libc::O_NONBLOCK) as u32)
+        .await
+        .unwrap();
+    conn.fsync(p.node, fh, false)
+        .await
+        .expect("an application fsync still rides the server's policy");
+
+    assert!(!conn.is_dead());
+}
+
+/// The control works under `honor` too, where it changes nothing but must not
+/// fail. An operator who scripts a pre-snapshot sync should not have to know
+/// which policy the server runs.
+#[tokio::test]
+async fn the_forced_sync_control_also_succeeds_under_the_honor_policy() {
+    let live = Live::start_with(FsyncPolicy::Honor).await;
+    let conn = live.attach().await;
+    conn.force_sync_export().await.unwrap();
+    conn.force_sync_export().await.unwrap();
+    assert!(!conn.is_dead());
 }

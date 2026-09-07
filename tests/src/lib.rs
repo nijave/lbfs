@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lbfs_proto::frame::{
-    FrameHeader, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE,
-    PROTOCOL_VERSION, STATUS_OK,
+    FrameHeader, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE, FLAG_FORCE_SYNC, FLAG_NO_REPLY, MAGIC,
+    MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_OK,
 };
 use lbfs_proto::io::{read_body, read_header, write_frame};
 use lbfs_proto::ops::{
@@ -198,6 +198,11 @@ pub fn enc<T: Serialize>(v: &T) -> Vec<u8> {
 pub struct Reply {
     pub id: u64,
     pub status: u16,
+    /// The reply frame's own flags. Zero on everything but a forced sync the
+    /// server performed, which echoes `FLAG_FORCE_SYNC` back — the one way a
+    /// caller can tell a sync that ran from one the durability policy skipped,
+    /// since both answer `STATUS_OK`.
+    pub flags: u16,
     pub body: Vec<u8>,
     pub data: Vec<u8>,
 }
@@ -250,6 +255,11 @@ impl Reply {
 
     pub fn is_errno(&self, want: i32) -> bool {
         self.status == want as u16
+    }
+
+    /// Whether the server acknowledged a forced sync on this reply.
+    pub fn forced_sync_acked(&self) -> bool {
+        self.flags & FLAG_FORCE_SYNC != 0
     }
 }
 
@@ -416,6 +426,7 @@ impl TestClient {
         Reply {
             id: hdr.request_id,
             status: hdr.op_or_status,
+            flags: hdr.flags,
             body,
             data,
         }
@@ -424,6 +435,20 @@ impl TestClient {
     /// One request, one reply, correlated.
     pub async fn call<R: Serialize>(&mut self, op: Opcode, req: &R) -> Reply {
         self.call_data(op, req, &[]).await
+    }
+
+    /// The same, with the request frame's flags spelled out.
+    ///
+    /// The typed path hardcodes `0`, which is right for every opcode but the
+    /// two sync ones — and it is exactly the flags that the forced-sync cases
+    /// are pinning, so they need a way to set them without dropping to
+    /// [`TestClient::frame`] and hand-rolling the correlation.
+    pub async fn call_flagged<R: Serialize>(&mut self, op: Opcode, req: &R, flags: u16) -> Reply {
+        let id = self.take_id(op);
+        self.frame(id, op as u16, flags, &enc(req), &[]).await;
+        let reply = self.recv().await;
+        assert_eq!(reply.id, id, "a reply must carry its request's id");
+        reply
     }
 
     pub async fn call_data<R: Serialize>(&mut self, op: Opcode, req: &R, data: &[u8]) -> Reply {

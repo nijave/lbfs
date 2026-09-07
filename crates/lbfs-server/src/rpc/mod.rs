@@ -510,6 +510,8 @@ fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, SessionError> {
 struct OutFrame {
     request_id: u64,
     status: u16,
+    /// The reply frame's flags, which only a forced sync ever sets.
+    flags: u16,
     body: Vec<u8>,
     data: Option<DataPayload>,
     /// The in-flight window permit this request consumed.
@@ -676,10 +678,11 @@ async fn read_loop(
         }
 
         let request_id = hdr.request_id;
+        let flags = hdr.flags;
         let fs = Arc::clone(fs);
         tokio::spawn(run_request(
             request_id,
-            async move { dispatch(op, &body, data, &fs).await },
+            async move { dispatch(op, flags, &body, data, &fs).await },
             tx.clone(),
             permit,
             Arc::clone(&session.socket_dead),
@@ -708,19 +711,25 @@ async fn run_request<F>(
 ) where
     F: std::future::Future<Output = dispatch::Reply> + Send + 'static,
 {
-    let (status, body, data) = match tokio::spawn(work).await {
+    let reply = match tokio::spawn(work).await {
         Ok(reply) => reply,
         Err(e) => {
             tracing::error!(request_id, error = %e, "request handler panicked; answering EIO");
-            (Errno::EIO.0, Vec::new(), None)
+            dispatch::Reply {
+                status: Errno::EIO.0,
+                flags: 0,
+                body: Vec::new(),
+                data: None,
+            }
         }
     };
     let queued = tx
         .send(OutFrame {
             request_id,
-            status,
-            body,
-            data,
+            status: reply.status,
+            flags: reply.flags,
+            body: reply.body,
+            data: reply.data,
             permit,
         })
         .await;
@@ -806,6 +815,7 @@ async fn writer_task(
         let OutFrame {
             request_id,
             status,
+            flags,
             body,
             data,
             permit,
@@ -824,7 +834,7 @@ async fn writer_task(
         let hdr = FrameHeader {
             request_id,
             op_or_status: status,
-            flags: 0,
+            flags,
             body_len: body.len() as u32,
             data_len: bytes.len() as u32,
         };
@@ -1035,6 +1045,7 @@ mod tests {
         tx.send(OutFrame {
             request_id: 1,
             status: STATUS_OK,
+            flags: 0,
             body: Vec::new(),
             data: Some(DataPayload::Owned(vec![0u8; HUGE])),
             permit: Some(permit),
@@ -1065,9 +1076,20 @@ mod tests {
         let (tx, rx) = mpsc::channel::<OutFrame>(1);
         drop(rx); // the writer is gone
         let dead = Arc::new(Notify::new());
-        run_request(1, async { (STATUS_OK, Vec::new(), None) }, tx, None, {
-            Arc::clone(&dead)
-        })
+        run_request(
+            1,
+            async {
+                dispatch::Reply {
+                    status: STATUS_OK,
+                    flags: 0,
+                    body: Vec::new(),
+                    data: None,
+                }
+            },
+            tx,
+            None,
+            Arc::clone(&dead),
+        )
         .await;
         // `notify_one` leaves a permit behind, so the reader's next
         // `notified()` completes even though it was not waiting yet.

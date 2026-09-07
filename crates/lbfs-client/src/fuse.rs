@@ -64,7 +64,7 @@ use fuser::{
 };
 use lbfs_proto::ops::CopyFileRangeRequest;
 use lbfs_proto::types::{
-    DirEntryPlus, Entry, FileAttr, FileKind, NodeId, SetattrArgs, StatfsReply, TimeSet,
+    DirEntryPlus, Entry, FileAttr, FileKind, NodeId, SetattrArgs, StatfsReply, TimeSet, ROOT_NODE,
 };
 use lbfs_proto::Errno;
 
@@ -95,6 +95,50 @@ use crate::conn::Connection;
 /// The server clamps the ask to what a reply frame can legally carry, so this
 /// number needs no relationship to the negotiated limits.
 const READDIR_PAGE_BYTES: u32 = 4 << 10;
+
+/// The xattr name that forces a real sync of the export (spec §6, §11).
+///
+/// A `setxattr` of this name **on the mount root** never travels: the bridge
+/// turns it into a forced `FSYNCDIR`, so the sync happens even against a server
+/// running `fsync = "ignore"`. Spec §11 offers an ioctl or a control xattr, and
+/// the xattr wins because lbfs implements no ioctl at all while xattrs already
+/// work end to end.
+///
+/// Three deliberate choices in one name:
+///
+/// * **Only the root inode.** The same name on any other file in the mount is
+///   an ordinary attribute and travels like one, so the name is lost to the user
+///   on exactly one directory rather than throughout the mount.
+/// * **`user.` rather than `trusted.`.** `trusted.*` demands `CAP_SYS_ADMIN`,
+///   and a control the CI workloads this filesystem exists for cannot invoke is
+///   no control. The kernel permits `user.*` on a directory, which the mount
+///   root is.
+/// * **Only `setxattr`.** `getxattr`, `listxattr` and `removexattr` travel
+///   untouched, so the name reads back absent and never appears in a listing —
+///   both true, since nothing is stored anywhere.
+///
+/// The value is ignored; any value asks for one sync. Same for the
+/// `XATTR_CREATE`/`XATTR_REPLACE` flags: nothing is stored, so a strict
+/// `XATTR_REPLACE` earns the sync rather than the `ENODATA` an absent
+/// ordinary attribute would answer with.
+pub const CONTROL_XATTR_SYNC: &[u8] = b"user.lbfs.sync";
+
+// The driver-initiated half of the control lives in `main.rs`, not here.
+//
+// `destroy` looks like the place for it and is not. fuser calls `destroy` from
+// `Session::run` on a thread that `BackgroundSession` *detaches* rather than
+// joins — the struct has no `Drop` of its own, so dropping it releases the
+// `JoinHandle` and then unmounts. `drop(session)` therefore returns while that
+// thread is still finishing, and the tokio runtime the binary owns can be gone
+// before `destroy` gets to use it: blocking on a shutting-down runtime panics
+// inside the timer driver, on the shutdown path, where a panic helps nobody.
+//
+// The unmount is the better barrier anyway. `umount(2)` syncs the superblock
+// before it detaches, so by the time `drop(session)` returns the kernel has
+// written back every dirty page as ordinary `WRITE` callbacks and the server
+// holds all of it — exactly the state a forced sync wants to flush, and
+// `main.rs` is where the runtime and the connection are both still owned. See
+// `force_sync_on_exit` there.
 
 // ---------------------------------------------------------------------------
 // Attribute conversion
@@ -763,6 +807,9 @@ impl fuser::Filesystem for LbfsFuse {
         Ok(())
     }
 
+    /// Teardown. Nothing that needs the runtime — see the note above
+    /// [`CONTROL_XATTR_SYNC`] for why the driver's forced sync lives in
+    /// `main.rs` instead.
     fn destroy(&mut self) {
         let dropped = self.conn.dropped_forgets();
         if dropped > 0 {
@@ -1278,6 +1325,17 @@ impl fuser::Filesystem for LbfsFuse {
         let (conn, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         let value = value.to_vec();
+        // The control, not an attribute: the root inode and this exact name
+        // together mean "sync the export now", whatever the server's durability
+        // policy. Both halves of the test matter — the same name on any other
+        // file travels and stores like anything else, so the name is only lost
+        // on the mount root. See [`CONTROL_XATTR_SYNC`].
+        if ino == ROOT_NODE && name == CONTROL_XATTR_SYNC {
+            tracing::info!("forced sync requested through the mount root control");
+            self.rt
+                .spawn(async move { reply_unit(reply, conn.force_sync_export().await) });
+            return;
+        }
         self.rt.spawn(async move {
             reply_unit(reply, conn.setxattr(ino, &name, value, flags as u32).await)
         });
