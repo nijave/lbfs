@@ -678,6 +678,122 @@ async fn the_ticket_serves_every_claim_the_session_makes() {
 }
 
 // ---------------------------------------------------------------------------
+// DETACH: dropping a retained session at a clean unmount
+// ---------------------------------------------------------------------------
+
+/// The server runs in this process, so its `O_PATH` node descriptors show up in
+/// `/proc/self/fd`. Scoping the census to this export's own tempdir is what
+/// turns it into a number rather than noise — the same measurement the loopback
+/// suite's fd-census cases make.
+fn export_fds(dir: &Path) -> usize {
+    let resolved = dir.canonicalize().unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc is mounted")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.starts_with(&resolved))
+        .count()
+}
+
+/// Poll `cond` until it holds or the deadline passes, failing with `what`.
+async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+    for _ in 0..300 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// `DETACH` drops the session, so a reconnecting `RESUME` finds nothing.
+#[tokio::test]
+async fn a_detached_session_cannot_be_resumed() {
+    let srv = TestServer::start().await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    a.detach(ticket).await.ok_unit();
+    drop(a);
+
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_NO_SESSION);
+}
+
+/// A `DETACH` whose secret does not match answers `ESTALE` and leaves the
+/// session claimable: a client that cannot prove ownership must not be able to
+/// destroy somebody else's session.
+#[tokio::test]
+async fn a_detach_with_a_wrong_secret_is_estale_and_keeps_the_session() {
+    let srv = TestServer::start().await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+
+    let mut wrong = ticket;
+    wrong.secret[0] ^= 0xff;
+    a.detach(wrong).await.expect_errno(libc::ESTALE);
+    drop(a);
+
+    // The right ticket still claims it, so the refused detach removed nothing.
+    let _ = resume_ok(&srv, ticket).await;
+}
+
+/// After `DETACH` the server's descriptors over the export return to baseline
+/// without waiting for the grace. The grace is set to an hour, so only a
+/// working `DETACH` — not the reaper — can free them inside the test.
+#[tokio::test]
+async fn detach_returns_the_export_descriptors_without_waiting_for_the_grace() {
+    let srv = TestServer::with_resume(Duration::from_secs(3600), 64).await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+
+    for name in ["a", "b", "c"] {
+        std::fs::write(srv.join(name), b"x").unwrap();
+        let _: Entry = a.lookup(ROOT_NODE, name.as_bytes()).await.ok();
+    }
+    assert!(
+        export_fds(srv.path()) > 1,
+        "the server should hold a descriptor per registered node"
+    );
+
+    a.detach(ticket).await.ok_unit();
+    drop(a);
+
+    wait_until(
+        || export_fds(srv.path()) == 0,
+        "the detached session's descriptors to close, an hour before the grace would",
+    )
+    .await;
+}
+
+/// `DETACH` ends the session's *retention*, not the connection. The socket
+/// keeps its `Arc<dyn FileSystem>` and serves until it closes, while the
+/// session stops being resumable — which is exactly what a clean unmount wants:
+/// flush and forget over a live socket, then drop retention.
+#[tokio::test]
+async fn a_request_after_detach_still_serves_on_the_same_socket() {
+    let srv = TestServer::start().await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    a.detach(ticket).await.ok_unit();
+
+    // The socket goes on serving.
+    let attr: FileAttr = a.getattr(ROOT_NODE).await.ok();
+    assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+
+    // And the session is no longer resumable.
+    drop(a);
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_NO_SESSION);
+}
+
+// ---------------------------------------------------------------------------
 // The opcode matrix
 // ---------------------------------------------------------------------------
 

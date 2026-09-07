@@ -59,8 +59,8 @@ use lbfs_proto::frame::{
 };
 use lbfs_proto::io::{read_body, read_header, write_frame, IoError};
 use lbfs_proto::ops::{
-    AttachReply, AttachRequest, ForgetRequest, HelloReply, HelloRequest, Opcode, ReadRequest,
-    ResumeReply, ResumeRequest,
+    AttachReply, AttachRequest, DetachRequest, ForgetRequest, HelloReply, HelloRequest, Opcode,
+    ReadRequest, ResumeReply, ResumeRequest,
 };
 use lbfs_proto::types::ROOT_NODE;
 use lbfs_proto::Errno;
@@ -888,6 +888,45 @@ async fn read_loop(
             }
             for (node, nlookup) in req.items {
                 fs.forget(node, nlookup).await;
+            }
+            continue;
+        }
+
+        if op == Opcode::Detach {
+            // Inline, beside FORGET: `DETACH` is one registry call, so spawning
+            // a task for it would cost more than doing it. Unlike FORGET it
+            // takes a window permit and produces a reply — the client waits for
+            // the answer before it closes the socket. `drop_session` verifies
+            // the secret, so a client that cannot prove ownership meets `ESTALE`
+            // and the session stays claimable. On success the entry is gone; the
+            // socket keeps its own `Arc<dyn FileSystem>` and serves until it
+            // closes, so a clean unmount can flush and forget over a live
+            // connection and only then drop retention.
+            let req: DetachRequest = postcard::from_bytes(&body)
+                .map_err(|_| SessionError::Protocol("malformed DETACH body"))?;
+            let status = if server.registry.drop_session(&req.ticket) {
+                tracing::info!(
+                    id = req.ticket.id,
+                    "detached a session at the client's request"
+                );
+                STATUS_OK
+            } else {
+                Errno::ESTALE.0
+            };
+            let queued = tx
+                .send(OutFrame {
+                    request_id: hdr.request_id,
+                    status,
+                    flags: 0,
+                    body: Vec::new(),
+                    data: None,
+                    permit,
+                })
+                .await;
+            if queued.is_err() {
+                // No writer left to take the reply, so no connection either.
+                socket_dead.notify_one();
+                return Ok(());
             }
             continue;
         }

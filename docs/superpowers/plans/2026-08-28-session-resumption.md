@@ -814,7 +814,7 @@ git commit -m "feat(server): RESUME claims a retained session"
 - Consumes: Task 6.
 - Produces: `DETACH` as an ordinary in-session request, answered `STATUS_OK`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 1. `DETACH`, drop the socket, reconnect, `RESUME`: `STATUS_NO_SESSION`.
 2. `DETACH` with a wrong secret answers `ESTALE` and leaves the session
@@ -831,9 +831,9 @@ the registry entry, and the connection keeps its `Arc<dyn FileSystem>` until it
 closes, so the export stays served and stops being resumable. That is what a
 clean unmount wants.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Handle `DETACH` in the read loop**
+- [x] **Step 3: Handle `DETACH` in the read loop**
 
 Beside `Forget`, which the loop already handles inline. `DETACH` is one
 registry call, so spawning a task for it would cost more than doing it — but
@@ -841,9 +841,9 @@ unlike `FORGET` it takes a window permit and produces a reply, because the
 client waits for it before closing. Log the detach with the session id at
 INFO; Task 13's drill greps for the line.
 
-- [ ] **Step 4: Run the tests, then `make check` and `make test-loopback`**
+- [x] **Step 4: Run the tests, then `make check` and `make test-loopback`**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/mod.rs tests/src/lib.rs tests/tests/protocol.rs
