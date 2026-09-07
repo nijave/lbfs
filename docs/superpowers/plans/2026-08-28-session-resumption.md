@@ -453,7 +453,7 @@ git commit -m "feat(proto): version 3 with session tickets, RESUME and DETACH"
   rides inside the rpc `Limits` struct.
   Methods: `mint`, `claim`, `release`, `drop_session`, `reap_expired`, `len`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Cover, against `Registry<u32, u32>`:
 
@@ -481,12 +481,12 @@ Cover, against `Registry<u32, u32>`:
     though the reaper has not run. Expiry is the clock's fact, not the reaper's
     schedule.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test -p lbfs-server registry`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write the registry**
+- [x] **Step 3: Write the registry**
 
 The shape:
 
@@ -551,14 +551,14 @@ refuses an attached session rather than stealing it (a steal is the
 session-hijack primitive in a protocol with no authentication, and a half-open
 socket resolves itself inside the keepalive budget).
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p lbfs-server registry`
 Expected: PASS, all eleven.
 
-- [ ] **Step 5: `make check`**
+- [x] **Step 5: `make check`**
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/registry.rs crates/lbfs-server/src/rpc/mod.rs

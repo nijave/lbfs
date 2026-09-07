@@ -43,6 +43,7 @@
 //!   that discards a produced reply is the connection dying underneath it.
 
 pub mod dispatch;
+pub mod registry;
 
 use std::ffi::OsStr;
 use std::io;
