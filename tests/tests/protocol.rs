@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::Duration;
 
 use lbfs_proto::frame::{
     FrameHeader, FLAG_FORCE_SYNC, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE, PROTOCOL_VERSION,
@@ -259,6 +260,99 @@ async fn attach_separates_not_exported_from_denied() {
         c.attach(&exports.join("file")).await.status,
         STATUS_NOT_EXPORTED
     );
+}
+
+// ---------------------------------------------------------------------------
+// Session retention: the advertised grace and the minted ticket
+// ---------------------------------------------------------------------------
+
+/// [`hello_request`] with the resume ask set: the shape of every handshake a
+/// reconnecting client sends.
+fn hello_resuming(max_inflight: u32, max_io_size: u32) -> HelloRequest {
+    HelloRequest {
+        resume: true,
+        ..hello_request(max_inflight, max_io_size)
+    }
+}
+
+/// The grace is advertised only to a client that asked to resume, so a client
+/// that never will is never tempted to believe its sessions are retained.
+#[tokio::test]
+async fn a_hello_that_asks_to_resume_learns_the_grace() {
+    let srv = TestServer::start().await;
+
+    let mut c = srv.connect().await;
+    let asked: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(
+        asked.resume_grace_ms, 60_000,
+        "the configured grace, in milliseconds"
+    );
+
+    let mut c = srv.connect().await;
+    let silent: HelloReply = c.hello(&hello_request(SERVER_WINDOW, SERVER_IO)).await.ok();
+    assert_eq!(
+        silent.resume_grace_ms, 0,
+        "a client that did not ask is told nothing is retained"
+    );
+}
+
+/// A ticket exists exactly when both sides asked for retention.
+#[tokio::test]
+async fn an_attach_that_asked_to_resume_gets_a_ticket() {
+    let srv = TestServer::start().await;
+
+    let ticket = srv
+        .attached_resumable()
+        .await
+        .ticket()
+        .expect("a resume-asking attach mints a ticket");
+    assert_eq!(
+        ticket.grace_ms, 60_000,
+        "the ticket carries the grace the server will honour"
+    );
+
+    let c = srv.attached().await;
+    assert!(
+        c.ticket().is_none(),
+        "a client that did not ask to resume gets no ticket"
+    );
+}
+
+/// `resume_grace = "0"` turns retention off: the handshake still succeeds,
+/// and nothing about it hints at a session that will be retained.
+#[tokio::test]
+async fn a_server_with_resume_grace_zero_mints_no_ticket() {
+    let srv = TestServer::with_resume(Duration::ZERO, 64).await;
+
+    let mut c = srv.connect().await;
+    let settled: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(
+        settled.resume_grace_ms, 0,
+        "retention off is advertised as a zero grace, whatever the client asked"
+    );
+
+    let attach: AttachReply = c.attach(srv.path()).await.ok();
+    assert!(
+        attach.ticket.is_none(),
+        "a server that retains nothing must not hand out a ticket"
+    );
+}
+
+/// Two sessions never share an id or a secret, so one mount's ticket cannot
+/// land on another mount's session.
+#[tokio::test]
+async fn two_attaches_that_asked_to_resume_mint_distinct_tickets() {
+    let srv = TestServer::start().await;
+    let a = srv.attached_resumable().await.ticket().unwrap();
+    let b = srv.attached_resumable().await.ticket().unwrap();
+    assert_ne!(a.id, b.id, "ids are never reused inside one process");
+    assert_ne!(a.secret, b.secret, "secrets differ between mints");
 }
 
 // ---------------------------------------------------------------------------

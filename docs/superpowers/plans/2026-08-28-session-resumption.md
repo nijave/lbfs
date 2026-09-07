@@ -633,7 +633,7 @@ git commit -m "feat(server): resume_grace and max_resumable_sessions"
   drains; a reaper task runs per server. **No `RESUME` yet** — a session goes
   idle and then expires, and nothing claims it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `tests/tests/protocol.rs`:
 
@@ -645,9 +645,9 @@ In `tests/tests/protocol.rs`:
    `None` whatever the client asked for.
 4. Two attaches return tickets with different ids and different secrets.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Wire the registry into `Server`**
+- [x] **Step 3: Wire the registry into `Server`**
 
 `Server::new` builds the registry from the config and spawns the reaper. The
 reaper wakes on an interval (grace / 4, floored at a second), calls
@@ -659,13 +659,13 @@ with a zero grace skips the task entirely. The spawn means the `pub`,
 synchronous `Server::new` now needs a runtime context its signature does not
 show — every current caller sits inside one, and its doc comment must say so.
 
-- [ ] **Step 4: `hello` reports the grace**
+- [x] **Step 4: `hello` reports the grace**
 
 `resume_grace_ms` = the configured grace in milliseconds when the client asked
 for resumption and the server retains anything, else `0`. Carry the client's
 `resume` bit into `Limits`, beside `writeback`, because `attach` needs it.
 
-- [ ] **Step 5: `attach` mints**
+- [x] **Step 5: `attach` mints**
 
 After `LocalFs::from_root_fd` succeeds and before the reply, mint, storing the
 settled `Limits` as the entry's guard — `writeback` rides inside it. A `None`
@@ -676,13 +676,13 @@ per occurrence with the cap in the line.
 Hold the minted `(id, epoch)` beside the `Arc<dyn FileSystem>` for the session
 task.
 
-- [ ] **Step 6: `serve_requests` releases before it drains**
+- [x] **Step 6: `serve_requests` releases before it drains**
 
 At the top of teardown, before `drop(session)` and the drain, call
 `release(id, epoch)`. Trap 2 in the design section is the reason: a claim
 arriving during the 30-second drain must not queue behind it.
 
-- [ ] **Step 7: `TCP_USER_TIMEOUT`**
+- [x] **Step 7: `TCP_USER_TIMEOUT`**
 
 In `rpc::configure_socket`, set `TCP_USER_TIMEOUT` to the keepalive budget,
 `KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * KEEPALIVE_COUNT`. One signature to
@@ -694,12 +694,12 @@ with replies queued for a black-holed peer sits in TCP retransmission for
 minutes, holding the session attached past any grace worth configuring and
 refusing every claim with `STATUS_SESSION_BUSY`.
 
-- [ ] **Step 8: Expose the ticket in the harness**
+- [x] **Step 8: Expose the ticket in the harness**
 
 `TestClient` keeps the `AttachReply`'s ticket and offers `ticket()`.
 `connect_and_attach_with` grows a `resume: bool`.
 
-- [ ] **Step 9: Run the tests, then the gates**
+- [x] **Step 9: Run the tests, then the gates**
 
 Run: `cargo test -p lbfs-tests --test protocol resume` then `make check` and
 `make test-loopback`.
@@ -711,7 +711,7 @@ library default is off — so no session survives its unmounts, nothing waits on
 the reaper, and every fd-census case passes exactly as before. A failure here
 is a real leak, not timing.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/mod.rs tests/src/lib.rs tests/tests/protocol.rs
