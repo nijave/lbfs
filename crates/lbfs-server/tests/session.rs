@@ -42,6 +42,8 @@ async fn start_server(patterns: Vec<String>) -> SocketAddr {
         max_inflight: 128,
         max_io_size: 1 << 20,
         fsync: FsyncPolicy::Honor,
+        resume_grace: std::time::Duration::from_secs(60),
+        max_resumable_sessions: 64,
     };
     let allow = Allowlist::new(&cfg.allowed_paths).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

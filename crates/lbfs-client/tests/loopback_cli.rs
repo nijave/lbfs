@@ -96,6 +96,8 @@ fn serve_with(export: &Path, fsync: FsyncPolicy) -> (tokio::runtime::Runtime, So
         max_inflight: DEFAULT_MAX_INFLIGHT,
         max_io_size: DEFAULT_MAX_IO_SIZE,
         fsync,
+        resume_grace: Duration::from_secs(60),
+        max_resumable_sessions: 64,
     };
     let allow = Allowlist::new(&cfg.allowed_paths).unwrap();
     let listener = rt

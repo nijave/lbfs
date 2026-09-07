@@ -261,6 +261,8 @@ impl ServerSide {
             max_inflight: DEFAULT_MAX_INFLIGHT,
             max_io_size: DEFAULT_MAX_IO_SIZE,
             fsync: opts.fsync,
+            resume_grace: Duration::from_secs(60),
+            max_resumable_sessions: 64,
         };
         let allow = Allowlist::new(&cfg.allowed_paths).unwrap();
         // Port 0, so the suite never collides with a server on the developer's

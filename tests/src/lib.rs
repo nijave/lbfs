@@ -157,6 +157,8 @@ pub async fn serve(
         max_inflight,
         max_io_size,
         fsync,
+        resume_grace: Duration::from_secs(60),
+        max_resumable_sessions: 64,
     };
     let allow = Allowlist::new(&cfg.allowed_paths).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

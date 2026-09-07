@@ -579,7 +579,7 @@ git commit -m "feat(server): a registry of sessions that outlive their sockets"
 - Produces: `Config::resume_grace: Duration` and
   `Config::max_resumable_sessions: usize`, plus `pub fn parse_duration`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Beside the existing `parse_size` cases: `parse_duration` accepts `"60s"`,
 `"500ms"`, a bare `"30"` as seconds and `"0"` as zero; it refuses `"60x"`,
@@ -587,9 +587,9 @@ Beside the existing `parse_size` cases: `parse_duration` accepts `"60s"`,
 sessions; one with `resume_grace = "0"` yields `Duration::ZERO`; an unknown key
 still fails, because `deny_unknown_fields` stays on.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Add the keys**
+- [x] **Step 3: Add the keys**
 
 `RawConfig` grows `resume_grace: Option<String>` and
 `max_resumable_sessions: Option<usize>`. `parse_duration` mirrors `parse_size`:
@@ -604,13 +604,13 @@ the loopback harness (`tests/src/lib.rs` and `tests/tests/loopback.rs`),
 literal lives in `config.rs`. Every one gains the two fields — the compiler
 names each — and this task's commit stages them all.
 
-- [ ] **Step 4: Update the two shipped configs**
+- [x] **Step 4: Update the two shipped configs**
 
 Add both keys, commented, to `crates/lbfs-server/pkg/lbfs.toml` and `vm/server-config.toml`.
 
-- [ ] **Step 5: `make check`**
+- [x] **Step 5: `make check`**
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-server/src/config.rs crates/lbfs-server/pkg/lbfs.toml crates/lbfs-server/tests/session.rs crates/lbfs-client/tests/live.rs crates/lbfs-client/tests/loopback_cli.rs tests/src/lib.rs tests/tests/loopback.rs vm/server-config.toml
