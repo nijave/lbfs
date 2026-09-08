@@ -14,3 +14,12 @@ listen = "127.0.0.1:9423"
 allowed_paths = ["/srv/exports/*"]
 
 fsync = "honor"
+
+# How long a session — node table, open handles, directory snapshots — outlives
+# its socket, so a client can claim it back with RESUME after a transport
+# failure. "0" turns retention off entirely.
+resume_grace = "60s"
+
+# How many sessions may hold a resume ticket at once. Past the cap, ATTACH
+# still succeeds and simply mints no ticket.
+max_resumable_sessions = 64

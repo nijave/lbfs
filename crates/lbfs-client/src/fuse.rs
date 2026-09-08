@@ -68,7 +68,7 @@ use lbfs_proto::types::{
 };
 use lbfs_proto::Errno;
 
-use crate::conn::Connection;
+use crate::session::Session;
 
 /// How many bytes of directory page to ask the server for per round trip.
 ///
@@ -615,10 +615,14 @@ pub fn session_config(
 // The filesystem
 // ---------------------------------------------------------------------------
 
-/// The `fuser::Filesystem` implementation: one connection, one runtime, two
-/// cache lifetimes.
+/// The `fuser::Filesystem` implementation: one session, one runtime, two cache
+/// lifetimes.
+///
+/// A [`Session`] rather than a [`crate::conn::Connection`], because the socket
+/// underneath a mount may be replaced and the mount may not notice. Every
+/// callback asks for the current connection inside the task it already spawns.
 pub struct LbfsFuse {
-    conn: Arc<Connection>,
+    session: Arc<Session>,
     rt: tokio::runtime::Handle,
     /// How long the kernel may trust a cached `stat` (spec §7). Zero disables
     /// attribute caching.
@@ -638,14 +642,14 @@ pub struct LbfsFuse {
 
 impl LbfsFuse {
     pub fn new(
-        conn: Arc<Connection>,
+        session: Arc<Session>,
         rt: tokio::runtime::Handle,
         attr_ttl: Duration,
         entry_ttl: Duration,
         writeback: bool,
     ) -> LbfsFuse {
         LbfsFuse {
-            conn,
+            session,
             rt,
             attr_ttl,
             entry_ttl,
@@ -654,15 +658,31 @@ impl LbfsFuse {
     }
 
     /// What every callback captures before it spawns.
-    fn ctx(&self) -> (Arc<Connection>, Duration) {
-        (Arc::clone(&self.conn), self.attr_ttl)
+    fn ctx(&self) -> (Arc<Session>, Duration) {
+        (Arc::clone(&self.session), self.attr_ttl)
     }
 
     /// The same, for the four callbacks that answer with a `ReplyEntry` and can
     /// therefore give the two lifetimes different values.
-    fn entry_ctx(&self) -> (Arc<Connection>, Duration, Duration) {
-        (Arc::clone(&self.conn), self.attr_ttl, self.entry_ttl)
+    fn entry_ctx(&self) -> (Arc<Session>, Duration, Duration) {
+        (Arc::clone(&self.session), self.attr_ttl, self.entry_ttl)
     }
+}
+
+/// The connection this callback runs on, or the errno reply that ends it.
+///
+/// A macro and not a function because the failure path returns from the
+/// *caller*: [`Session::current`] answers `EIO` for a mount whose session is
+/// over, and every callback below turns that into the same `reply.error` it
+/// would send for an `EIO` off the wire. `?` cannot do it — a spawned callback
+/// body answers with a reply object rather than a `Result`.
+macro_rules! conn {
+    ($session:expr, $reply:expr) => {
+        match $session.current().await {
+            Ok(conn) => conn,
+            Err(e) => return $reply.error(errno(e)),
+        }
+    };
 }
 
 /// A `u16` errno as the kernel wants it. Every error out of the multiplexer
@@ -755,7 +775,7 @@ fn reply_statfs(reply: ReplyStatfs, r: Result<StatfsReply, Errno>) {
 //   mount with no event source of its own.
 impl fuser::Filesystem for LbfsFuse {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
-        let max_io = self.conn.limits.max_io_size;
+        let max_io = self.session.limits.max_io_size;
         // The kernel's default write ceiling is 16 MiB, far above anything the
         // handshake settled on; a write over the negotiated size is refused by
         // the multiplexer with `EINVAL` rather than travelling, so this is not
@@ -791,7 +811,7 @@ impl fuser::Filesystem for LbfsFuse {
         // The congestion threshold is where the kernel starts treating the
         // filesystem as backed up; three quarters is fuser's own ratio, named
         // here so the number does not rest on somebody else's default.
-        let window = u16::try_from(self.conn.limits.max_inflight).unwrap_or(u16::MAX);
+        let window = u16::try_from(self.session.limits.max_inflight).unwrap_or(u16::MAX);
         if let Err(nearest) = config.set_max_background(window) {
             tracing::warn!(window, nearest, "the kernel would not take max_background");
         }
@@ -830,23 +850,34 @@ impl fuser::Filesystem for LbfsFuse {
     /// [`CONTROL_XATTR_SYNC`] for why the driver's forced sync lives in
     /// `main.rs` instead.
     fn destroy(&mut self) {
-        let dropped = self.conn.dropped_forgets();
+        let dropped = self.session.dropped_forgets();
         if dropped > 0 {
-            tracing::warn!(dropped, "forgets were dropped during this mount");
+            // The two counts have different cures. A forget lost to a full
+            // queue means the socket stalled behind a burst; one lost while
+            // reconnecting means the mount had no connection to hand it to at
+            // all, and a shorter `--reconnect-timeout` is the knob that shrinks
+            // that window. Either way the nodes they named stay resident on the
+            // server until the session ends (design §9).
+            tracing::warn!(
+                dropped,
+                while_reconnecting = self.session.dropped_while_reconnecting(),
+                "forgets were dropped during this mount"
+            );
         }
         tracing::info!("mount torn down");
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
-        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
+        let (session, attr_ttl, entry_ttl) = self.entry_ctx();
         let name = name.as_bytes().to_vec();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             reply_entry(reply, attr_ttl, entry_ttl, conn.lookup(parent, &name).await)
         });
     }
 
-    /// No reply object, no way to wait: [`Connection::send_forget`] is
+    /// No reply object, no way to wait: [`Session::send_forget`] is
     /// synchronous and batches behind the scenes, so this must not spawn.
     ///
     /// `batch_forget` is deliberately not overridden. Its slice element type is
@@ -854,14 +885,16 @@ impl fuser::Filesystem for LbfsFuse {
     /// it does not need to be, because the trait's default body calls this
     /// method once per node, which is exactly what the old override did.
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.conn.send_forget(ino.0, nlookup);
+        self.session.send_forget(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let (ino, fh) = (ino.0, fh.map(|h| h.0));
-        let (conn, ttl) = self.ctx();
-        self.rt
-            .spawn(async move { reply_attr(reply, ttl, ino, conn.getattr(ino, fh).await) });
+        let (session, ttl) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_attr(reply, ttl, ino, conn.getattr(ino, fh).await)
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -889,7 +922,7 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyAttr,
     ) {
         let (ino, fh) = (ino.0, fh.map(|h| h.0));
-        let (conn, ttl) = self.ctx();
+        let (session, ttl) = self.ctx();
         let args = SetattrArgs {
             mode,
             uid,
@@ -899,15 +932,19 @@ impl fuser::Filesystem for LbfsFuse {
             mtime: time_set(mtime),
             fh,
         };
-        self.rt
-            .spawn(async move { reply_attr(reply, ttl, ino, conn.setattr(ino, args).await) });
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_attr(reply, ttl, ino, conn.setattr(ino, args).await)
+        });
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_data(reply, conn.readlink(ino).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_data(reply, conn.readlink(ino).await)
+        });
     }
 
     /// No `MKNOD` opcode: the protocol creates regular files through `CREATE`
@@ -937,9 +974,10 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
-        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
+        let (session, attr_ttl, entry_ttl) = self.entry_ctx();
         let name = name.as_bytes().to_vec();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             reply_entry(
                 reply,
                 attr_ttl,
@@ -951,18 +989,22 @@ impl fuser::Filesystem for LbfsFuse {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let parent = parent.0;
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         let name = name.as_bytes().to_vec();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.unlink(parent, &name).await) });
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.unlink(parent, &name).await)
+        });
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let parent = parent.0;
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         let name = name.as_bytes().to_vec();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.rmdir(parent, &name).await) });
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.rmdir(parent, &name).await)
+        });
     }
 
     fn symlink(
@@ -974,10 +1016,11 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
-        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
+        let (session, attr_ttl, entry_ttl) = self.entry_ctx();
         let name = link_name.as_bytes().to_vec();
         let target = target.as_os_str().as_bytes().to_vec();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             reply_entry(
                 reply,
                 attr_ttl,
@@ -1003,10 +1046,11 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let (parent, newparent, flags) = (parent.0, newparent.0, flags.bits());
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         let newname = newname.as_bytes().to_vec();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             reply_unit(
                 reply,
                 conn.rename(parent, &name, newparent, &newname, flags).await,
@@ -1023,9 +1067,10 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEntry,
     ) {
         let (ino, newparent) = (ino.0, newparent.0);
-        let (conn, attr_ttl, entry_ttl) = self.entry_ctx();
+        let (session, attr_ttl, entry_ttl) = self.entry_ctx();
         let newname = newname.as_bytes().to_vec();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             reply_entry(
                 reply,
                 attr_ttl,
@@ -1037,8 +1082,9 @@ impl fuser::Filesystem for LbfsFuse {
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             match conn.open(ino, flags.0 as u32).await {
                 Ok(fh) => reply.opened(FileHandle(fh), open_flags(flags)),
                 Err(e) => reply.error(errno(e)),
@@ -1058,9 +1104,10 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyCreate,
     ) {
         let parent = parent.0;
-        let (conn, ttl) = self.ctx();
+        let (session, ttl) = self.ctx();
         let name = name.as_bytes().to_vec();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             match conn.create(parent, &name, mode, flags as u32).await {
                 Ok((e, fh)) => reply.created(
                     &ttl,
@@ -1087,9 +1134,11 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyData,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_data(reply, conn.read(ino, fh, offset, size).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_data(reply, conn.read(ino, fh, offset, size).await)
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1106,13 +1155,14 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyWrite,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         let kill = kill_suidgid(write_flags);
         // The slice borrows the session's single receive buffer, which is
         // reused the moment this callback returns. The copy is what lets the
         // write outlive the callback.
         let data = data.to_vec();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             match conn.write(ino, fh, offset, data, kill).await {
                 Ok(written) => reply.written(written),
                 Err(e) => reply.error(errno(e)),
@@ -1129,9 +1179,11 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.flush(ino, fh).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.flush(ino, fh).await)
+        });
     }
 
     fn release(
@@ -1145,9 +1197,11 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.release(ino, fh).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.release(ino, fh).await)
+        });
     }
 
     fn fsync(
@@ -1159,15 +1213,18 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.fsync(ino, fh, datasync).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.fsync(ino, fh, datasync).await)
+        });
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             match conn.opendir(ino).await {
                 // A directory handle wants no flags, which is what the zero
                 // this used to pass said.
@@ -1195,8 +1252,9 @@ impl fuser::Filesystem for LbfsFuse {
         mut reply: ReplyDirectory,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             let mut cursor = offset;
             // Across pages, not within one: the kernel's buffer holds the whole
             // reply, so this is what says whether a refusal leaves it empty.
@@ -1245,8 +1303,9 @@ impl fuser::Filesystem for LbfsFuse {
         mut reply: ReplyDirectoryPlus,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, ttl) = self.ctx();
+        let (session, ttl) = self.ctx();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             let mut cursor = offset;
             // As in `readdir`: the count that decides whether a refused entry
             // leaves an empty reply spans the pages, not one of them.
@@ -1302,9 +1361,11 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.releasedir(ino, fh).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.releasedir(ino, fh).await)
+        });
     }
 
     fn fsyncdir(
@@ -1316,16 +1377,20 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.fsyncdir(ino, fh, datasync).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.fsyncdir(ino, fh, datasync).await)
+        });
     }
 
     fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_statfs(reply, conn.statfs(ino).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_statfs(reply, conn.statfs(ino).await)
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1341,7 +1406,7 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         let name = name.as_bytes().to_vec();
         let value = value.to_vec();
         // The control, not an attribute: the root inode and this exact name
@@ -1351,36 +1416,45 @@ impl fuser::Filesystem for LbfsFuse {
         // on the mount root. See [`CONTROL_XATTR_SYNC`].
         if ino == ROOT_NODE && name == CONTROL_XATTR_SYNC {
             tracing::info!("forced sync requested through the mount root control");
-            self.rt
-                .spawn(async move { reply_unit(reply, conn.force_sync_export().await) });
+            self.rt.spawn(async move {
+                let conn = conn!(session, reply);
+                reply_unit(reply, conn.force_sync_export().await)
+            });
             return;
         }
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             reply_unit(reply, conn.setxattr(ino, &name, value, flags as u32).await)
         });
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         let name = name.as_bytes().to_vec();
-        self.rt
-            .spawn(async move { reply_xattr(reply, size, conn.getxattr(ino, &name, size).await) });
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_xattr(reply, size, conn.getxattr(ino, &name, size).await)
+        });
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
-        self.rt
-            .spawn(async move { reply_xattr(reply, size, conn.listxattr(ino, size).await) });
+        let (session, _) = self.ctx();
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_xattr(reply, size, conn.listxattr(ino, size).await)
+        });
     }
 
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let ino = ino.0;
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         let name = name.as_bytes().to_vec();
-        self.rt
-            .spawn(async move { reply_unit(reply, conn.removexattr(ino, &name).await) });
+        self.rt.spawn(async move {
+            let conn = conn!(session, reply);
+            reply_unit(reply, conn.removexattr(ino, &name).await)
+        });
     }
 
     fn fallocate(
@@ -1394,8 +1468,9 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyEmpty,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             reply_unit(
                 reply,
                 conn.fallocate(ino, fh, offset, length, mode as u32).await,
@@ -1416,8 +1491,9 @@ impl fuser::Filesystem for LbfsFuse {
         reply: ReplyLseek,
     ) {
         let (ino, fh) = (ino.0, fh.0);
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             let Ok(offset) = u64::try_from(offset) else {
                 reply.error(FuseErrno::EINVAL);
                 return;
@@ -1446,8 +1522,9 @@ impl fuser::Filesystem for LbfsFuse {
         _flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
-        let (conn, _) = self.ctx();
+        let (session, _) = self.ctx();
         self.rt.spawn(async move {
+            let conn = conn!(session, reply);
             let req = CopyFileRangeRequest {
                 node_in: ino_in.0,
                 fh_in: fh_in.0,

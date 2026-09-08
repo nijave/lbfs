@@ -76,6 +76,8 @@ startup instead of quietly leaving a default in place.
 | `max_inflight` | integer | `128` | Requests one client may keep outstanding. |
 | `max_io_size` | size string | `"1MiB"` | Largest READ or WRITE payload. |
 | `fsync` | `"honor"` / `"ignore"` | `"honor"` | Whether `FSYNC` reaches the disk. |
+| `resume_grace` | duration string | `"60s"` | How long a session — node table, open handles, directory snapshots — outlives its socket, so a reconnecting client can claim it back. `"0"` turns retention off. |
+| `max_resumable_sessions` | integer | `64` | Sessions retained for `RESUME` at once. Past the cap, `ATTACH` still succeeds and mints no ticket. |
 
 ```toml
 listen = "0.0.0.0:9423"
@@ -166,6 +168,8 @@ mismatch prints a plain error instead of leaving an `EIO` mountpoint behind.
 | `--fuse-threads N` | off (one) | Run N fuser event-loop threads. Off by default and expected to stay off on a two-vCPU guest: the session thread peaks at 15.6% of a core under the heaviest measured shape, and the A/B in `docs/benchmarks/2026-08-22-bottleneck-analysis.md` moved nothing. Each thread allocates a 16 MiB receive buffer, of which about 2 MB turns resident under a 1 MiB negotiated I/O size. Pair with `--fuse-clone-fd`. Linux only, 1 to 64. |
 | `--fuse-clone-fd` | off | Give each event-loop thread its own `/dev/fuse` descriptor (`FUSE_DEV_IOC_CLONE`, Linux 4.5+). Without it the threads share one queue. Means nothing without `--fuse-threads`. |
 | `--no-writeback` | off | Write through to the server instead of letting the kernel batch dirty pages. |
+| `--reconnect-timeout <seconds>` | `10` | How long the client keeps re-attaching after its connection drops. Requests issued during the gap park until the session comes back or this runs out; requests already on the wire fail `EIO` either way. Clamped to three-quarters of the grace the server advertises, so a number past the server's `resume_grace` buys nothing. `0` means `--no-reconnect`. |
+| `--no-reconnect` | off | Never re-attach: a lost connection ends the mount, exactly as it did before session resumption. Clears the handshake request too, so the server retains nothing for this mount and its `ATTACH` reply carries no ticket. |
 | `--readahead-kb <KiB>` | negotiated `max_io_size / 1024`, never below 128 | After mounting, the client writes this into the mount's `/sys/class/bdi/<dev>/read_ahead_kb`, best effort. The kernel clamps readahead to that knob, whose default of 128 costs about half of buffered sequential read throughput (`docs/benchmarks/2026-08-28-readahead.md`). Root owns the knob, so an unprivileged client logs the exact `sudo tee` command for an operator and carries on. `0` skips the attempt. The knob resets on every mount. |
 
 The writeback cache stays on by default because coalescing small writes is the
@@ -260,7 +264,7 @@ each one asks of the host.
 | `make test-loopback` | a real FUSE mount over a real socket on this host, driven through `std::fs`, plus the shipped client binary | `/dev/fuse` and `fusermount3` |
 | `make vm-up [KERNEL=…]` | brings up the libvirt guest pair | libvirt and qemu |
 | `make vm-deploy` | builds the guest binaries in a container and installs them on the pair | podman, a running pair |
-| `make vm-test` | the cross-VM end-to-end suite: every v1 op, fio with `crc32c` verify, a throughput floor, a build workload, and the disconnect drill | a deployed pair |
+| `make vm-test` | the cross-VM end-to-end suite: every v1 op, fio with `crc32c` verify, a throughput floor, a build workload, and the disconnect and reconnect drills | a deployed pair |
 | `make vm-down` | tears the pair down | — |
 
 The loopback cases carry `#[ignore]`, so `make test` leaves them alone and
@@ -340,13 +344,24 @@ the cause.
 against the resolved path, which always begins with `/`. Write absolute
 patterns; a relative one silently covers no export.
 
-**The disconnect drill covers a clean stop.** Stopping the server tears the
-sessions down at once and the mount answers `EIO` immediately. A `SIGKILL` or
-a network partition leaves the socket open until TCP keepalive gives up, which
-takes about 25 seconds — 10 seconds idle, then three probes 5 seconds apart.
-Requests in flight hang for that long first.
+**The two drills split the failure modes.** The disconnect drill stops the
+server, which empties its retained sessions: a restarted server refuses the
+claim outright and the mount dies at once, while a server that stays down
+leaves the client redialling until `--reconnect-timeout` runs out. The
+reconnect drill severs the connection and leaves the server up, and the mount
+resumes. A `SIGKILL` or a network partition sits between the two: the socket
+stays open until TCP keepalive gives up, about 25 seconds — 10 seconds idle,
+then three probes 5 seconds apart — requests in flight hang for that long
+first, and only then does the client start redialling a server that may still
+hold its session.
 
-**No reconnection.** A dropped connection fails every in-flight and later
-operation with `EIO`. The mount stays present and unmounts cleanly, but it
-never comes back; node and handle state is session-scoped on the server, so
-honest recovery needs session resumption. That is the first fast-follow.
+**Reconnection has a deadline, and it never replays.** Requests in flight
+when the connection breaks still fail with `EIO`, because the client cannot
+know whether the server executed them. Requests issued during the gap park
+while the client re-attaches, bounded by `--reconnect-timeout` — 10 seconds by
+default, clamped to three-quarters of the server's grace. A claim the server
+refuses — a restart emptied its sessions, the grace ran out, the ticket is
+wrong — leaves the mount dead exactly as a lost connection always did: `EIO`
+until unmount, never a fresh attach underneath a kernel that still holds the
+old node ids. `--no-reconnect` restores the old contract on the wire and in
+the client.

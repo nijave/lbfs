@@ -35,11 +35,12 @@ use lbfs_proto::frame::{
 };
 use lbfs_proto::io::{read_body, read_header, write_frame};
 use lbfs_proto::ops::{
-    AttachReply, AttachRequest, CreateRequest, ForgetRequest, GetattrRequest, HelloReply,
-    HelloRequest, LookupRequest, MkdirRequest, Opcode, OpenRequest, OpendirRequest, ReadRequest,
-    ReaddirRequest, ReleaseRequest, ReleasedirRequest, RmdirRequest, UnlinkRequest, WriteRequest,
+    AttachReply, AttachRequest, CreateRequest, DetachRequest, ForgetRequest, GetattrRequest,
+    HelloReply, HelloRequest, LookupRequest, MkdirRequest, Opcode, OpenRequest, OpendirRequest,
+    ReadRequest, ReaddirRequest, ReleaseRequest, ReleasedirRequest, ResumeRequest, RmdirRequest,
+    UnlinkRequest, WriteRequest,
 };
-use lbfs_proto::types::{Fh, FileAttr, NodeId};
+use lbfs_proto::types::{Fh, FileAttr, NodeId, SessionTicket};
 use lbfs_server::config::{Allowlist, Config, FsyncPolicy};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -103,6 +104,23 @@ impl TestServer {
         TestServer { addr, export }
     }
 
+    /// A server whose retention knobs are the test's subject: everything else
+    /// stays at the defaults of [`TestServer::start`].
+    pub async fn with_resume(resume_grace: Duration, max_resumable_sessions: usize) -> TestServer {
+        let export = tempfile::tempdir().unwrap();
+        let addr = spawn_server(Config {
+            listen: "127.0.0.1:0".to_string(),
+            allowed_paths: vec![resolved(export.path())],
+            max_inflight: DEFAULT_MAX_INFLIGHT,
+            max_io_size: DEFAULT_MAX_IO_SIZE,
+            fsync: FsyncPolicy::Honor,
+            resume_grace,
+            max_resumable_sessions,
+        })
+        .await;
+        TestServer { addr, export }
+    }
+
     /// The exported directory, as this process sees it.
     pub fn path(&self) -> &Path {
         self.export.path()
@@ -131,6 +149,22 @@ impl TestServer {
             max_inflight,
             max_io_size,
             writeback,
+            false,
+        )
+        .await
+    }
+
+    /// A client that asked to resume, so its `ATTACH` reply carries a ticket
+    /// whenever this server retains sessions. Every other handshake value
+    /// stays at the defaults of [`TestServer::attached`].
+    pub async fn attached_resumable(&self) -> TestClient {
+        TestClient::connect_and_attach_with(
+            self.addr,
+            self.path(),
+            DEFAULT_MAX_INFLIGHT,
+            DEFAULT_MAX_IO_SIZE,
+            false,
+            true,
         )
         .await
     }
@@ -151,13 +185,19 @@ pub async fn serve(
     max_inflight: u32,
     max_io_size: u32,
 ) -> SocketAddr {
-    let cfg = Config {
+    spawn_server(Config {
         listen: "127.0.0.1:0".to_string(),
         allowed_paths,
         max_inflight,
         max_io_size,
         fsync,
-    };
+        resume_grace: Duration::from_secs(60),
+        max_resumable_sessions: 64,
+    })
+    .await
+}
+
+async fn spawn_server(cfg: Config) -> SocketAddr {
     let allow = Allowlist::new(&cfg.allowed_paths).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -279,6 +319,7 @@ pub struct TestClient {
     seen: BTreeSet<u16>,
     settled: Option<HelloReply>,
     root_attr: Option<FileAttr>,
+    ticket: Option<SessionTicket>,
 }
 
 impl TestClient {
@@ -290,6 +331,7 @@ impl TestClient {
             seen: BTreeSet::new(),
             settled: None,
             root_attr: None,
+            ticket: None,
         }
     }
 
@@ -301,6 +343,7 @@ impl TestClient {
             DEFAULT_MAX_INFLIGHT,
             DEFAULT_MAX_IO_SIZE,
             false,
+            false,
         )
         .await
     }
@@ -311,6 +354,7 @@ impl TestClient {
         max_inflight: u32,
         max_io_size: u32,
         writeback: bool,
+        resume: bool,
     ) -> TestClient {
         let mut c = TestClient::connect(addr).await;
         let settled: HelloReply = c
@@ -320,12 +364,14 @@ impl TestClient {
                 max_inflight,
                 max_io_size,
                 writeback,
+                resume,
             })
             .await
             .ok();
         let attach: AttachReply = c.attach(path).await.ok();
         c.settled = Some(settled);
         c.root_attr = Some(attach.root_attr);
+        c.ticket = attach.ticket;
         c
     }
 
@@ -337,6 +383,11 @@ impl TestClient {
     /// The export root's attributes, as ATTACH reported them.
     pub fn root_attr(&self) -> &FileAttr {
         self.root_attr.as_ref().expect("ATTACH has been answered")
+    }
+
+    /// The ticket the `ATTACH` reply carried, if the session got one.
+    pub fn ticket(&self) -> Option<SessionTicket> {
+        self.ticket
     }
 
     /// Every opcode this client has sent, so a matrix test can prove it left
@@ -487,6 +538,19 @@ impl TestClient {
             },
         )
         .await
+    }
+
+    /// RESUME as the second frame: presents a ticket to claim a retained
+    /// session. The raw reply, so a case can assert the refusal status as
+    /// readily as the success.
+    pub async fn resume(&mut self, ticket: SessionTicket) -> Reply {
+        self.call(Opcode::Resume, &ResumeRequest { ticket }).await
+    }
+
+    /// DETACH as an ordinary in-session request: drops the retained session so
+    /// a clean unmount leaves no descriptors resident for the grace.
+    pub async fn detach(&mut self, ticket: SessionTicket) -> Reply {
+        self.call(Opcode::Detach, &DetachRequest { ticket }).await
     }
 
     // --- Sugar for the ops every case needs --------------------------------

@@ -118,17 +118,22 @@ survives. The protocol has no in-band error recovery.
 ### 3.2 Handshake and attach
 
 1. `HELLO` (client → server): magic `LBFS`, proposed limits, and a protocol
-   version — now `2`, and still an exact match, which is the whole point.
+   version — now `3`, and still an exact match, which is the whole point.
    Version `2` adds `kill_suidgid` to the `WRITE` body. postcard ignores
    trailing bytes, so a version-`1` server decoding a version-`2` `WRITE`
    would drop the flag and silently keep a set-user-ID bit the mount
    promised to clear. Refusing the handshake turns that into a startup
    failure an operator can see. Both ends deploy together, so the refusal
-   costs nothing.
+   costs nothing. Version `3` carries a request to resume in `HELLO` and a
+   session ticket in the `ATTACH` reply, and postcard's trailing-byte
+   tolerance is the same reason the match stays exact: a version-`2` server
+   would decode a version-`3` `HELLO` cleanly, drop the request to resume,
+   and grant a mount the client wrongly believes it can re-attach to.
 2. `HELLO` reply: settled protocol version, **max in-flight window**
    (default 128, clamped to [8, 1024]), **max I/O size** (default 1 MiB,
    matches FUSE `max_write`), max body size (64 KiB — bounds xattr values
-   and readdir batches).
+   and readdir batches), and the settled grace, in milliseconds, zero when
+   the server retains nothing.
 3. `ATTACH` (client → server): desired absolute server path as bytes. Server
    opens the path `O_PATH | O_DIRECTORY`, reads the descriptor's true
    resolved path from `/proc/self/fd/N`, matches that resolved path against
@@ -146,6 +151,11 @@ sustain 1 GiB/s; 128 leaves ample depth for metadata bursts.
 
 - `NodeId` (u64): server-assigned, session-scoped, paired with a
   `generation` (u64) to detect reuse; mirrors FUSE's inode protocol.
+- A *session* rather than a connection scopes node ids, generations and
+  handles. A session outlives its socket by the configured grace (§4), and a
+  client re-attaches to it with the ticket `ATTACH` handed it. What a resumed
+  session does and does not restore lives in
+  `docs/superpowers/specs/2026-08-28-session-resumption-design.md`.
 - `Fh` / `Dh` (u64): open file/directory handles from `OPEN`/`CREATE`/
   `OPENDIR`.
 - The client batches `FORGET` frames; they carry `NO_REPLY` and decrement
@@ -162,7 +172,7 @@ sustain 1 GiB/s; 128 leaves ample depth for metadata bursts.
 
 | Group | Ops |
 |---|---|
-| Session | `HELLO`, `ATTACH` |
+| Session | `HELLO`, `ATTACH`, `RESUME`, `DETACH` |
 | Metadata | `LOOKUP`, `FORGET` (batched), `GETATTR`, `SETATTR`, `STATFS` |
 | Namespace | `MKDIR`, `UNLINK`, `RMDIR`, `RENAME` (`NOREPLACE`/`EXCHANGE` flags → `renameat2`), `SYMLINK`, `READLINK`, `LINK` |
 | File I/O | `OPEN`, `CREATE`, `READ`, `WRITE`, `FLUSH`, `RELEASE`, `FSYNC`, `FALLOCATE`, `LSEEK` (`SEEK_DATA`/`SEEK_HOLE`), `COPY_FILE_RANGE` (server-side copy; data never crosses the wire) |
@@ -218,7 +228,15 @@ allowed_paths = ["/srv/exports/*", "/home/*/shared"]
 max_inflight = 128
 max_io_size = "1MiB"
 fsync = "honor"        # or "ignore" — see §6
+resume_grace = "60s"   # "0" turns retention off entirely
+max_resumable_sessions = 64
 ```
+
+`resume_grace` says how long the server holds a session — node table, open
+handles, directory snapshots — after its socket dies, so a client can claim
+it back with `RESUME`. `max_resumable_sessions` caps how many sessions can
+hold a ticket at once; past the cap, `ATTACH` still succeeds and simply mints
+no ticket.
 
 Allowlist: `globset` patterns matched against the **descriptor's resolved
 path** — open `O_PATH | O_DIRECTORY` first, read `/proc/self/fd/N`, then
@@ -452,10 +470,14 @@ the forced sync makes every write durable at a moment the caller picks.
   `lbfs-client <server:port> <remote-path> <mountpoint> [--attr-timeout N]
   [--entry-timeout N] [--allow-other] [--auto-unmount] [--no-writeback]
   [--fuse-threads N] [--fuse-clone-fd]`.
-- **Connection loss:** all in-flight and later ops fail `EIO`; the mount
-  stays present and cleanly unmountable. No transparent reconnect in v1
-  (node/handle state is session-scoped server-side; honest reconnection
-  needs session resumption — the first fast-follow, §11).
+- **Connection loss:** requests in flight at the break fail `EIO`; requests
+  issued afterwards park while the client re-attaches, bounded by
+  `--reconnect-timeout` (10 s default). A server that still holds the
+  session answers `RESUME`, and the mount continues with its node ids,
+  handles and directory cursors intact. A server that does not — a restart,
+  an expired grace, a wrong ticket — leaves the mount dead in the old sense,
+  `EIO` until unmount. The reasoning lives in
+  `docs/superpowers/specs/2026-08-28-session-resumption-design.md`.
 
 ## 8. Error Handling and Edge Cases
 
@@ -464,8 +486,9 @@ the forced sync makes every write durable at a moment the caller picks.
   use distinct protocol statuses so the CLI can say "path not exported"
   instead of bare `EACCES`.
 - **Staleness:** generation-checked `NodeId`s; requests against forgotten or
-  recycled nodes return `ESTALE`. Server restart ⇒ connection drop ⇒ `EIO`
-  until remount (until reconnection lands).
+  recycled nodes return `ESTALE`. A server restart empties the session
+  registry, so it refuses the claim and the mount answers `EIO` until
+  remount. A transport failure to a server that stayed up resumes instead.
 - **Validation before allocation:** `body_len`/`data_len` checked against
   negotiated maxima before any buffer use; violations are connection-fatal.
   Pooled buffers cap peer-driven allocation. Full adversarial hardening is
@@ -568,10 +591,7 @@ check` (fmt + clippy `-D warnings` + tests) is the standard local gate.
 
 Fast-follows (priority order):
 
-1. **Reconnection / session resumption:** re-`ATTACH` on connection loss
-   with re-establishment of node and handle state; requires a session-resume
-   protocol extension (the `HELLO` version field is the vehicle).
-2. ~~**Forced-sync control.**~~ **Done** (2026-08-28) — §6 holds the design.
+1. ~~**Forced-sync control.**~~ **Done** (2026-08-28) — §6 holds the design.
    Both entry points shipped: `setxattr` of `user.lbfs.sync` on the mount root,
    and the client driver's own call after the unmount. Both ride frame flag
    bit 1 on `FSYNCDIR`, and the reply carries the bit back as the server's
@@ -581,6 +601,13 @@ Fast-follows (priority order):
    `FORCE_SYNC` on `FSYNC` and the protocol suite exercises it, but no shipped
    caller sends it. No test yet shows the forced bytes surviving a power cut;
    that needs the VM pair.
+
+**Session resumption landed** (2026-09-07) — the first fast-follow, out of
+the list. The server retains a session for a configured grace after its
+socket dies, and the client claims it back with `RESUME` under a ticket
+minted at `ATTACH`; §3.2, §3.3, §4, §7 and §8 record the behaviour, and
+`docs/superpowers/specs/2026-08-28-session-resumption-design.md` holds the
+design.
 
 Long-term direction: lbfs grows toward a single-writer, multi-reader,
 volatile overlay filesystem tuned for CI and build systems. Build hosts
@@ -711,6 +738,22 @@ Future work:
   is on tape — would add a `flags` field there and a protocol version bump. The
   field does not exist yet because nothing has needed it, and inventing it
   would put FUSE vocabulary inside the `FileSystem` trait (§5.1).
+- **A persistent-session design over `name_to_handle_at`/`open_by_handle_at`**,
+  so a session survives a server restart. It needs `CAP_DAC_READ_SEARCH`,
+  filesystem support for file handles, and an answer to what a stale handle
+  means after inode reuse — a separate design (session-resumption design §11).
+- **The cold re-attach with a poisoned id space:** a fresh `ATTACH` after a
+  refused claim whose node counter starts far above anything the dead session
+  issued, so remembered ids answer `ESTALE` rather than alias
+  (session-resumption design §5).
+- **A session-level `FORGET` queue that survives a connection swap.** The
+  batcher dies with its connection today, and the nodes behind its queued
+  forgets stay resident for the life of the retained session
+  (session-resumption design §9).
+- **Reclaiming the lookup counts and handles stranded by requests that died
+  in the gap** — at most `max_inflight` per reconnect. It needs undo records
+  and a cumulative acknowledgement, the machinery the session-resumption
+  design declines (§3.1, §13).
 
 Noted and deferred:
 

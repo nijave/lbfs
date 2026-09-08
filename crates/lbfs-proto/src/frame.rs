@@ -1,11 +1,13 @@
 pub const HEADER_LEN: usize = 24;
 pub const MAGIC: [u8; 4] = *b"LBFS";
-/// Version 2 added `WriteRequest.kill_suidgid`. postcard ignores trailing
-/// bytes instead of refusing them, so a version-1 peer would decode a
-/// version-2 `WRITE` body cleanly and drop the flag — losing a set-user-ID
-/// strip in silence. The exact-match handshake is what turns that into a
-/// visible startup failure.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Version 3 adds session resumption: `HelloRequest.resume`,
+/// `HelloReply.resume_grace_ms`, a ticket on the `ATTACH` reply, and the
+/// `RESUME`/`DETACH` opcodes. The match stays exact for the reason version 2
+/// made it exact — postcard ignores trailing bytes rather than refusing them,
+/// so a version-2 server would decode a version-3 `HELLO` cleanly, drop the
+/// resume request, and hand back a mount the client wrongly believes it can
+/// re-attach to.
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 9423;
 pub const DEFAULT_MAX_INFLIGHT: u32 = 128;
 pub const WINDOW_CLAMP: (u32, u32) = (8, 1024);
@@ -31,6 +33,9 @@ pub const STATUS_OK: u16 = 0;
 pub const STATUS_VERSION_MISMATCH: u16 = 0xFF01;
 pub const STATUS_ATTACH_DENIED: u16 = 0xFF02;
 pub const STATUS_NOT_EXPORTED: u16 = 0xFF03;
+pub const STATUS_NO_SESSION: u16 = 0xFF04;
+pub const STATUS_SESSION_BUSY: u16 = 0xFF05;
+pub const STATUS_SESSION_MISMATCH: u16 = 0xFF06;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -135,6 +140,33 @@ mod tests {
         #[test]
         fn decode_any_24_bytes_never_panics(bytes in prop::array::uniform24(any::<u8>())) {
             let _ = FrameHeader::decode(&bytes);
+        }
+    }
+
+    /// Version 3 is the session-resumption protocol, and its three refusal
+    /// statuses must be protocol statuses (>= 0xFF00), distinct from each
+    /// other and from the three that already exist.
+    #[test]
+    fn version_three_and_the_session_statuses() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+        let new = [
+            STATUS_NO_SESSION,
+            STATUS_SESSION_BUSY,
+            STATUS_SESSION_MISMATCH,
+        ];
+        let old = [
+            STATUS_VERSION_MISMATCH,
+            STATUS_ATTACH_DENIED,
+            STATUS_NOT_EXPORTED,
+        ];
+        for (i, s) in new.iter().enumerate() {
+            assert!(*s >= 0xFF00, "a protocol status lives above 0xFF00");
+            for later in &new[i + 1..] {
+                assert_ne!(s, later);
+            }
+            for o in &old {
+                assert_ne!(s, o);
+            }
         }
     }
 }

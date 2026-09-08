@@ -2,6 +2,12 @@ use lbfs_proto::frame::{DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE, WINDOW_CLAMP}
 use serde::Deserialize;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
+use std::time::Duration;
+
+/// How long a session outlives its socket when the file says nothing.
+const DEFAULT_RESUME_GRACE: Duration = Duration::from_secs(60);
+/// How many sessions may hold a resume ticket at once, by default.
+const DEFAULT_MAX_RESUMABLE_SESSIONS: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -9,6 +15,8 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("bad size literal: {0}")]
     BadSize(String),
+    #[error("bad duration literal: {0}")]
+    BadDuration(String),
     #[error("bad glob: {0}")]
     BadGlob(#[from] globset::Error),
 }
@@ -24,7 +32,7 @@ pub enum FsyncPolicy {
 ///
 /// `deny_unknown_fields` because the alternative is silence. `listen` and
 /// `allowed_paths` are required, so a typo in either already stops the server.
-/// The other three have defaults, and a typo in one of those changes nothing:
+/// The other keys have defaults, and a typo in one of those changes nothing:
 /// the server starts and runs on the default the operator was trying to
 /// override. `fsync_policy = "ignore"` for `fsync = "ignore"` leaves durability
 /// where the operator did not want it, and says so nowhere. A refusal at
@@ -37,6 +45,8 @@ struct RawConfig {
     max_inflight: Option<u32>,
     max_io_size: Option<String>,
     fsync: Option<FsyncPolicy>,
+    resume_grace: Option<String>,
+    max_resumable_sessions: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -46,6 +56,15 @@ pub struct Config {
     pub max_inflight: u32,
     pub max_io_size: u32,
     pub fsync: FsyncPolicy,
+    /// How long the server holds a session — node table, open handles,
+    /// directory snapshots — after its socket dies, so a client can claim it
+    /// back with `RESUME`. `resume_grace = "0"` turns retention off entirely,
+    /// so an operator who wants the old die-with-the-socket behaviour has one
+    /// switch.
+    pub resume_grace: Duration,
+    /// How many sessions may hold a resume ticket at once. Past the cap,
+    /// `ATTACH` still succeeds and simply mints no ticket.
+    pub max_resumable_sessions: usize,
 }
 
 impl Config {
@@ -54,6 +73,10 @@ impl Config {
         let max_io_size = match raw.max_io_size {
             Some(ref lit) => parse_size(lit)?,
             None => DEFAULT_MAX_IO_SIZE,
+        };
+        let resume_grace = match raw.resume_grace {
+            Some(ref lit) => parse_duration(lit)?,
+            None => DEFAULT_RESUME_GRACE,
         };
         Ok(Config {
             listen: raw.listen,
@@ -64,6 +87,10 @@ impl Config {
                 .clamp(WINDOW_CLAMP.0, WINDOW_CLAMP.1),
             max_io_size,
             fsync: raw.fsync.unwrap_or(FsyncPolicy::Honor),
+            resume_grace,
+            max_resumable_sessions: raw
+                .max_resumable_sessions
+                .unwrap_or(DEFAULT_MAX_RESUMABLE_SESSIONS),
         })
     }
 }
@@ -82,6 +109,26 @@ pub fn parse_size(s: &str) -> Result<u32, ConfigError> {
     };
     let v: u64 = digits.trim().parse().map_err(|_| bad())?;
     u32::try_from(v.checked_mul(mult).ok_or_else(bad)?).map_err(|_| bad())
+}
+
+/// Mirrors [`parse_size`]: widen to `u64` before scaling, and refuse anything
+/// that does not parse whole. `"60s"` and `"500ms"` mean what they say; a bare
+/// number is seconds; `"0"` is the switch that turns retention off, so an
+/// operator who wants the old die-with-the-socket behaviour has one.
+pub fn parse_duration(s: &str) -> Result<Duration, ConfigError> {
+    let bad = || ConfigError::BadDuration(s.to_string());
+    // "ms" before "s": every millisecond literal also ends in "s".
+    let (digits, unit_ms) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1000u64)
+    } else {
+        (s, 1000u64)
+    };
+    let v: u64 = digits.trim().parse().map_err(|_| bad())?;
+    Ok(Duration::from_millis(
+        v.checked_mul(unit_ms).ok_or_else(bad)?,
+    ))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,6 +249,55 @@ mod tests {
         .unwrap();
         assert!(matches!(cfg.fsync, FsyncPolicy::Ignore));
         assert_eq!(cfg.max_inflight, 1024); // clamped
+    }
+
+    #[test]
+    fn parses_durations() {
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        // A bare number means seconds, and "0" is the off switch.
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        assert!(parse_duration("60x").is_err());
+        assert!(parse_duration("-1").is_err());
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn resume_keys_default_and_parse() {
+        // Neither key present: 60 seconds of grace, 64 sessions.
+        let cfg = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:9423"
+            allowed_paths = ["/srv/exports/*"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resume_grace, Duration::from_secs(60));
+        assert_eq!(cfg.max_resumable_sessions, 64);
+
+        // "0" turns retention off entirely.
+        let cfg = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:9423"
+            allowed_paths = ["/srv/exports/*"]
+            resume_grace = "0"
+            max_resumable_sessions = 8
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resume_grace, Duration::ZERO);
+        assert_eq!(cfg.max_resumable_sessions, 8);
+
+        // `deny_unknown_fields` stays on: a misspelt new key is a refusal.
+        assert!(Config::from_toml(
+            r#"
+            listen = "127.0.0.1:9423"
+            allowed_paths = ["/srv/exports/*"]
+            resume_graze = "60s"
+        "#,
+        )
+        .is_err());
     }
 
     /// A misspelt key is refused, and the message names it.

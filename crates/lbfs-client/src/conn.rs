@@ -41,11 +41,14 @@
 //!   segment under the *body* bound rather than the I/O bound. A client that
 //!   policed inbound data with `max_io_size` alone would kill its own
 //!   connection on a legal 64 KiB xattr over a session that settled on 4096.
-//! * **A dead connection stays dead.** There is no reconnect in v1 (spec §7):
-//!   node ids, handles and lookup counts are session state the server drops
-//!   with the socket, so pretending otherwise would hand the caller a handle
-//!   that names nothing. Every pending caller gets `EIO`, every later call
-//!   gets `EIO` immediately, and the mount stays unmountable-clean.
+//! * **A dead connection stays dead.** Node ids, handles and lookup counts are
+//!   session state, so a `Connection` that has failed cannot be revived without
+//!   handing the caller a handle that names nothing. Every pending caller gets
+//!   `EIO`, every later call gets `EIO` immediately, and the mount stays
+//!   unmountable-clean. [`Connection::closed`] reports that death to whoever
+//!   wants to dial a *new* connection, and [`Connection::resume`] is how that
+//!   caller builds one over the same server-side session — a second
+//!   `Connection`, never a revival of the first.
 
 use std::collections::HashMap;
 use std::io;
@@ -56,22 +59,22 @@ use std::time::Duration;
 
 use lbfs_proto::frame::{
     FrameHeader, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_IO_SIZE, FLAG_FORCE_SYNC, FLAG_NO_REPLY, MAGIC,
-    MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_ATTACH_DENIED, STATUS_NOT_EXPORTED, STATUS_OK,
-    STATUS_VERSION_MISMATCH, WINDOW_CLAMP,
+    MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_ATTACH_DENIED, STATUS_NOT_EXPORTED, STATUS_NO_SESSION,
+    STATUS_OK, STATUS_SESSION_BUSY, STATUS_SESSION_MISMATCH, STATUS_VERSION_MISMATCH, WINDOW_CLAMP,
 };
 use lbfs_proto::io::{read_body, read_header, write_frame, IoError};
 use lbfs_proto::ops::{
     AttachReply, AttachRequest, CopyFileRangeReply, CopyFileRangeRequest, CreateReply,
-    CreateRequest, FallocateRequest, FlushRequest, ForgetRequest, FsyncRequest, FsyncdirRequest,
-    GetattrRequest, GetxattrRequest, HelloReply, HelloRequest, LinkRequest, ListxattrRequest,
-    LookupRequest, LseekReply, LseekRequest, MkdirRequest, Opcode, OpenReply, OpenRequest,
-    OpendirReply, OpendirRequest, ReadRequest, ReaddirReply, ReaddirRequest, ReaddirplusReply,
-    ReadlinkReply, ReadlinkRequest, ReleaseRequest, ReleasedirRequest, RemovexattrRequest,
-    RenameRequest, RmdirRequest, SetattrRequest, SetxattrRequest, StatfsRequest, SymlinkRequest,
-    UnlinkRequest, WriteReply, WriteRequest,
+    CreateRequest, DetachRequest, FallocateRequest, FlushRequest, ForgetRequest, FsyncRequest,
+    FsyncdirRequest, GetattrRequest, GetxattrRequest, HelloReply, HelloRequest, LinkRequest,
+    ListxattrRequest, LookupRequest, LseekReply, LseekRequest, MkdirRequest, Opcode, OpenReply,
+    OpenRequest, OpendirReply, OpendirRequest, ReadRequest, ReaddirReply, ReaddirRequest,
+    ReaddirplusReply, ReadlinkReply, ReadlinkRequest, ReleaseRequest, ReleasedirRequest,
+    RemovexattrRequest, RenameRequest, ResumeReply, ResumeRequest, RmdirRequest, SetattrRequest,
+    SetxattrRequest, StatfsRequest, SymlinkRequest, UnlinkRequest, WriteReply, WriteRequest,
 };
 use lbfs_proto::types::{
-    Entry, Fh, FileAttr, NodeId, SetattrArgs, StatfsReply, XattrReply, ROOT_NODE,
+    Entry, Fh, FileAttr, NodeId, SessionTicket, SetattrArgs, StatfsReply, XattrReply, ROOT_NODE,
 };
 use lbfs_proto::Errno;
 use serde::de::DeserializeOwned;
@@ -79,7 +82,7 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 /// The smallest I/O ceiling this client will accept from a server.
@@ -160,6 +163,16 @@ pub enum ConnectError {
     Attach(u16),
     #[error("the server did not finish the handshake in time")]
     TimedOut,
+    /// The three refusals a `RESUME` can meet, typed for the same reason the
+    /// handshake statuses above are: the reconnect supervisor decides between
+    /// retrying and surrendering on them, and a decision that hung on parsing a
+    /// formatted message would be a mount lost to a reworded string.
+    #[error("the server no longer holds this session")]
+    NoSession,
+    #[error("another connection still holds this session")]
+    SessionBusy,
+    #[error("this handshake settled a different shape than the retained session")]
+    SessionMismatch,
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
 }
@@ -189,6 +202,19 @@ pub struct Proposal {
     /// page cache and the file size, which changes how the server reads an
     /// `OPEN`'s flags. Only the client knows it, so it travels in `HELLO`.
     pub writeback: bool,
+    /// Whether this client intends to re-attach to its session after a
+    /// disconnection.
+    ///
+    /// Off by default, which is the whole of the compatibility story: every
+    /// direct caller of this library keeps today's teardown semantics — no
+    /// ticket in the `ATTACH` reply, no session retained past its socket, no
+    /// parking — until it says otherwise. The shipped binary says otherwise.
+    ///
+    /// It also has to be *the same* on a claim as it was on the mint. The
+    /// server stores the settled shape as the registry's guard and this flag
+    /// rides inside it, so a reconnecting client that dropped the request would
+    /// meet `STATUS_SESSION_MISMATCH` rather than its own session.
+    pub resume: bool,
     /// How long [`Connection::connect_with`] waits for the whole approach —
     /// TCP, `HELLO`, `ATTACH` — before giving up with
     /// [`ConnectError::TimedOut`].
@@ -207,6 +233,7 @@ impl Default for Proposal {
             // Spec §7: on by default, because letting the kernel aggregate
             // small writes is the largest single win for build workloads.
             writeback: true,
+            resume: false,
             handshake_timeout: CONNECT_TIMEOUT,
         }
     }
@@ -277,6 +304,9 @@ struct Shared {
     /// of the batcher was full. Only the first is worth a warning; the rest
     /// would be a log flood at exactly the moment the connection is in trouble.
     dropped_forgets: AtomicU64,
+    /// Woken once, by [`Shared::kill`], for every waiter parked in
+    /// [`Connection::closed`].
+    died: Arc<Notify>,
 }
 
 impl Shared {
@@ -335,6 +365,13 @@ impl Shared {
             Table::Dead => return,
         };
         self.dead.store(true, Ordering::Release);
+        // After the store, never before: a waiter that misses the notification
+        // re-reads `dead` and finds it set. See [`Connection::closed`].
+        //
+        // `notify_waiters` rather than `notify_one`, because every waiter has to
+        // learn — and a stored permit for a waiter that has not arrived yet
+        // would be wrong here, since that waiter reads `dead` instead.
+        self.died.notify_waiters();
         // Wakes callers parked waiting for a permit, which would otherwise
         // wait on a window that can never open again.
         self.window.close();
@@ -372,6 +409,14 @@ pub struct Connection {
     reader: JoinHandle<()>,
     /// What the handshake settled, verbatim from the server.
     pub limits: HelloReply,
+    /// What this session's `ATTACH` minted, and what every later claim on it
+    /// presents. `None` when either end declined retention.
+    ///
+    /// It sits on the connection because the connection is what learned it, and
+    /// it survives a claim unchanged: a `Connection` built by
+    /// [`Connection::resume`] carries the ticket it presented, so the session
+    /// above can be rebuilt from either kind without a special case.
+    pub ticket: Option<SessionTicket>,
 }
 
 impl Drop for Connection {
@@ -429,53 +474,100 @@ impl Connection {
             dial(addr, export_path, &proposal),
         )
         .await;
-        let (sock, settled, root_attr) = match dialled {
+        let (sock, settled, root_attr, ticket) = match dialled {
             Ok(result) => result?,
             Err(_) => {
                 tracing::error!(%addr, timeout = ?proposal.handshake_timeout, "handshake timed out");
                 return Err(ConnectError::TimedOut);
             }
         };
-
-        let (read_half, write_half) = sock.into_split();
-        let shared = Arc::new(Shared {
-            table: Mutex::new(Table::Live(HashMap::new())),
-            dead: AtomicBool::new(false),
-            next_id: AtomicU64::new(3),
-            window: Arc::new(Semaphore::new(settled.max_inflight as usize)),
-            dropped_forgets: AtomicU64::new(0),
-        });
-        let (out_tx, out_rx) = mpsc::channel(settled.max_inflight as usize + OUT_SLACK);
-        let (forget_tx, forget_rx) = mpsc::channel(FORGET_QUEUE);
-
-        let reader = tokio::spawn(reader_task(
-            read_half,
-            Arc::clone(&shared),
-            inbound_data_bound(&settled),
-        ));
-        tokio::spawn(writer_task(write_half, out_rx, Arc::clone(&shared)));
-        tokio::spawn(forget_task(forget_rx, out_tx.clone(), Arc::clone(&shared)));
-
         tracing::info!(
             %addr,
             max_inflight = settled.max_inflight,
             max_io_size = settled.max_io_size,
             writeback = proposal.writeback,
+            resumable = ticket.is_some(),
             "attached"
         );
-        let conn = Arc::new(Connection {
-            shared,
-            out_tx,
-            forget_tx,
-            reader,
-            limits: settled.clone(),
-        });
+        let conn = start(sock, &settled, ticket);
+        Ok((conn, settled, root_attr))
+    }
+
+    /// Re-attach to a session this client already holds a ticket for.
+    ///
+    /// The sibling of [`connect_with`](Connection::connect_with), and
+    /// deliberately the same shape: one dial, one `HELLO` checked by the same
+    /// [`check_settled`], one second frame, all under the one end-to-end
+    /// timeout. `RESUME` stands where `ATTACH` stands, and the reply's
+    /// `root_attr` is the export root freshly stat'd — the same value `ATTACH`
+    /// reports, for a caller that wants it.
+    ///
+    /// The three session refusals come back as
+    /// [`ConnectError::NoSession`], [`ConnectError::SessionBusy`] and
+    /// [`ConnectError::SessionMismatch`]. That distinction is the supervisor's
+    /// whole decision: `Busy` means the server holds the session and has not
+    /// noticed the old socket, so coming back works; the other two mean the
+    /// answer will not change, and the mount is over (design §8.2).
+    ///
+    /// `export_path` never reaches the wire — a claim names a session, not a
+    /// path, and the server does not re-verify its allowlist (design §13). It
+    /// is here for the log line, which is the one place an operator gets to see
+    /// which mount came back.
+    pub async fn resume(
+        addr: SocketAddr,
+        export_path: &[u8],
+        proposal: Proposal,
+        ticket: SessionTicket,
+    ) -> Result<(Arc<Connection>, HelloReply, FileAttr), ConnectError> {
+        let dialled =
+            tokio::time::timeout(proposal.handshake_timeout, redial(addr, &proposal, ticket)).await;
+        let (sock, settled, root_attr) = match dialled {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::warn!(%addr, timeout = ?proposal.handshake_timeout, "RESUME timed out");
+                return Err(ConnectError::TimedOut);
+            }
+        };
+        tracing::info!(
+            %addr,
+            export = %String::from_utf8_lossy(export_path),
+            session = ticket.id,
+            "re-attached to the retained session"
+        );
+        let conn = start(sock, &settled, Some(ticket));
         Ok((conn, settled, root_attr))
     }
 
     /// Whether the connection has failed. Once true, never false again.
     pub fn is_dead(&self) -> bool {
         self.shared.is_dead()
+    }
+
+    /// Resolve when this connection dies, and at once if it already has.
+    ///
+    /// The signal a caller above this layer needs to dial a replacement without
+    /// polling `is_dead`. It reports the death and changes nothing about it: a
+    /// dead `Connection` still answers `EIO` for ever, and whatever wakes here
+    /// builds a *new* one.
+    ///
+    /// The two checks around the registration are the whole of the correctness.
+    /// `notify_waiters` wakes the waiters registered at the moment it runs and
+    /// stores nothing for later, so a death between the first check and the
+    /// registration would be missed for ever. `enable` registers the waiter
+    /// before the future is awaited, which lets the second check cover exactly
+    /// that window — `kill` stores `dead` before it notifies, so a waiter that
+    /// misses the notification reads the flag instead.
+    pub async fn closed(&self) {
+        if self.shared.is_dead() {
+            return;
+        }
+        let notified = self.shared.died.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.shared.is_dead() {
+            return;
+        }
+        notified.await;
     }
 
     /// One request, one reply, correlated.
@@ -659,7 +751,10 @@ impl Connection {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // The connection is gone, and with it the whole node table:
-                // there is nothing left to decrement (spec §8).
+                // there is nothing left to decrement (spec §8). Still counted —
+                // `destroy` reports every forget the mount never delivered,
+                // whatever the reason it was dropped.
+                self.shared.dropped_forgets.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(node, nlookup, "connection is gone; dropping FORGET");
             }
         }
@@ -1130,6 +1225,22 @@ impl Connection {
         Ok((reply.size, data))
     }
 
+    /// End this session's retention now, rather than at the end of its grace.
+    ///
+    /// An ordinary in-session request, and one the caller waits for. The socket
+    /// closing cannot carry this meaning: a crashed client closes its socket
+    /// exactly the way a polite one does, and the crashed client is the case
+    /// retention exists for (design §7.5). The connection goes on serving
+    /// afterwards — `DETACH` ends the *session's* retention, not the socket —
+    /// so a clean unmount can flush and forget over it and only then let go.
+    ///
+    /// `ESTALE` means the server did not recognise the ticket: something
+    /// dropped this session already, or the caller cannot prove it owns one.
+    pub async fn detach(&self, ticket: SessionTicket) -> Result<(), Errno> {
+        self.call_unit(Opcode::Detach, &DetachRequest { ticket })
+            .await
+    }
+
     pub async fn removexattr(&self, node: NodeId, name: &[u8]) -> Result<(), Errno> {
         self.call_unit(
             Opcode::Removexattr,
@@ -1155,14 +1266,65 @@ async fn dial(
     addr: SocketAddr,
     export_path: &[u8],
     proposal: &Proposal,
-) -> Result<(TcpStream, HelloReply, FileAttr), ConnectError> {
+) -> Result<(TcpStream, HelloReply, FileAttr, Option<SessionTicket>), ConnectError> {
     let mut sock = TcpStream::connect(addr).await?;
     configure_socket(&sock)?;
     // Ids 1 and 2 belong to the handshake; the session's counter starts after
     // them so no id is ever reused on this connection.
     let settled = hello(&mut sock, proposal).await?;
-    let root_attr = attach(&mut sock, export_path).await?;
+    let (root_attr, ticket) = attach(&mut sock, export_path).await?;
+    Ok((sock, settled, root_attr, ticket))
+}
+
+/// The same approach for a connection that claims a session instead of making
+/// one: `RESUME` in `ATTACH`'s place, under the same one timeout.
+async fn redial(
+    addr: SocketAddr,
+    proposal: &Proposal,
+    ticket: SessionTicket,
+) -> Result<(TcpStream, HelloReply, FileAttr), ConnectError> {
+    let mut sock = TcpStream::connect(addr).await?;
+    configure_socket(&sock)?;
+    let settled = hello(&mut sock, proposal).await?;
+    let root_attr = claim(&mut sock, ticket).await?;
     Ok((sock, settled, root_attr))
+}
+
+/// The multiplexer over a socket whose handshake is settled: three tasks and
+/// the tables they share.
+///
+/// Shared by both entry points, which have nothing to disagree about past the
+/// second frame — a resumed connection multiplexes exactly as a fresh one does,
+/// and the session it serves cannot tell the difference.
+fn start(sock: TcpStream, settled: &HelloReply, ticket: Option<SessionTicket>) -> Arc<Connection> {
+    let (read_half, write_half) = sock.into_split();
+    let shared = Arc::new(Shared {
+        table: Mutex::new(Table::Live(HashMap::new())),
+        dead: AtomicBool::new(false),
+        next_id: AtomicU64::new(3),
+        window: Arc::new(Semaphore::new(settled.max_inflight as usize)),
+        dropped_forgets: AtomicU64::new(0),
+        died: Arc::new(Notify::new()),
+    });
+    let (out_tx, out_rx) = mpsc::channel(settled.max_inflight as usize + OUT_SLACK);
+    let (forget_tx, forget_rx) = mpsc::channel(FORGET_QUEUE);
+
+    let reader = tokio::spawn(reader_task(
+        read_half,
+        Arc::clone(&shared),
+        inbound_data_bound(settled),
+    ));
+    tokio::spawn(writer_task(write_half, out_rx, Arc::clone(&shared)));
+    tokio::spawn(forget_task(forget_rx, out_tx.clone(), Arc::clone(&shared)));
+
+    Arc::new(Connection {
+        shared,
+        out_tx,
+        forget_tx,
+        reader,
+        limits: settled.clone(),
+        ticket,
+    })
 }
 
 async fn hello(sock: &mut TcpStream, proposal: &Proposal) -> Result<HelloReply, ConnectError> {
@@ -1172,6 +1334,7 @@ async fn hello(sock: &mut TcpStream, proposal: &Proposal) -> Result<HelloReply, 
         max_inflight: proposal.max_inflight,
         max_io_size: proposal.max_io_size,
         writeback: proposal.writeback,
+        resume: proposal.resume,
     };
     let reply = exchange(sock, 1, Opcode::Hello, &req).await?;
     match reply.status {
@@ -1234,7 +1397,10 @@ fn check_settled(proposal: &Proposal, settled: &HelloReply) -> Result<(), Connec
     Ok(())
 }
 
-async fn attach(sock: &mut TcpStream, export_path: &[u8]) -> Result<FileAttr, ConnectError> {
+async fn attach(
+    sock: &mut TcpStream,
+    export_path: &[u8],
+) -> Result<(FileAttr, Option<SessionTicket>), ConnectError> {
     let req = AttachRequest {
         path: export_path.to_vec(),
     };
@@ -1251,7 +1417,31 @@ async fn attach(sock: &mut TcpStream, export_path: &[u8]) -> Result<FileAttr, Co
     }
     let attached: AttachReply = postcard::from_bytes(&reply.body)
         .map_err(|_| ConnectError::Protocol("malformed ATTACH reply body"))?;
-    Ok(attached.root_attr)
+    Ok((attached.root_attr, attached.ticket))
+}
+
+/// The resuming second frame: present the ticket, take the root's attributes
+/// back, or learn which of the three refusals this is.
+///
+/// The secret is never logged, here or anywhere — it is the whole of the
+/// authentication a claim carries (design §6.2), and a log file is a place
+/// tickets outlive the sessions they name.
+async fn claim(sock: &mut TcpStream, ticket: SessionTicket) -> Result<FileAttr, ConnectError> {
+    let reply = exchange(sock, 2, Opcode::Resume, &ResumeRequest { ticket }).await?;
+    match reply.status {
+        STATUS_OK => {}
+        STATUS_NO_SESSION => return Err(ConnectError::NoSession),
+        STATUS_SESSION_BUSY => return Err(ConnectError::SessionBusy),
+        STATUS_SESSION_MISMATCH => return Err(ConnectError::SessionMismatch),
+        errno @ 1..=4095 => return Err(ConnectError::Attach(errno)),
+        status => {
+            tracing::error!(status, "RESUME answered with an unexpected status");
+            return Err(ConnectError::Protocol("RESUME was refused"));
+        }
+    }
+    let resumed: ResumeReply = postcard::from_bytes(&reply.body)
+        .map_err(|_| ConnectError::Protocol("malformed RESUME reply body"))?;
+    Ok(resumed.root_attr)
 }
 
 /// One request and its reply, written and read inline.
@@ -1436,6 +1626,7 @@ async fn flush_forgets(
     out: &mpsc::Sender<Outbound>,
     shared: &Shared,
 ) -> bool {
+    let count = items.len() as u64;
     let body = match postcard::to_allocvec(&ForgetRequest { items }) {
         Ok(body) => body,
         Err(e) => {
@@ -1458,6 +1649,12 @@ async fn flush_forgets(
             data: Vec::new(),
         })
         .await;
+    if queued.is_err() {
+        // The writer is gone, so this whole batch was dropped: into the same
+        // tally as the queue-full drops, so `destroy` reports every forget the
+        // mount never delivered.
+        shared.dropped_forgets.fetch_add(count, Ordering::Relaxed);
+    }
     queued.is_ok()
 }
 
@@ -1508,6 +1705,7 @@ mod tests {
             max_inflight: 128,
             max_io_size,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         }
     }
 
@@ -1593,6 +1791,7 @@ mod tests {
             max_inflight: WINDOW_CLAMP.0,
             max_io_size: MIN_IO_SIZE,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         };
         assert!(check_settled(&tiny, &answer).is_ok());
     }

@@ -26,10 +26,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::Duration;
 
 use lbfs_proto::frame::{
     FrameHeader, FLAG_FORCE_SYNC, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE, PROTOCOL_VERSION,
-    STATUS_ATTACH_DENIED, STATUS_NOT_EXPORTED, WINDOW_CLAMP,
+    STATUS_ATTACH_DENIED, STATUS_NOT_EXPORTED, STATUS_NO_SESSION, STATUS_SESSION_BUSY,
+    STATUS_SESSION_MISMATCH, WINDOW_CLAMP,
 };
 use lbfs_proto::ops::*;
 use lbfs_proto::types::*;
@@ -47,6 +49,7 @@ fn hello_request(max_inflight: u32, max_io_size: u32) -> HelloRequest {
         max_inflight,
         max_io_size,
         writeback: false,
+        resume: false,
     }
 }
 
@@ -86,6 +89,7 @@ async fn the_handshake_settles_and_echoes_the_limits() {
             max_inflight: WINDOW_CLAMP.0,
             max_io_size: 4096,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         }
     );
 
@@ -99,11 +103,12 @@ async fn the_handshake_settles_and_echoes_the_limits() {
             max_inflight: SERVER_WINDOW,
             max_io_size: SERVER_IO,
             max_body_size: MAX_BODY_SIZE,
+            resume_grace_ms: 0,
         }
     );
     // `writeback` is the client's alone and gets no echo, but it is a
     // positional field in the HELLO body: a session that reached ATTACH proves
-    // the server read the five-field handshake this client sent.
+    // the server read the six-field handshake this client sent.
     assert_eq!(c.root_attr().mode & libc::S_IFMT, libc::S_IFDIR);
 }
 
@@ -256,6 +261,571 @@ async fn attach_separates_not_exported_from_denied() {
         c.attach(&exports.join("file")).await.status,
         STATUS_NOT_EXPORTED
     );
+}
+
+// ---------------------------------------------------------------------------
+// Session retention: the advertised grace and the minted ticket
+// ---------------------------------------------------------------------------
+
+/// [`hello_request`] with the resume ask set: the shape of every handshake a
+/// reconnecting client sends.
+fn hello_resuming(max_inflight: u32, max_io_size: u32) -> HelloRequest {
+    HelloRequest {
+        resume: true,
+        ..hello_request(max_inflight, max_io_size)
+    }
+}
+
+/// The grace is advertised only to a client that asked to resume, so a client
+/// that never will is never tempted to believe its sessions are retained.
+#[tokio::test]
+async fn a_hello_that_asks_to_resume_learns_the_grace() {
+    let srv = TestServer::start().await;
+
+    let mut c = srv.connect().await;
+    let asked: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(
+        asked.resume_grace_ms, 60_000,
+        "the configured grace, in milliseconds"
+    );
+
+    let mut c = srv.connect().await;
+    let silent: HelloReply = c.hello(&hello_request(SERVER_WINDOW, SERVER_IO)).await.ok();
+    assert_eq!(
+        silent.resume_grace_ms, 0,
+        "a client that did not ask is told nothing is retained"
+    );
+}
+
+/// A ticket exists exactly when both sides asked for retention.
+#[tokio::test]
+async fn an_attach_that_asked_to_resume_gets_a_ticket() {
+    let srv = TestServer::start().await;
+
+    let ticket = srv
+        .attached_resumable()
+        .await
+        .ticket()
+        .expect("a resume-asking attach mints a ticket");
+    assert_eq!(
+        ticket.grace_ms, 60_000,
+        "the ticket carries the grace the server will honour"
+    );
+
+    let c = srv.attached().await;
+    assert!(
+        c.ticket().is_none(),
+        "a client that did not ask to resume gets no ticket"
+    );
+}
+
+/// `resume_grace = "0"` turns retention off: the handshake still succeeds,
+/// and nothing about it hints at a session that will be retained.
+#[tokio::test]
+async fn a_server_with_resume_grace_zero_mints_no_ticket() {
+    let srv = TestServer::with_resume(Duration::ZERO, 64).await;
+
+    let mut c = srv.connect().await;
+    let settled: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(
+        settled.resume_grace_ms, 0,
+        "retention off is advertised as a zero grace, whatever the client asked"
+    );
+
+    let attach: AttachReply = c.attach(srv.path()).await.ok();
+    assert!(
+        attach.ticket.is_none(),
+        "a server that retains nothing must not hand out a ticket"
+    );
+}
+
+/// Two sessions never share an id or a secret, so one mount's ticket cannot
+/// land on another mount's session.
+#[tokio::test]
+async fn two_attaches_that_asked_to_resume_mint_distinct_tickets() {
+    let srv = TestServer::start().await;
+    let a = srv.attached_resumable().await.ticket().unwrap();
+    let b = srv.attached_resumable().await.ticket().unwrap();
+    assert_ne!(a.id, b.id, "ids are never reused inside one process");
+    assert_ne!(a.secret, b.secret, "secrets differ between mints");
+}
+
+// ---------------------------------------------------------------------------
+// RESUME: claiming a retained session back
+// ---------------------------------------------------------------------------
+
+// The whole point of this suite (design §3, §7.4). Every case attaches with a
+// ticket, drops the socket, and claims the session back on a fresh one — then
+// proves the claim restored exactly what retention promised and refused
+// exactly what it must.
+
+/// Reconnect and RESUME with `ticket`, retrying past the brief `SESSION_BUSY`
+/// the old socket's teardown opens before its `release` runs (design §6.3, the
+/// half-open window the real client also retries through). Asserts the claim
+/// finally succeeds and returns the resumed client, positioned to issue
+/// requests against the same node table and handles.
+async fn resume_ok(srv: &TestServer, ticket: SessionTicket) -> TestClient {
+    for _ in 0..200 {
+        let mut c = srv.connect().await;
+        let _: HelloReply = c
+            .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+            .await
+            .ok();
+        let reply = c.resume(ticket).await;
+        if reply.status == STATUS_SESSION_BUSY {
+            // The old socket has not released yet. Drop this attempt and let it.
+            drop(c);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        reply.expect_ok();
+        return c;
+    }
+    panic!("RESUME never got past SESSION_BUSY");
+}
+
+/// The happy path: the old `NodeId` still resolves and the old `Fh` still
+/// reads the same bytes, because the session object never went away.
+#[tokio::test]
+async fn resume_hands_back_the_same_nodes_and_handles() {
+    let srv = TestServer::start().await;
+    std::fs::write(srv.join("f"), b"page one").unwrap();
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().expect("a resumable attach carries a ticket");
+
+    let ent: Entry = a.lookup(ROOT_NODE, b"f").await.ok();
+    let opened: OpenReply = a.open(ent.node, libc::O_RDONLY).await.ok();
+    let first = a.read(ent.node, opened.fh, 0, 4096).await;
+    first.expect_ok();
+    assert_eq!(first.data, b"page one");
+    drop(a);
+
+    let mut b = resume_ok(&srv, ticket).await;
+    let attr: FileAttr = b.getattr(ent.node).await.ok();
+    assert_eq!(attr.size, 8, "the old NodeId still answers GETATTR");
+    let again = b.read(ent.node, opened.fh, 0, 4096).await;
+    again.expect_ok();
+    assert_eq!(
+        again.data, b"page one",
+        "the old Fh still reads the same bytes"
+    );
+}
+
+/// A directory walk paused mid-listing continues from the cookie the first
+/// connection handed out: the `DirHandle` snapshot and its cookie map survive
+/// the reconnect, so the union is the whole directory with no gap and no
+/// duplicate.
+#[tokio::test]
+async fn a_half_paged_readdir_continues_after_a_resume() {
+    const FILES: usize = 24;
+    let srv = TestServer::start().await;
+    for i in 0..FILES {
+        std::fs::write(srv.join(&format!("f{i:02}")), b"").unwrap();
+    }
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    let dh: OpendirReply = a.opendir(ROOT_NODE).await.ok();
+
+    // A budget too small for the whole listing, so the cursor does the work.
+    let page1: ReaddirReply = a.readdir(ROOT_NODE, dh.dh, 0, 64).await.ok();
+    assert!(
+        !page1.entries.is_empty() && !page1.end,
+        "the first page must be partial for this to test anything"
+    );
+    let cursor = page1.entries.last().unwrap().offset;
+    drop(a);
+
+    let mut b = resume_ok(&srv, ticket).await;
+    let mut all = page1.entries.clone();
+    let mut offset = cursor;
+    let mut pages = 1;
+    loop {
+        let page: ReaddirReply = b.readdir(ROOT_NODE, dh.dh, offset, 64).await.ok();
+        pages += 1;
+        if let Some(last) = page.entries.last() {
+            offset = last.offset;
+        }
+        let end = page.end;
+        all.extend(page.entries);
+        assert!(pages < 100, "paging must terminate");
+        if end {
+            break;
+        }
+    }
+    assert_eq!(all.len(), FILES + 2, "the files, plus . and ..");
+    let names: BTreeSet<Vec<u8>> = all.iter().map(|e| e.name.clone()).collect();
+    assert_eq!(names.len(), all.len(), "no name repeated across the gap");
+}
+
+/// A wrong secret answers `STATUS_NO_SESSION` and mutates nothing, so a
+/// corrected claim afterwards succeeds.
+#[tokio::test]
+async fn a_wrong_secret_is_refused_and_the_session_survives() {
+    let srv = TestServer::start().await;
+    let a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    drop(a);
+
+    let mut wrong = ticket;
+    wrong.secret[0] ^= 0xff;
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(wrong).await.status, STATUS_NO_SESSION);
+
+    // The entry survives the refusal, so the right secret still claims it.
+    let _ = resume_ok(&srv, ticket).await;
+}
+
+/// An unknown id answers `STATUS_NO_SESSION`, before any state is consulted.
+#[tokio::test]
+async fn an_unknown_id_is_refused() {
+    let srv = TestServer::start().await;
+    let a = srv.attached_resumable().await;
+    let mut ticket = a.ticket().unwrap();
+    ticket.id = ticket.id.wrapping_add(1000);
+
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_NO_SESSION);
+    drop(a);
+}
+
+/// A claim while the first socket is still attached answers
+/// `STATUS_SESSION_BUSY`, and the first socket goes on working: a claim never
+/// steals a live session (design §6.3).
+#[tokio::test]
+async fn a_claim_against_a_still_attached_session_is_busy() {
+    let srv = TestServer::start().await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_SESSION_BUSY);
+
+    let attr: FileAttr = a.getattr(ROOT_NODE).await.ok();
+    assert_eq!(
+        attr.mode & libc::S_IFMT,
+        libc::S_IFDIR,
+        "the busy refusal left the first socket serving"
+    );
+}
+
+/// A claim whose handshake settled a different shape answers
+/// `STATUS_SESSION_MISMATCH` — a changed `max_io_size` and a flipped
+/// `writeback` alike — and the session survives both, so a matching claim
+/// afterwards succeeds.
+#[tokio::test]
+async fn a_mismatched_handshake_is_refused_and_the_session_survives() {
+    let srv = TestServer::start().await;
+    let a = srv.attached_resumable().await; // writeback off, default I/O size
+    let ticket = a.ticket().unwrap();
+    drop(a);
+
+    // A different settled I/O size.
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&HelloRequest {
+            max_io_size: 8192,
+            ..hello_resuming(SERVER_WINDOW, SERVER_IO)
+        })
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_SESSION_MISMATCH);
+
+    // A flipped writeback, everything else matching.
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&HelloRequest {
+            writeback: true,
+            ..hello_resuming(SERVER_WINDOW, SERVER_IO)
+        })
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_SESSION_MISMATCH);
+
+    // The matching handshake claims it, so neither refusal disturbed the entry.
+    let _ = resume_ok(&srv, ticket).await;
+}
+
+/// A grace that has run out answers `STATUS_NO_SESSION`, whether the reaper
+/// has swept the entry yet or not: expiry is the clock's fact.
+#[tokio::test]
+async fn an_expired_grace_is_refused() {
+    let srv = TestServer::with_resume(Duration::from_millis(200), 64).await;
+    let a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_NO_SESSION);
+}
+
+/// `RESUME` after the handshake is as fatal as a second `HELLO` or `ATTACH`:
+/// it is a re-attach, and a re-attach mid-session has no answer to carry.
+#[tokio::test]
+async fn resume_after_the_handshake_is_fatal() {
+    let srv = TestServer::start().await;
+    let mut c = srv.attached().await;
+    c.begin(
+        Opcode::Resume,
+        &ResumeRequest {
+            ticket: SessionTicket {
+                id: 1,
+                secret: [0u8; 16],
+                grace_ms: 0,
+            },
+        },
+    )
+    .await;
+    assert!(c.closed().await, "RESUME after the handshake is fatal");
+}
+
+/// Identity, part one: a file unlinked during the gap keeps its handle and
+/// loses its name. The held `Fh` reads the original bytes; `LOOKUP` of the
+/// name answers `ENOENT`.
+#[tokio::test]
+async fn a_file_unlinked_during_the_gap_keeps_its_handle_and_loses_its_name() {
+    let srv = TestServer::start().await;
+    std::fs::write(srv.join("f"), b"original").unwrap();
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    let ent: Entry = a.lookup(ROOT_NODE, b"f").await.ok();
+    let opened: OpenReply = a.open(ent.node, libc::O_RDONLY).await.ok();
+    drop(a);
+
+    std::fs::remove_file(srv.join("f")).unwrap();
+
+    let mut b = resume_ok(&srv, ticket).await;
+    let held = b.read(ent.node, opened.fh, 0, 4096).await;
+    held.expect_ok();
+    assert_eq!(
+        held.data, b"original",
+        "the held Fh reads the original bytes"
+    );
+    b.lookup(ROOT_NODE, b"f").await.expect_errno(libc::ENOENT);
+}
+
+/// Identity, part two — the case the whole design exists to get right: a file
+/// replaced during the gap keeps its handle addressing the *original* inode,
+/// while a fresh `LOOKUP` yields a different `NodeId` and a different
+/// `generation`. The old id never quietly becomes the new file.
+#[tokio::test]
+async fn a_file_replaced_during_the_gap_keeps_its_handle_and_gets_a_new_identity() {
+    let srv = TestServer::start().await;
+    std::fs::write(srv.join("f"), b"original").unwrap();
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    let ent: Entry = a.lookup(ROOT_NODE, b"f").await.ok();
+    let opened: OpenReply = a.open(ent.node, libc::O_RDONLY).await.ok();
+    drop(a);
+
+    // Unlink then recreate, so the name resolves to a brand-new inode.
+    std::fs::remove_file(srv.join("f")).unwrap();
+    std::fs::write(srv.join("f"), b"replacement!").unwrap();
+
+    let mut b = resume_ok(&srv, ticket).await;
+    let held = b.read(ent.node, opened.fh, 0, 4096).await;
+    held.expect_ok();
+    assert_eq!(
+        held.data, b"original",
+        "the held descriptor still addresses the original inode"
+    );
+    let fresh: Entry = b.lookup(ROOT_NODE, b"f").await.ok();
+    assert_ne!(fresh.node, ent.node, "a fresh lookup is a different NodeId");
+    assert_ne!(
+        fresh.generation, ent.generation,
+        "and carries a different generation"
+    );
+}
+
+/// The ticket is stable: it claims every gap the session ever spans, because
+/// nothing rotates (design §7.6).
+#[tokio::test]
+async fn the_ticket_serves_every_claim_the_session_makes() {
+    let srv = TestServer::start().await;
+    let a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    drop(a);
+
+    let b = resume_ok(&srv, ticket).await;
+    drop(b);
+
+    // The same ticket the ATTACH reply carried, a second time.
+    let mut c = resume_ok(&srv, ticket).await;
+    let attr: FileAttr = c.getattr(ROOT_NODE).await.ok();
+    assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+}
+
+/// A second break during the reconnect itself (design §7.6): the socket dies
+/// between sending `RESUME` and reading its reply, so the server's claim may
+/// succeed on a connection the client has already abandoned. The next claim
+/// with the same ticket must still land — a claim whose handshake failed after
+/// the entry went `Attached` must release it, not wedge it `Busy` forever.
+///
+/// The reply-write failure cannot be forced deterministically over loopback
+/// TCP, so the deterministic pin of that exact path is the unit case
+/// `rpc::tests::a_resume_whose_reply_write_fails_releases_the_claimed_session`;
+/// this case covers the same scenario end to end, whichever side of the write
+/// the break lands on.
+#[tokio::test]
+async fn a_claim_abandoned_before_its_reply_leaves_the_session_claimable() {
+    let srv = TestServer::start().await;
+    std::fs::write(srv.join("f"), b"still here").unwrap();
+    let a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    drop(a);
+
+    // Send the claim, then die without reading the answer.
+    let mut b = srv.connect().await;
+    let _: HelloReply = b
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    b.begin(Opcode::Resume, &ResumeRequest { ticket }).await;
+    drop(b);
+
+    // The retry loop inside `resume_ok` is the bound: a session wedged
+    // `Attached` answers `SESSION_BUSY` past any number of attempts.
+    let mut c = resume_ok(&srv, ticket).await;
+    let ent: Entry = c.lookup(ROOT_NODE, b"f").await.ok();
+    assert_eq!(ent.attr.size, 10, "the retained session still serves");
+}
+
+// ---------------------------------------------------------------------------
+// DETACH: dropping a retained session at a clean unmount
+// ---------------------------------------------------------------------------
+
+/// The server runs in this process, so its `O_PATH` node descriptors show up in
+/// `/proc/self/fd`. Scoping the census to this export's own tempdir is what
+/// turns it into a number rather than noise — the same measurement the loopback
+/// suite's fd-census cases make.
+fn export_fds(dir: &Path) -> usize {
+    let resolved = dir.canonicalize().unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc is mounted")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.starts_with(&resolved))
+        .count()
+}
+
+/// Poll `cond` until it holds or the deadline passes, failing with `what`.
+async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+    for _ in 0..300 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// `DETACH` drops the session, so a reconnecting `RESUME` finds nothing.
+#[tokio::test]
+async fn a_detached_session_cannot_be_resumed() {
+    let srv = TestServer::start().await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    a.detach(ticket).await.ok_unit();
+    drop(a);
+
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_NO_SESSION);
+}
+
+/// A `DETACH` whose secret does not match answers `ESTALE` and leaves the
+/// session claimable: a client that cannot prove ownership must not be able to
+/// destroy somebody else's session.
+#[tokio::test]
+async fn a_detach_with_a_wrong_secret_is_estale_and_keeps_the_session() {
+    let srv = TestServer::start().await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+
+    let mut wrong = ticket;
+    wrong.secret[0] ^= 0xff;
+    a.detach(wrong).await.expect_errno(libc::ESTALE);
+    drop(a);
+
+    // The right ticket still claims it, so the refused detach removed nothing.
+    let _ = resume_ok(&srv, ticket).await;
+}
+
+/// After `DETACH` the server's descriptors over the export return to baseline
+/// without waiting for the grace. The grace is set to an hour, so only a
+/// working `DETACH` — not the reaper — can free them inside the test.
+#[tokio::test]
+async fn detach_returns_the_export_descriptors_without_waiting_for_the_grace() {
+    let srv = TestServer::with_resume(Duration::from_secs(3600), 64).await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+
+    for name in ["a", "b", "c"] {
+        std::fs::write(srv.join(name), b"x").unwrap();
+        let _: Entry = a.lookup(ROOT_NODE, name.as_bytes()).await.ok();
+    }
+    assert!(
+        export_fds(srv.path()) > 1,
+        "the server should hold a descriptor per registered node"
+    );
+
+    a.detach(ticket).await.ok_unit();
+    drop(a);
+
+    wait_until(
+        || export_fds(srv.path()) == 0,
+        "the detached session's descriptors to close, an hour before the grace would",
+    )
+    .await;
+}
+
+/// `DETACH` ends the session's *retention*, not the connection. The socket
+/// keeps its `Arc<dyn FileSystem>` and serves until it closes, while the
+/// session stops being resumable — which is exactly what a clean unmount wants:
+/// flush and forget over a live socket, then drop retention.
+#[tokio::test]
+async fn a_request_after_detach_still_serves_on_the_same_socket() {
+    let srv = TestServer::start().await;
+    let mut a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    a.detach(ticket).await.ok_unit();
+
+    // The socket goes on serving.
+    let attr: FileAttr = a.getattr(ROOT_NODE).await.ok();
+    assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+
+    // And the session is no longer resumable.
+    drop(a);
+    let mut c = srv.connect().await;
+    let _: HelloReply = c
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    assert_eq!(c.resume(ticket).await.status, STATUS_NO_SESSION);
 }
 
 // ---------------------------------------------------------------------------

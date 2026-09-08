@@ -2,13 +2,34 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to execute this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Not started. Written 2026-08-28 alongside
+**Status:** Complete. Written 2026-08-28 alongside
 `docs/superpowers/specs/2026-08-28-session-resumption-design.md`, which holds
 the reasoning this plan executes. Read that document first; this one assumes
 its rulings and does not re-argue them. Revised 2026-09-07 after subagent
 review: no ticket rotation, shape checks inside the registry's `claim`,
 resumption opt-in with the shipped binary on by default, and the review's
-mechanical corrections folded in.
+mechanical corrections folded in. All thirteen tasks ran on 2026-09-07 —
+Tasks 1-12 on the host against `make check` and `make test-loopback`, Task 13
+on the guest pair — and the full `make vm-test` came back green: thirteen
+steps, `disconnect.sh` passing unchanged beside the new `reconnect.sh`.
+
+Two things the execution learned that the plan did not know:
+
+- **Task 13's `ss -K` filter named the wrong end of the connection.** Run on
+  the server, the lbfs connection's local port is 9423 and the client holds
+  the ephemeral end, so `dst $CLIENT_IP dport = :$SERVER_PORT` — the peer's
+  address *and* the peer's port — matches nothing, and `ss -K` exits zero
+  either way. The drill filters on `sport = :$SERVER_PORT` instead, checked
+  against a live connection before severing anything, and asserts the kill
+  printed the client's socket rather than trusting the exit code. `CONFIG_INET_DIAG_DESTROY` itself holds
+  on the guests, exactly as the plan expected — the risk that had a fallback
+  never fired; the spelling nobody doubted is what needed the fix.
+- **The drill's numbers, from the real pair.** A fresh write issued after the
+  sever landed 355 ms later standalone and 542 ms inside the suite, ssh round
+  trips included — one supervisor backoff, nowhere near the 10-second
+  deadline. The interrupted 4 GiB `dd` failed (exit 1) at its `conv=fsync`,
+  its in-flight writes dying with the socket as designed, and the descriptor
+  held open across the sever read and wrote in order afterwards.
 
 **Two coordination facts before Task 1.**
 
@@ -206,7 +227,7 @@ a short read here is a silently weak secret.
   here: protocol version `3`, the `RESUME` and `DETACH` opcodes, the three new
   statuses, the two config keys, and the sentence §7 replaces.
 
-- [ ] **Step 1: §3.2 — the version and the new handshake field**
+- [x] **Step 1: §3.2 — the version and the new handshake field**
 
 Replace the version-`2` paragraph of step 1 with a version-`3` one that keeps
 the existing argument verbatim and adds: version `3` carries a request to
@@ -216,7 +237,7 @@ trailing-byte tolerance is the same reason the match stays exact.
 Add to step 2's list: the settled grace, in milliseconds, zero when the server
 retains nothing.
 
-- [ ] **Step 2: §3.3 — session lifetime**
+- [x] **Step 2: §3.3 — session lifetime**
 
 After the `NodeId` bullet, state that a *session* rather than a connection
 scopes node ids, generations and handles, that a session outlives its
@@ -224,16 +245,16 @@ socket by the configured grace, and that a client re-attaches with the ticket
 `ATTACH` handed it. Point at the design document for what that does and does
 not restore.
 
-- [ ] **Step 3: §3.4 — two opcodes**
+- [x] **Step 3: §3.4 — two opcodes**
 
 Add `RESUME` and `DETACH` to the Session row of the opcode table.
 
-- [ ] **Step 4: §4 — the config keys**
+- [x] **Step 4: §4 — the config keys**
 
 Add `resume_grace = "60s"` and `max_resumable_sessions = 64` to the TOML block,
 with one sentence each.
 
-- [ ] **Step 5: §7 — replace the connection-loss bullet**
+- [x] **Step 5: §7 — replace the connection-loss bullet**
 
 Find:
 
@@ -252,14 +273,14 @@ directory cursors intact; a server that does not — a restart, an expired grace
 a wrong ticket — leaves the mount dead in the old sense, `EIO` until unmount.
 Name the design document for the reasoning.
 
-- [ ] **Step 6: §8 — staleness**
+- [x] **Step 6: §8 — staleness**
 
 Replace "Server restart ⇒ connection drop ⇒ `EIO` until remount (until
 reconnection lands)" with the settled behaviour: a server restart empties the
 session registry, so it refuses the claim and the mount answers `EIO` until
 remount. A transport failure to a server that stayed up resumes instead.
 
-- [ ] **Step 7: §11 — retire the fast-follow, add the leftovers**
+- [x] **Step 7: §11 — retire the fast-follow, add the leftovers**
 
 Move fast-follow 1 out of the priority list and into a line recording that it
 landed, naming the design document. Renumber what remains, reading §11 as it
@@ -271,12 +292,12 @@ space; a session-level `FORGET` queue that survives a connection swap; and
 reclaiming the lookup counts and handles stranded by requests that died in the
 gap.
 
-- [ ] **Step 8: Check the diff**
+- [x] **Step 8: Check the diff**
 
 Run: `git diff --stat docs/superpowers/specs/2026-08-20-lbfs-design.md`
 Expected: one file changed.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add docs/superpowers/specs/2026-08-20-lbfs-design.md docs/superpowers/plans/2026-08-28-session-resumption.md
@@ -300,7 +321,7 @@ git commit -m "docs(spec): session resumption over a retained server session"
   `resume_grace_ms: 0`, `ticket: None`), and every existing test passes
   unchanged.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/lbfs-proto/src/ops.rs`'s test module, add cases pinning: the two new
 opcode numbers round-trip through `TryFrom<u16>`; `36` still fails; a
@@ -315,12 +336,12 @@ In `crates/lbfs-proto/src/frame.rs`, add a case pinning `PROTOCOL_VERSION == 3`
 and that the three new statuses sit above `0xFF00`, differ from each other, and
 differ from the three that already exist.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test -p lbfs-proto`
 Expected: FAIL to compile — the names do not exist.
 
-- [ ] **Step 3: `frame.rs`**
+- [x] **Step 3: `frame.rs`**
 
 ```rust
 /// Version 3 adds session resumption: `HelloRequest.resume`,
@@ -339,7 +360,7 @@ pub const STATUS_SESSION_MISMATCH: u16 = 0xFF06;
 
 Leave `FLAG_NO_REPLY` and `FLAG_FORCE_SYNC` untouched.
 
-- [ ] **Step 4: `types.rs` — the ticket**
+- [x] **Step 4: `types.rs` — the ticket**
 
 ```rust
 /// What a client presents to claim a session it was already attached to.
@@ -376,7 +397,7 @@ impl SessionTicket {
 }
 ```
 
-- [ ] **Step 5: `ops.rs` — opcodes, fields, request structs**
+- [x] **Step 5: `ops.rs` — opcodes, fields, request structs**
 
 Add `Resume = 34` and `Detach = 35` to the enum and to `TryFrom<u16>`. Add
 `pub resume: bool` to `HelloRequest`, `pub resume_grace_ms: u32` to
@@ -403,13 +424,13 @@ pub struct DetachRequest {
 }
 ```
 
-- [ ] **Step 6: The `rustix` feature**
+- [x] **Step 6: The `rustix` feature**
 
 In the workspace `Cargo.toml`, add `"rand"` to the `rustix` feature list, with
 a comment naming Task 3's use: session secrets come from
 `rustix::rand::getrandom`, which is `getrandom(2)` and no new crate.
 
-- [ ] **Step 7: Make the workspace compile again, inertly**
+- [x] **Step 7: Make the workspace compile again, inertly**
 
 Fill the new fields at every construction site with values that change nothing:
 `resume: false` in the client's `hello`, `resume_grace_ms: 0` in the server's
@@ -423,13 +444,13 @@ Add `Resume` to the server's post-handshake rejection alongside `Hello` and
 `Detach` stays out of that list — an ordinary in-session request, and Task 7
 answers it there.
 
-- [ ] **Step 8: Run the tests**
+- [x] **Step 8: Run the tests**
 
 Run: `make check` then `make test-loopback`
 Expected: PASS. The wire grew fields nobody reads and one version number
 everybody checks; the loopback client and server both moved to `3` together.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add Cargo.toml crates/lbfs-proto/src/frame.rs crates/lbfs-proto/src/types.rs crates/lbfs-proto/src/ops.rs crates/lbfs-server/src/rpc/mod.rs crates/lbfs-server/tests/session.rs crates/lbfs-client/src/conn.rs tests/src/lib.rs tests/tests/protocol.rs
@@ -453,7 +474,7 @@ git commit -m "feat(proto): version 3 with session tickets, RESUME and DETACH"
   rides inside the rpc `Limits` struct.
   Methods: `mint`, `claim`, `release`, `drop_session`, `reap_expired`, `len`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Cover, against `Registry<u32, u32>`:
 
@@ -481,12 +502,12 @@ Cover, against `Registry<u32, u32>`:
     though the reaper has not run. Expiry is the clock's fact, not the reaper's
     schedule.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test -p lbfs-server registry`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write the registry**
+- [x] **Step 3: Write the registry**
 
 The shape:
 
@@ -551,14 +572,14 @@ refuses an attached session rather than stealing it (a steal is the
 session-hijack primitive in a protocol with no authentication, and a half-open
 socket resolves itself inside the keepalive budget).
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p lbfs-server registry`
 Expected: PASS, all eleven.
 
-- [ ] **Step 5: `make check`**
+- [x] **Step 5: `make check`**
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/registry.rs crates/lbfs-server/src/rpc/mod.rs
@@ -579,7 +600,7 @@ git commit -m "feat(server): a registry of sessions that outlive their sockets"
 - Produces: `Config::resume_grace: Duration` and
   `Config::max_resumable_sessions: usize`, plus `pub fn parse_duration`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Beside the existing `parse_size` cases: `parse_duration` accepts `"60s"`,
 `"500ms"`, a bare `"30"` as seconds and `"0"` as zero; it refuses `"60x"`,
@@ -587,9 +608,9 @@ Beside the existing `parse_size` cases: `parse_duration` accepts `"60s"`,
 sessions; one with `resume_grace = "0"` yields `Duration::ZERO`; an unknown key
 still fails, because `deny_unknown_fields` stays on.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Add the keys**
+- [x] **Step 3: Add the keys**
 
 `RawConfig` grows `resume_grace: Option<String>` and
 `max_resumable_sessions: Option<usize>`. `parse_duration` mirrors `parse_size`:
@@ -604,13 +625,13 @@ the loopback harness (`tests/src/lib.rs` and `tests/tests/loopback.rs`),
 literal lives in `config.rs`. Every one gains the two fields — the compiler
 names each — and this task's commit stages them all.
 
-- [ ] **Step 4: Update the two shipped configs**
+- [x] **Step 4: Update the two shipped configs**
 
 Add both keys, commented, to `crates/lbfs-server/pkg/lbfs.toml` and `vm/server-config.toml`.
 
-- [ ] **Step 5: `make check`**
+- [x] **Step 5: `make check`**
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-server/src/config.rs crates/lbfs-server/pkg/lbfs.toml crates/lbfs-server/tests/session.rs crates/lbfs-client/tests/live.rs crates/lbfs-client/tests/loopback_cli.rs tests/src/lib.rs tests/tests/loopback.rs vm/server-config.toml
@@ -633,7 +654,7 @@ git commit -m "feat(server): resume_grace and max_resumable_sessions"
   drains; a reaper task runs per server. **No `RESUME` yet** — a session goes
   idle and then expires, and nothing claims it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `tests/tests/protocol.rs`:
 
@@ -645,9 +666,9 @@ In `tests/tests/protocol.rs`:
    `None` whatever the client asked for.
 4. Two attaches return tickets with different ids and different secrets.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Wire the registry into `Server`**
+- [x] **Step 3: Wire the registry into `Server`**
 
 `Server::new` builds the registry from the config and spawns the reaper. The
 reaper wakes on an interval (grace / 4, floored at a second), calls
@@ -659,13 +680,13 @@ with a zero grace skips the task entirely. The spawn means the `pub`,
 synchronous `Server::new` now needs a runtime context its signature does not
 show — every current caller sits inside one, and its doc comment must say so.
 
-- [ ] **Step 4: `hello` reports the grace**
+- [x] **Step 4: `hello` reports the grace**
 
 `resume_grace_ms` = the configured grace in milliseconds when the client asked
 for resumption and the server retains anything, else `0`. Carry the client's
 `resume` bit into `Limits`, beside `writeback`, because `attach` needs it.
 
-- [ ] **Step 5: `attach` mints**
+- [x] **Step 5: `attach` mints**
 
 After `LocalFs::from_root_fd` succeeds and before the reply, mint, storing the
 settled `Limits` as the entry's guard — `writeback` rides inside it. A `None`
@@ -676,13 +697,13 @@ per occurrence with the cap in the line.
 Hold the minted `(id, epoch)` beside the `Arc<dyn FileSystem>` for the session
 task.
 
-- [ ] **Step 6: `serve_requests` releases before it drains**
+- [x] **Step 6: `serve_requests` releases before it drains**
 
 At the top of teardown, before `drop(session)` and the drain, call
 `release(id, epoch)`. Trap 2 in the design section is the reason: a claim
 arriving during the 30-second drain must not queue behind it.
 
-- [ ] **Step 7: `TCP_USER_TIMEOUT`**
+- [x] **Step 7: `TCP_USER_TIMEOUT`**
 
 In `rpc::configure_socket`, set `TCP_USER_TIMEOUT` to the keepalive budget,
 `KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * KEEPALIVE_COUNT`. One signature to
@@ -694,12 +715,12 @@ with replies queued for a black-holed peer sits in TCP retransmission for
 minutes, holding the session attached past any grace worth configuring and
 refusing every claim with `STATUS_SESSION_BUSY`.
 
-- [ ] **Step 8: Expose the ticket in the harness**
+- [x] **Step 8: Expose the ticket in the harness**
 
 `TestClient` keeps the `AttachReply`'s ticket and offers `ticket()`.
 `connect_and_attach_with` grows a `resume: bool`.
 
-- [ ] **Step 9: Run the tests, then the gates**
+- [x] **Step 9: Run the tests, then the gates**
 
 Run: `cargo test -p lbfs-tests --test protocol resume` then `make check` and
 `make test-loopback`.
@@ -711,7 +732,7 @@ library default is off — so no session survives its unmounts, nothing waits on
 the reaper, and every fd-census case passes exactly as before. A failure here
 is a real leak, not timing.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/mod.rs tests/src/lib.rs tests/tests/protocol.rs
@@ -732,7 +753,7 @@ git commit -m "feat(server): retain a session for a grace after its socket dies"
   `STATUS_OK` with the root's attributes, or one of the three refusal
   statuses.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 This is the suite that pins the contract. In `tests/tests/protocol.rs`:
 
@@ -766,9 +787,9 @@ This is the suite that pins the contract. In `tests/tests/protocol.rs`:
     the ticket `ATTACH` minted: it works. Nothing rotates, so nothing needs
     re-learning after a claim.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Write `resume`**
+- [x] **Step 3: Write `resume`**
 
 A sibling of `attach` in the handshake sequence. `session()` reads the second
 frame's opcode and branches: `Attach` → today's path, `Resume` → the new one,
@@ -788,14 +809,14 @@ Log every refusal with the peer address and the reason, and every successful
 claim with the session id — a refused claim is the line an operator reads when
 a mount died, and the claim line is what Task 13's drill greps for.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p lbfs-tests --test protocol resume`
 Expected: PASS, all eleven.
 
-- [ ] **Step 5: `make check` and `make test-loopback`**
+- [x] **Step 5: `make check` and `make test-loopback`**
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/mod.rs tests/src/lib.rs tests/tests/protocol.rs
@@ -814,7 +835,7 @@ git commit -m "feat(server): RESUME claims a retained session"
 - Consumes: Task 6.
 - Produces: `DETACH` as an ordinary in-session request, answered `STATUS_OK`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 1. `DETACH`, drop the socket, reconnect, `RESUME`: `STATUS_NO_SESSION`.
 2. `DETACH` with a wrong secret answers `ESTALE` and leaves the session
@@ -831,9 +852,9 @@ the registry entry, and the connection keeps its `Arc<dyn FileSystem>` until it
 closes, so the export stays served and stops being resumable. That is what a
 clean unmount wants.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Handle `DETACH` in the read loop**
+- [x] **Step 3: Handle `DETACH` in the read loop**
 
 Beside `Forget`, which the loop already handles inline. `DETACH` is one
 registry call, so spawning a task for it would cost more than doing it — but
@@ -841,9 +862,9 @@ unlike `FORGET` it takes a window permit and produces a reply, because the
 client waits for it before closing. Log the detach with the session id at
 INFO; Task 13's drill greps for the line.
 
-- [ ] **Step 4: Run the tests, then `make check` and `make test-loopback`**
+- [x] **Step 4: Run the tests, then `make check` and `make test-loopback`**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/lbfs-server/src/rpc/mod.rs tests/src/lib.rs tests/tests/protocol.rs
@@ -863,15 +884,15 @@ git commit -m "feat(server): DETACH drops a session at a clean unmount"
 - Produces: `pub async fn closed(&self)`, which returns when the connection
   dies and returns immediately if it already has.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `mux.rs`: `closed()` on a live connection stays pending; it completes when
 the scripted server drops the socket; it completes immediately on a connection
 that already died; and two concurrent waiters both complete.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: Add the signal**
+- [x] **Step 3: Add the signal**
 
 `Shared` grows a `died: Arc<Notify>`; `Shared::kill` calls `notify_waiters`
 after it stores `dead`. `Connection::closed` checks `is_dead()` first, then
@@ -884,9 +905,9 @@ the `is_dead()` check already covers that case.
 answers `EIO` forever and is never revived. `closed()` reports the death; it
 does not undo it.
 
-- [ ] **Step 4: Run the tests, then `make check`**
+- [x] **Step 4: Run the tests, then `make check`**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/lbfs-client/src/conn.rs crates/lbfs-client/tests/mux.rs
@@ -909,13 +930,13 @@ git commit -m "feat(client): Connection::closed reports a connection's death"
   `LbfsFuse` holds an `Arc<Session>`. **A pure refactor: no reconnect, and
   every existing test passes unchanged.**
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 One case in `mux.rs`: a `Session` over a live connection forwards a typed call
 and returns the same answer the connection would; a `Session` whose connection
 died answers `EIO`. Written first so the refactor has a target.
 
-- [ ] **Step 2: Write `Session`**
+- [x] **Step 2: Write `Session`**
 
 ```rust
 enum State {
@@ -950,21 +971,21 @@ exposes `async fn current() -> Result<Arc<Connection>, Errno>`; each `LbfsFuse`
 callback awaits it inside the block it already spawns, so the callbacks
 themselves stay synchronous and take one extra line each.
 
-- [ ] **Step 3: Move `LbfsFuse` onto it**
+- [x] **Step 3: Move `LbfsFuse` onto it**
 
 `LbfsFuse::new` takes an `Arc<Session>`; `ctx` and `entry_ctx` return one.
 `init` reads `self.session.limits`. `destroy` reads a `dropped_forgets` that
 sums across connections. `main.rs` builds the `Session` after `connect` and
 hands it to `LbfsFuse`.
 
-- [ ] **Step 4: Run everything**
+- [x] **Step 4: Run everything**
 
 Run: `make check` then `make test-loopback`
 Expected: PASS with no test changed except the ones that named `Connection`
 directly. A refactor that needs a behavioural test edited is a refactor that
 changed behaviour — stop and find out why.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/lbfs-client/src/session.rs crates/lbfs-client/src/lib.rs crates/lbfs-client/src/fuse.rs crates/lbfs-client/src/main.rs crates/lbfs-client/src/bin/lbfs-bench.rs crates/lbfs-client/tests/mux.rs tests/tests/loopback.rs crates/lbfs-client/tests/loopback_cli.rs
@@ -985,7 +1006,7 @@ git commit -m "refactor(client): a Session above the connection"
   `connect`; a supervisor task inside `Session` that dials, resumes and
   installs; `Session::current()` that parks while `Reconnecting`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Against a scripted server in `mux.rs`:
 
@@ -1008,9 +1029,9 @@ Against a scripted server in `mux.rs`:
 8. **One ticket, many claims.** A second death and reconnect presents the same
    ticket the `ATTACH` reply carried, and the scripted server sees it twice.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: `Connection::resume`**
+- [x] **Step 3: `Connection::resume`**
 
 A sibling of `connect_with` that runs `HELLO` and then `RESUME` in place of
 `ATTACH`, under the same end-to-end timeout, with the same `check_settled`
@@ -1018,7 +1039,7 @@ afterwards. It returns `ConnectError::NoSession`, `SessionBusy` or
 `SessionMismatch` for the three refusal statuses, so the supervisor can tell a
 retry from a surrender without parsing a string.
 
-- [ ] **Step 4: The supervisor**
+- [x] **Step 4: The supervisor**
 
 One task, spawned alongside the `Session`, in a loop:
 
@@ -1043,7 +1064,7 @@ a 10 s outage costs a dozen rather than two hundred.
 before the first dial, so a call arriving between the death and the
 first dial parks rather than seeing a stale `Live`.
 
-- [ ] **Step 5: Parked calls**
+- [x] **Step 5: Parked calls**
 
 `Session::current()` went `async` back in Task 9; this step adds the parking
 arm. `Live` returns at once, `Dead` returns
@@ -1057,16 +1078,18 @@ thread (`conn.rs` says why). While reconnecting it drops the forget and counts
 it, which is what the connection already does when its queue is full. Task 11's
 log line reports the total.
 
-- [ ] **Step 6: Shutdown cancels reconnection**
+- [x] **Step 6: Shutdown cancels reconnection**
 
 `Session::shutdown()` sets `Dead`, which stops the supervisor and fails
-everything parked. `main.rs` calls it before it drops the runtime, or a
-supervisor still dialling holds the process open past the unmount. Task 11
-teaches the same method to send `DETACH` before it marks the state.
+everything parked. The binary calls it after its unmount drain, or a supervisor
+still dialling holds the process open past the unmount — and that call lands in
+Task 11, which stages `main.rs` and teaches the same method to send `DETACH`
+before it marks the state. Nothing the binary builds reconnects until then, so
+there is nothing for it to cancel here.
 
-- [ ] **Step 7: Run the tests, then `make check` and `make test-loopback`**
+- [x] **Step 7: Run the tests, then `make check` and `make test-loopback`**
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/lbfs-client/src/session.rs crates/lbfs-client/src/conn.rs crates/lbfs-client/tests/mux.rs
@@ -1079,6 +1102,7 @@ git commit -m "feat(client): re-attach to a retained session after a disconnect"
 
 **Files:**
 - Edit: `crates/lbfs-client/src/main.rs`, `crates/lbfs-client/src/session.rs`, `crates/lbfs-client/src/conn.rs`
+- Edit: `crates/lbfs-client/src/fuse.rs` (Step 5's line lives in `destroy`)
 - Edit: `crates/lbfs-client/tests/loopback_cli.rs`
 
 **Interfaces:**
@@ -1087,16 +1111,16 @@ git commit -m "feat(client): re-attach to a retained session after a disconnect"
   the binary asks to resume by default; `DETACH` lands in
   `Session::shutdown()`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Unit cases beside the existing `attr_timeout` and `event_loop_threads` ones:
 the flag parses, refuses a negative and an absurd value, and `--no-reconnect`
 yields a zero deadline. One `loopback_cli` case: a mount started with
 `--no-reconnect` behaves exactly as today when its server dies.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
-- [ ] **Step 3: The flags**
+- [x] **Step 3: The flags**
 
 Ten seconds by default, and the doc comment carries the reason: it has to stay
 under the twenty-second `timeout` that `vm/tests/disconnect.sh` puts around its
@@ -1111,7 +1135,7 @@ The binary asks for resumption whenever the deadline is non-zero:
 `--no-reconnect` clears the handshake request too, so it restores today's
 behaviour on the wire as well as in the client.
 
-- [ ] **Step 4: `DETACH` on the way out**
+- [x] **Step 4: `DETACH` on the way out**
 
 The detach lives in `Session::shutdown()`, not in `main.rs`: on a live
 connection of a session that holds a ticket, shutdown sends `DETACH`, waits
@@ -1125,18 +1149,18 @@ Order matters. `shutdown()` runs *after* the unmount drain, because the drain
 flushes writeback and the `FORGET`s the kernel emits for every evicted inode,
 and both need the session.
 
-- [ ] **Step 5: The dropped-forget line**
+- [x] **Step 5: The dropped-forget line**
 
 `destroy` already warns about dropped forgets. Extend it to name the count
 dropped while reconnecting, separately, since that is the one an operator can
 act on by shortening the deadline.
 
-- [ ] **Step 6: Run the tests, then `make check` and `make test-loopback`**
+- [x] **Step 6: Run the tests, then `make check` and `make test-loopback`**
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
-git add crates/lbfs-client/src/main.rs crates/lbfs-client/src/session.rs crates/lbfs-client/src/conn.rs crates/lbfs-client/tests/loopback_cli.rs
+git add crates/lbfs-client/src/main.rs crates/lbfs-client/src/session.rs crates/lbfs-client/src/conn.rs crates/lbfs-client/src/fuse.rs crates/lbfs-client/tests/loopback_cli.rs
 git commit -m "feat(client): --reconnect-timeout, --no-reconnect, DETACH at unmount"
 ```
 
@@ -1149,10 +1173,10 @@ git commit -m "feat(client): --reconnect-timeout, --no-reconnect, DETACH at unmo
 
 **Interfaces:**
 - Consumes: Tasks 10 and 11.
-- Produces: `Breaker`, a forwarding proxy the test can sever, plus four cases
-  through a real mount.
+- Produces: `Breaker`, a forwarding proxy the test can sever, plus the five
+  cases of Step 2 through a real mount.
 
-- [ ] **Step 1: Write the proxy**
+- [x] **Step 1: Write the proxy**
 
 The loopback harness starts its server in-process and the client connects
 straight to it, so no test can sever the socket without killing the server —
@@ -1168,7 +1192,7 @@ opted in detaches before the fd census reads.
 Keep it small, and say plainly what it stands for: a test double for a flaky
 network, not a proxy anybody ships.
 
-- [ ] **Step 2: Write the failing cases**
+- [x] **Step 2: Write the failing cases**
 
 1. **An open descriptor survives.** Open a file through the mount, write to it,
    `sever()`, wait for the mount to answer again, write more through the *same*
@@ -1196,19 +1220,19 @@ network, not a proxy anybody ships.
    the teardown's `Session::shutdown()` sent `DETACH` rather than leaving the
    session to the reaper.
 
-- [ ] **Step 3: Run the cases**
+- [x] **Step 3: Run the cases**
 
 Run: `cargo test -p lbfs-tests --test loopback sever -- --ignored --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 4: Run the whole loopback suite and `make check`**
+- [x] **Step 4: Run the whole loopback suite and `make check`**
 
 Expected: PASS, including
 `a_dead_server_leaves_an_eio_mount_that_still_unmounts` unchanged and on
 today's clock — its mount never asks to resume, so there is no ten-second park
 and no timing shift at all.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/tests/loopback.rs
@@ -1231,7 +1255,7 @@ git commit -m "test(loopback): a mount survives a severed connection"
 **This is the first task that touches the VM pair. Confirm nobody else holds it
 before running anything here.**
 
-- [ ] **Step 1: Write the drill**
+- [x] **Step 1: Write the drill**
 
 Modelled on `vm/tests/disconnect.sh`, which it complements rather than
 replaces. Mount, start a large `dd` with `conv=fsync`, wait until the server's
@@ -1260,12 +1284,12 @@ Assert afterwards:
   session count.
 - The mount unmounts cleanly.
 
-- [ ] **Step 2: Wire it into `vm/test.sh`**
+- [x] **Step 2: Wire it into `vm/test.sh`**
 
 Beside `disconnect.sh`, after it — the two want the server in a known state and
 `disconnect.sh` restores one.
 
-- [ ] **Step 3: Deploy and run**
+- [x] **Step 3: Deploy and run**
 
 ```bash
 make vm-deploy
@@ -1274,7 +1298,7 @@ make vm-test
 
 Expected: PASS, including `disconnect.sh` unchanged.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add vm/tests/reconnect.sh vm/test.sh

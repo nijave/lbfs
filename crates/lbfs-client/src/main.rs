@@ -22,9 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use lbfs_client::conn::{ConnectError, Connection};
+use lbfs_client::conn::{ConnectError, Connection, Proposal};
 use lbfs_client::fuse::{session_config, LbfsFuse};
 use lbfs_client::readahead;
+use lbfs_client::session::Session;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -82,6 +83,34 @@ struct Cli {
     #[arg(long)]
     no_writeback: bool,
 
+    /// How long to keep re-attaching after the connection drops, in seconds.
+    ///
+    /// A request issued while the client is redialling parks until the session
+    /// comes back or this runs out; a request that was already on the wire
+    /// fails `EIO` either way, because its outcome is unknown and no reply can
+    /// settle it (design §3.1).
+    ///
+    /// Ten seconds covers a reset plus a redial and a service restart, and it
+    /// has to stay well under the twenty-second `timeout` that
+    /// `vm/tests/disconnect.sh` puts around its post-mortem `ls` and the
+    /// thirty-second settle window the loopback suite waits for its first
+    /// `EIO`: a mount that parks for longer than a test waits looks exactly
+    /// like a hang. The session clamps whatever it gets to three-quarters of
+    /// the grace the server advertises, so a number larger than the server's
+    /// `resume_grace` buys nothing. Zero turns reconnection off, the same as
+    /// `--no-reconnect`.
+    #[arg(long, default_value_t = 10.0)]
+    reconnect_timeout: f64,
+
+    /// Never re-attach: a lost connection ends the mount, as it did before
+    /// session resumption existed.
+    ///
+    /// Clears the handshake request as well as the deadline, so the server
+    /// retains nothing for this mount, its `ATTACH` reply carries no ticket,
+    /// and a disconnection costs exactly what spec §7 always said it cost.
+    #[arg(long)]
+    no_reconnect: bool,
+
     /// Run this many fuser event-loop threads instead of one.
     ///
     /// Off by default, and expected to stay off on a two-vCPU guest: the
@@ -130,6 +159,11 @@ enum StartupError {
     NoAddress(String),
     #[error("--attr-timeout must be a non-negative, finite number of seconds")]
     AttrTimeout,
+    #[error(
+        "--reconnect-timeout must be a finite number of seconds between 0 and \
+         {MAX_RECONNECT_SECS}"
+    )]
+    ReconnectTimeout,
     #[error("--fuse-threads must be between 1 and 64")]
     FuseThreads,
     #[error("the remote path must be absolute")]
@@ -177,6 +211,7 @@ fn run() -> Result<(), StartupError> {
     let cli = Cli::parse();
     let ttl = attr_timeout(cli.attr_timeout)?;
     let entry_ttl = entry_timeout(cli.entry_timeout, ttl)?;
+    let reconnect = reconnect_deadline(cli.reconnect_timeout, cli.no_reconnect)?;
     if !cli.remote_path.is_absolute() {
         // The server matches the path against its allowlist after resolving it
         // from its own working directory, so a relative one is at best a
@@ -204,9 +239,32 @@ fn run() -> Result<(), StartupError> {
     // whole point of the bridge is that the requests it spawns overlap.
     let rt = tokio::runtime::Runtime::new().map_err(StartupError::Runtime)?;
     let export = cli.remote_path.as_os_str().as_bytes();
+    // Spelled out rather than left to `Connection::connect`, because the
+    // session below keeps the same proposal: whatever a later redial asks for
+    // has to be what this handshake asked for, or the server settles different
+    // limits than the mount was configured with.
+    let proposal = Proposal {
+        writeback,
+        // Asked for whenever this mount means to come back, and cleared with
+        // the deadline otherwise: `--no-reconnect` restores today's behaviour
+        // on the wire as well as in the client, so the server retains nothing
+        // and the `ATTACH` reply carries no ticket.
+        resume: !reconnect.is_zero(),
+        ..Proposal::default()
+    };
     let (conn, limits, _root) = rt
-        .block_on(Connection::connect(addr, export, writeback))
+        .block_on(Connection::connect_with(addr, export, proposal))
         .map_err(|source| StartupError::Connect { addr, source })?;
+    // One object above the connection for the whole life of the mount, holding
+    // the ticket the handshake earned and swapping the connection underneath
+    // the bridge after a reconnect.
+    //
+    // Inside the runtime, like `Signals::install` below and for the same kind
+    // of reason: it spawns the reconnect supervisor, which needs a runtime
+    // context its plain signature does not advertise.
+    let ticket = conn.ticket;
+    let lbfs_session = rt
+        .block_on(async { Session::new(conn, addr, export.to_vec(), proposal, ticket, reconnect) });
 
     // Before the mount, not after. A signal arriving in the window between
     // `spawn_mount` returning and the handlers being installed would take its
@@ -225,10 +283,10 @@ fn run() -> Result<(), StartupError> {
         n_threads,
         cli.fuse_clone_fd,
     );
-    // Cloned rather than moved: the exit path still needs the connection after
-    // the mount has let go of it, to force the sync below.
+    // Cloned rather than moved: the exit path still needs the session after
+    // the mount has let go of it, to force the sync and detach below.
     let fs = LbfsFuse::new(
-        Arc::clone(&conn),
+        Arc::clone(&lbfs_session),
         rt.handle().clone(),
         ttl,
         entry_ttl,
@@ -274,7 +332,26 @@ fn run() -> Result<(), StartupError> {
     // flush it. Under `fsync = "ignore"` that is precisely the data a crash
     // would lose, and this is the driver-initiated half of the forced-sync
     // control (spec §11).
-    force_sync_on_exit(&rt, &conn);
+    //
+    // Over the session's *live* connection rather than the one this function
+    // dialled: a reconnect swaps it, and syncing over the socket that died
+    // would report a failure for an export that is perfectly reachable. `live`
+    // and never `current`, because the mount is already gone: a session still
+    // redialling — or dead — means the sync is skipped with the warning below,
+    // where `current` would park this exit for the whole reconnect deadline
+    // with nothing left to serve at the end of it.
+    match lbfs_session.live() {
+        Some(conn) => force_sync_on_exit(&rt, &conn),
+        None => {
+            tracing::warn!("there is no connection left; the export was not synced on the way out")
+        }
+    }
+
+    // Last, because everything above needed the session: `DETACH` hands the
+    // server's descriptors back now rather than at the end of the grace, and
+    // marking the session dead stops a supervisor that would otherwise still be
+    // dialling — and holding this process open past its own unmount.
+    rt.block_on(lbfs_session.shutdown());
 
     match ending {
         Ending::Signalled => Ok(()),
@@ -410,6 +487,31 @@ fn event_loop_threads(n: Option<usize>) -> Result<Option<usize>, StartupError> {
     }
 }
 
+/// The largest reconnect deadline this binary will accept, in seconds.
+///
+/// Ten minutes, and the number itself matters less than having one: past some
+/// point a parked request stops being a bounded wait and becomes the hang spec
+/// §8 names as the one outcome a filesystem must not have. What actually bounds
+/// a useful deadline is the server's own `resume_grace`, which the session
+/// clamps against — this only refuses an ask that was never going to mean
+/// anything.
+const MAX_RECONNECT_SECS: f64 = 600.0;
+
+/// How long the client may spend re-attaching, from the two flags that set it.
+///
+/// `--no-reconnect` wins outright, and a zero timeout says the same thing in
+/// numbers: no deadline, and — because the binary asks to resume only when it
+/// intends to come back — no request to resume in the handshake either.
+fn reconnect_deadline(secs: f64, disabled: bool) -> Result<Duration, StartupError> {
+    if disabled {
+        return Ok(Duration::ZERO);
+    }
+    if !secs.is_finite() || !(0.0..=MAX_RECONNECT_SECS).contains(&secs) {
+        return Err(StartupError::ReconnectTimeout);
+    }
+    Duration::try_from_secs_f64(secs).map_err(|_| StartupError::ReconnectTimeout)
+}
+
 /// The name lifetime, falling back to the attribute lifetime when the operator
 /// named only one.
 ///
@@ -537,6 +639,67 @@ mod tests {
         ]);
         assert_eq!(split.attr_timeout, 0.5);
         assert_eq!(split.entry_timeout, Some(60.0));
+    }
+
+    /// Both flags parse, and the absent case is the documented default rather
+    /// than a number somebody has to remember.
+    #[test]
+    fn the_reconnect_flags_parse() {
+        let plain = Cli::parse_from([
+            "lbfs-client",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(plain.reconnect_timeout, 10.0);
+        assert!(!plain.no_reconnect);
+
+        let named = Cli::parse_from([
+            "lbfs-client",
+            "--reconnect-timeout",
+            "2.5",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert_eq!(named.reconnect_timeout, 2.5);
+
+        let off = Cli::parse_from([
+            "lbfs-client",
+            "--no-reconnect",
+            "10.0.0.2:7000",
+            "/srv/exports/a",
+            "/mnt/lbfs",
+        ]);
+        assert!(off.no_reconnect);
+    }
+
+    /// `--no-reconnect` wins over any timeout beside it, and the timeout itself
+    /// refuses the two shapes that would turn a bounded park into something
+    /// else: a negative or non-finite number, and one so large the park is a
+    /// hang by any reading of spec §8.
+    #[test]
+    fn the_reconnect_deadline_refuses_nonsense_and_zeroes_on_the_flag() {
+        assert_eq!(
+            reconnect_deadline(10.0, false).unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            reconnect_deadline(0.5, false).unwrap(),
+            Duration::from_millis(500)
+        );
+        // Zero is the same switch as the flag, spelled as a number.
+        assert_eq!(reconnect_deadline(0.0, false).unwrap(), Duration::ZERO);
+        assert_eq!(reconnect_deadline(30.0, true).unwrap(), Duration::ZERO);
+
+        assert!(reconnect_deadline(-1.0, false).is_err());
+        assert!(reconnect_deadline(f64::NAN, false).is_err());
+        assert!(reconnect_deadline(f64::INFINITY, false).is_err());
+        assert!(reconnect_deadline(MAX_RECONNECT_SECS + 1.0, false).is_err());
+        assert_eq!(
+            reconnect_deadline(MAX_RECONNECT_SECS, false).unwrap(),
+            Duration::from_secs_f64(MAX_RECONNECT_SECS)
+        );
     }
 
     #[test]

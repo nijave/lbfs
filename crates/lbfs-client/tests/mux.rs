@@ -19,19 +19,23 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lbfs_client::conn::{ConnectError, Connection, Proposal};
+// Aliased: `Session` in this file is the scripted server's accepted socket,
+// and the two would otherwise share a name across four hundred lines.
+use lbfs_client::session::Session as LbfsSession;
 use lbfs_proto::frame::{
     FrameHeader, FLAG_NO_REPLY, MAGIC, MAX_BODY_SIZE, PROTOCOL_VERSION, STATUS_ATTACH_DENIED,
-    STATUS_NOT_EXPORTED, STATUS_OK, STATUS_VERSION_MISMATCH,
+    STATUS_NOT_EXPORTED, STATUS_NO_SESSION, STATUS_OK, STATUS_SESSION_BUSY,
+    STATUS_VERSION_MISMATCH,
 };
 use lbfs_proto::io::{read_body, read_header, write_frame};
 use lbfs_proto::ops::{
     AttachReply, AttachRequest, ForgetRequest, HelloReply, HelloRequest, LookupRequest, Opcode,
-    ReadRequest, WriteReply,
+    ReadRequest, ResumeReply, ResumeRequest, WriteReply,
 };
-use lbfs_proto::types::{Entry, FileAttr, XattrReply};
+use lbfs_proto::types::{Entry, FileAttr, SessionTicket, XattrReply};
 use lbfs_proto::Errno;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -112,6 +116,19 @@ impl Fake {
     /// version, the proposed limits, and the `writeback` flag that only the
     /// client knows.
     async fn handshake(&self, settled: &HelloReply, root: FileAttr) -> Session {
+        self.handshake_minting(settled, root, None).await
+    }
+
+    /// The same, with an `ATTACH` that mints a ticket.
+    ///
+    /// The shape a client that asked to resume meets, and the only way this
+    /// file's reconnecting cases get a session worth claiming back.
+    async fn handshake_minting(
+        &self,
+        settled: &HelloReply,
+        root: FileAttr,
+        ticket: Option<SessionTicket>,
+    ) -> Session {
         let (sock, _) = self.listener.accept().await.unwrap();
         let mut sess = Session { sock };
 
@@ -121,6 +138,11 @@ impl Fake {
         let req: HelloRequest = hello.decode();
         assert_eq!(req.magic, MAGIC);
         assert_eq!(req.version, PROTOCOL_VERSION);
+        assert_eq!(
+            req.resume,
+            ticket.is_some(),
+            "a ticket comes back only to a client that asked to resume"
+        );
         sess.reply_ok(hello.id, settled).await;
 
         let attach = sess.recv().await;
@@ -128,10 +150,75 @@ impl Fake {
         assert_eq!(attach.op, Opcode::Attach as u16);
         let req: AttachRequest = attach.decode();
         assert_eq!(req.path, EXPORT, "the export path travels as bytes");
-        sess.reply_ok(attach.id, &AttachReply { root_attr: root })
-            .await;
+        sess.reply_ok(
+            attach.id,
+            &AttachReply {
+                root_attr: root,
+                ticket,
+            },
+        )
+        .await;
 
         sess
+    }
+
+    /// Accept a reconnecting client: `HELLO`, then `RESUME` answered with
+    /// `status`.
+    ///
+    /// Hands back the ticket the client presented, which is what the
+    /// no-rotation rule (design §7.6) is asserted against. A refusal leaves the
+    /// returned session with nothing more to say — the real server closes after
+    /// one, and a caller reproduces that by dropping it.
+    async fn claim(&self, settled: &HelloReply, status: u16) -> (Session, SessionTicket) {
+        let (sock, _) = self.listener.accept().await.unwrap();
+        let mut sess = Session { sock };
+
+        let hello = sess.recv().await;
+        assert_eq!(hello.op, Opcode::Hello as u16);
+        let req: HelloRequest = hello.decode();
+        assert!(
+            req.resume,
+            "a reconnecting client asks to resume, or the server's guard refuses \
+             its claim for a shape that differs"
+        );
+        sess.reply_ok(hello.id, settled).await;
+
+        let claim = sess.recv().await;
+        assert_eq!(claim.id, 2, "RESUME is the second frame, where ATTACH was");
+        assert_eq!(claim.op, Opcode::Resume as u16);
+        assert_eq!(claim.data.len(), 0, "RESUME carries no data segment");
+        let req: ResumeRequest = claim.decode();
+        if status == STATUS_OK {
+            sess.reply_ok(
+                claim.id,
+                &ResumeReply {
+                    root_attr: root_dir(),
+                },
+            )
+            .await;
+        } else {
+            sess.reply(claim.id, status, &[], &[]).await;
+        }
+        (sess, req.ticket)
+    }
+
+    /// Accept a client and refuse its `HELLO` outright.
+    async fn refuse_hello(&self, status: u16) -> Session {
+        let (sock, _) = self.listener.accept().await.unwrap();
+        let mut sess = Session { sock };
+        let hello = sess.recv().await;
+        assert_eq!(hello.op, Opcode::Hello as u16);
+        sess.reply(hello.id, status, &[], &[]).await;
+        sess
+    }
+
+    /// Accept a client and drop the socket without answering anything.
+    ///
+    /// A transport failure from the client's side, indistinguishable from a
+    /// reset or a server that is still coming up.
+    async fn drop_one_dial(&self) {
+        let (sock, _) = self.listener.accept().await.unwrap();
+        drop(sock);
     }
 }
 
@@ -201,7 +288,43 @@ fn settled(max_inflight: u32, max_io_size: u32) -> HelloReply {
         max_inflight,
         max_io_size,
         max_body_size: MAX_BODY_SIZE,
+        resume_grace_ms: 0,
     }
+}
+
+/// The same, from a server that retains sessions after their sockets die.
+///
+/// The grace is what a client clamps its own reconnect deadline against, so it
+/// is deliberately far larger than any deadline this file sets.
+fn resumable() -> HelloReply {
+    HelloReply {
+        resume_grace_ms: 60_000,
+        ..settled(128, 1 << 20)
+    }
+}
+
+/// The one ticket this suite's scripted server ever hands out.
+///
+/// Fixed rather than random because nothing rotates (design §7.6): every claim
+/// in this file presents the value `ATTACH` minted, and the cases below assert
+/// exactly that.
+fn a_ticket() -> SessionTicket {
+    SessionTicket {
+        id: 42,
+        secret: [0x5A; 16],
+        grace_ms: 60_000,
+    }
+}
+
+/// An address nothing is listening on: bound for a moment, then given up.
+///
+/// A dial there is refused rather than hung, which leaves the client's deadline
+/// as the only thing that can end a reconnect.
+async fn dead_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
 }
 
 fn root_dir() -> FileAttr {
@@ -288,8 +411,14 @@ async fn connect_negotiates_attaches_and_reports_the_root() {
     assert_eq!(req.path, EXPORT);
     let mut root = root_dir();
     root.ino = 99;
-    sess.reply_ok(attach.id, &AttachReply { root_attr: root })
-        .await;
+    sess.reply_ok(
+        attach.id,
+        &AttachReply {
+            root_attr: root,
+            ticket: None,
+        },
+    )
+    .await;
 
     let (conn, hello, got_root) = client.await.unwrap().unwrap();
     assert_eq!(hello.version, PROTOCOL_VERSION);
@@ -318,6 +447,7 @@ async fn a_client_that_never_negotiates_writeback_says_so() {
         attach.id,
         &AttachReply {
             root_attr: root_dir(),
+            ticket: None,
         },
     )
     .await;
@@ -923,6 +1053,35 @@ async fn forgets_after_a_disconnect_neither_panic_nor_block() {
     assert!(conn.is_dead());
 }
 
+/// A forget dropped because the connection is dead lands in the same tally a
+/// queue-full drop does, so the count `destroy` reports covers every forget the
+/// mount never delivered — not only the ones lost to a stalled socket.
+///
+/// The batcher and the writer wind down at their own pace after the death, so
+/// which arm a given forget dies in — batched behind a writer that is gone, or
+/// refused outright once the batcher exited — depends on timing this test does
+/// not control. It feeds forgets until one is counted, bounded well above any
+/// batch interval.
+#[tokio::test]
+async fn forgets_dropped_on_a_dead_connection_are_counted() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+    drop(sess);
+    assert_eq!(conn.getattr(1, None).await.unwrap_err(), Errno::EIO);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut node = 100;
+    while conn.dropped_forgets() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no forget dropped on the dead connection was ever counted"
+        );
+        conn.send_forget(node, 1);
+        node += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Frames the client must refuse
 // ---------------------------------------------------------------------------
@@ -1116,6 +1275,478 @@ async fn a_reply_already_on_the_wire_survives_the_disconnect_behind_it() {
 
     assert_eq!(answered.await.unwrap().unwrap().node, 42);
     assert_eq!(stranded.await.unwrap().unwrap_err(), Errno::EIO);
+}
+
+// ---------------------------------------------------------------------------
+// The death signal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn closed_stays_pending_while_the_connection_lives() {
+    let fake = Fake::bind().await;
+    let (conn, _sess) = plain(&fake).await;
+
+    // Nothing has gone wrong, so nothing may wake: a `closed()` that completed
+    // here would have a reconnect supervisor redialling a healthy mount.
+    assert!(
+        tokio::time::timeout(NEVER, conn.closed()).await.is_err(),
+        "closed() must not complete on a live connection"
+    );
+    assert!(!conn.is_dead());
+}
+
+#[tokio::test]
+async fn closed_completes_when_the_server_drops_the_socket() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+
+    let waiter = {
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move { conn.closed().await })
+    };
+    // Still parked, because the connection is still up.
+    tokio::time::sleep(NEVER).await;
+    assert!(!waiter.is_finished());
+
+    drop(sess);
+    tokio::time::timeout(ARRIVES, waiter)
+        .await
+        .expect("closed() wakes on the death")
+        .unwrap();
+    assert!(conn.is_dead());
+}
+
+#[tokio::test]
+async fn closed_returns_at_once_on_a_connection_that_already_died() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+    drop(sess);
+    // Observe the death through a call, so the reader task has certainly run.
+    assert_eq!(conn.getattr(1, None).await.unwrap_err(), Errno::EIO);
+
+    // The waiter arrives after the notification, which is the case a bare
+    // `Notify` would miss for ever.
+    tokio::time::timeout(ARRIVES, conn.closed())
+        .await
+        .expect("closed() on a dead connection returns immediately");
+}
+
+#[tokio::test]
+async fn two_waiters_both_learn_of_one_death() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let conn = Arc::clone(&conn);
+        waiters.push(tokio::spawn(async move { conn.closed().await }));
+    }
+    tokio::time::sleep(NEVER).await;
+    drop(sess);
+
+    // Both, not whichever registered first: a permit handed to one waiter would
+    // leave the other parked on a connection that is never coming back.
+    for waiter in waiters {
+        tokio::time::timeout(ARRIVES, waiter)
+            .await
+            .expect("every waiter learns of the death")
+            .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The session above the connection
+// ---------------------------------------------------------------------------
+
+/// One call the way a FUSE callback makes it: ask the session for a
+/// connection, then spend it.
+async fn lookup_through(session: &LbfsSession, name: &[u8]) -> Result<Entry, Errno> {
+    session.current().await?.lookup(1, name).await
+}
+
+#[tokio::test]
+async fn a_session_forwards_a_call_and_reports_its_connections_death() {
+    let fake = Fake::bind().await;
+    let (conn, mut sess) = plain(&fake).await;
+    let session = LbfsSession::new(
+        Arc::clone(&conn),
+        fake.addr,
+        EXPORT.to_vec(),
+        Proposal::default(),
+        None,
+        Duration::ZERO,
+    );
+    // The mount reads these once, at `init`, and the kernel cannot be told a
+    // new number afterwards.
+    assert_eq!(session.limits, conn.limits);
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"f").await })
+    };
+    let req = sess.recv().await;
+    assert_eq!(req.op, Opcode::Lookup as u16, "the call reached the wire");
+    sess.reply_ok(req.id, &an_entry(2, 3)).await;
+    assert_eq!(
+        call.await.unwrap().expect("the lookup succeeds").node,
+        2,
+        "a session answers what its connection answers"
+    );
+
+    // The server vanishes. Nothing reconnects yet, so the session answers with
+    // exactly what the dead connection underneath it answers.
+    drop(sess);
+    assert_eq!(
+        lookup_through(&session, b"f").await.unwrap_err(),
+        Errno::EIO
+    );
+    assert!(conn.is_dead());
+}
+
+// ---------------------------------------------------------------------------
+// Reconnection
+// ---------------------------------------------------------------------------
+
+/// Wait for the client to have noticed that its socket died.
+///
+/// A closed socket is news that travels: the reader task has to wake, read the
+/// end of the stream and kill the connection before the session can know
+/// anything is wrong. A call issued inside that window is a call issued over a
+/// connection the client still believes in, and it fails `EIO` like any other
+/// request in flight at the break — which is correct, and not what the cases
+/// below are about. [`NEVER`] is orders of magnitude longer than the wake-up
+/// takes.
+async fn noticed() {
+    tokio::time::sleep(NEVER).await;
+}
+
+/// A session that will try to resume: a handshake that minted a ticket, and a
+/// deadline to redial inside.
+async fn resuming(fake: &Fake, deadline: Duration) -> (Arc<LbfsSession>, Session) {
+    resuming_at(fake, fake.addr, deadline).await
+}
+
+/// The same, redialling somewhere other than where the first connection came
+/// from — which only the deadline's case wants, and only because nothing is
+/// listening there.
+async fn resuming_at(
+    fake: &Fake,
+    redial: SocketAddr,
+    deadline: Duration,
+) -> (Arc<LbfsSession>, Session) {
+    let proposal = Proposal {
+        resume: true,
+        ..Proposal::default()
+    };
+    let addr = fake.addr;
+    let client =
+        tokio::spawn(async move { Connection::connect_with(addr, EXPORT, proposal).await });
+    let sess = fake
+        .handshake_minting(&resumable(), root_dir(), Some(a_ticket()))
+        .await;
+    let (conn, _limits, _root) = client.await.unwrap().expect("the handshake succeeds");
+    assert_eq!(
+        conn.ticket,
+        Some(a_ticket()),
+        "the ATTACH reply's ticket reaches the connection that earned it"
+    );
+    let session = LbfsSession::new(
+        conn,
+        redial,
+        EXPORT.to_vec(),
+        proposal,
+        Some(a_ticket()),
+        deadline,
+    );
+    (session, sess)
+}
+
+#[tokio::test]
+async fn a_call_in_flight_when_the_socket_dies_still_fails_at_once() {
+    let fake = Fake::bind().await;
+    // A deadline far above the bound below, so the assertion separates "failed
+    // with the socket" from "rode the reconnect" even on a loaded box.
+    let (session, mut sess) = resuming(&fake, Duration::from_secs(30)).await;
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"f").await })
+    };
+    let req = sess.recv().await;
+    assert_eq!(req.op, Opcode::Lookup as u16, "the call reached the wire");
+
+    // Design §3.1: the server may have executed it, may never have read it, and
+    // the client cannot tell. It fails, and it fails now rather than riding the
+    // reconnect — a `dd` mid-write reports at the same moment it does today.
+    // The bound is generous — it asserts "did not wait for the reconnect", not
+    // "fast" — because this runs under `make check` on arbitrary machines.
+    let started = Instant::now();
+    drop(sess);
+    assert_eq!(call.await.unwrap().unwrap_err(), Errno::EIO);
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(5),
+        "an in-flight call waited {waited:?} for a reconnect it must not wait for"
+    );
+}
+
+#[tokio::test]
+async fn a_call_issued_during_the_gap_completes_over_the_new_connection() {
+    let fake = Fake::bind().await;
+    let (session, sess) = resuming(&fake, Duration::from_secs(10)).await;
+    drop(sess);
+    noticed().await;
+
+    // Issued after the death, so nothing about its outcome is in doubt: it
+    // parks rather than failing (design §3.2).
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"parked").await })
+    };
+    tokio::time::sleep(NEVER).await;
+    assert!(
+        !call.is_finished(),
+        "a call issued during the gap must park, not fail"
+    );
+
+    let (mut second, presented) = fake.claim(&resumable(), STATUS_OK).await;
+    assert_eq!(presented, a_ticket());
+    let req = second.recv().await;
+    assert_eq!(
+        req.op,
+        Opcode::Lookup as u16,
+        "the parked call goes out on the second connection"
+    );
+    assert_eq!(req.decode::<LookupRequest>().name, b"parked");
+    second.reply_ok(req.id, &an_entry(2, 3)).await;
+    assert_eq!(
+        call.await.unwrap().expect("the parked call answers").node,
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_refused_claim_kills_the_session_with_no_second_dial() {
+    let fake = Fake::bind().await;
+    let (session, sess) = resuming(&fake, Duration::from_secs(10)).await;
+    drop(sess);
+    noticed().await;
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"parked").await })
+    };
+    let (refused, presented) = fake.claim(&resumable(), STATUS_NO_SESSION).await;
+    assert_eq!(presented, a_ticket());
+
+    assert_eq!(call.await.unwrap().unwrap_err(), Errno::EIO);
+    // And so does everything after it. Trap 1: a fresh `ATTACH` would start its
+    // node counter over, and the client's kernel still holds ids from the dead
+    // session (design §5).
+    assert_eq!(
+        lookup_through(&session, b"later").await.unwrap_err(),
+        Errno::EIO
+    );
+    assert!(
+        tokio::time::timeout(NEVER, fake.listener.accept())
+            .await
+            .is_err(),
+        "a server that answered `no such session` cannot change its mind, so \
+         nothing may dial it again"
+    );
+    drop(refused);
+}
+
+#[tokio::test]
+async fn a_busy_session_is_claimed_again_until_the_server_relents() {
+    let fake = Fake::bind().await;
+    let (session, sess) = resuming(&fake, Duration::from_secs(10)).await;
+    drop(sess);
+    noticed().await;
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"waited").await })
+    };
+
+    // The server holds the session and has not yet noticed the old socket
+    // (design §6.3). Refusing beats stealing, and the client's business is to
+    // come back.
+    let (busy, first) = fake.claim(&resumable(), STATUS_SESSION_BUSY).await;
+    drop(busy);
+    let (mut second, again) = fake.claim(&resumable(), STATUS_OK).await;
+    assert_eq!(first, a_ticket());
+    assert_eq!(again, first, "the retry presents the same ticket");
+
+    let req = second.recv().await;
+    assert_eq!(req.decode::<LookupRequest>().name, b"waited");
+    second.reply_ok(req.id, &an_entry(3, 1)).await;
+    assert_eq!(
+        call.await.unwrap().expect("the parked call answers").node,
+        3
+    );
+}
+
+#[tokio::test]
+async fn a_dial_that_fails_at_the_transport_is_tried_again() {
+    let fake = Fake::bind().await;
+    let (session, sess) = resuming(&fake, Duration::from_secs(10)).await;
+    drop(sess);
+    noticed().await;
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"waited").await })
+    };
+
+    // A dial that dies before the handshake finishes. A refused connect, a
+    // reset and a server still coming up all reach the client as the same
+    // `io::Error`, and none of them is an answer about the session.
+    fake.drop_one_dial().await;
+    let (mut second, presented) = fake.claim(&resumable(), STATUS_OK).await;
+    assert_eq!(presented, a_ticket());
+
+    let req = second.recv().await;
+    second.reply_ok(req.id, &an_entry(4, 1)).await;
+    assert_eq!(
+        call.await.unwrap().expect("the parked call answers").node,
+        4
+    );
+}
+
+#[tokio::test]
+async fn the_deadline_bounds_the_wait_for_a_server_that_never_comes_back() {
+    let fake = Fake::bind().await;
+    // Every dial is refused, so only the deadline can end this.
+    let nowhere = dead_address().await;
+    let deadline = Duration::from_millis(600);
+    let (session, sess) = resuming_at(&fake, nowhere, deadline).await;
+
+    let started = Instant::now();
+    drop(sess);
+    noticed().await;
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"parked").await })
+    };
+    assert_eq!(call.await.unwrap().unwrap_err(), Errno::EIO);
+    let waited = started.elapsed();
+
+    // Both bounds matter. Below the deadline the client gave up on a session it
+    // promised to keep trying for; far above it, spec §8's one forbidden
+    // outcome — a filesystem that hangs — is back. The slack is generous on
+    // purpose: the upper bound asserts "bounded", not "prompt", and this runs
+    // under `make check` on arbitrary machines.
+    assert!(
+        waited >= deadline,
+        "the reconnect gave up after {waited:?}, inside its own deadline"
+    );
+    assert!(
+        waited < deadline + Duration::from_secs(5),
+        "the parked call waited {waited:?}, which is not a bounded wait"
+    );
+    assert_eq!(
+        lookup_through(&session, b"after").await.unwrap_err(),
+        Errno::EIO,
+        "and the mount stays dead"
+    );
+}
+
+#[tokio::test]
+async fn a_version_mismatch_on_the_second_connection_is_final() {
+    let fake = Fake::bind().await;
+    let (session, sess) = resuming(&fake, Duration::from_secs(10)).await;
+    drop(sess);
+    noticed().await;
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"parked").await })
+    };
+    // Something answered, and it does not speak this protocol. Retrying cannot
+    // change that, and the mount is over.
+    let refused = fake.refuse_hello(STATUS_VERSION_MISMATCH).await;
+
+    assert_eq!(call.await.unwrap().unwrap_err(), Errno::EIO);
+    assert_eq!(
+        lookup_through(&session, b"later").await.unwrap_err(),
+        Errno::EIO
+    );
+    assert!(
+        tokio::time::timeout(NEVER, fake.listener.accept())
+            .await
+            .is_err(),
+        "a version mismatch is not retried"
+    );
+    drop(refused);
+}
+
+#[tokio::test]
+async fn every_claim_presents_the_ticket_attach_minted() {
+    let fake = Fake::bind().await;
+    let (session, sess) = resuming(&fake, Duration::from_secs(10)).await;
+    drop(sess);
+
+    let (mut second, first_claim) = fake.claim(&resumable(), STATUS_OK).await;
+    // Proves the second connection is installed and serving before it dies in
+    // its turn, so the second gap is a gap and not a continuation of the first.
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"between").await })
+    };
+    let req = second.recv().await;
+    second.reply_ok(req.id, &an_entry(5, 1)).await;
+    assert_eq!(call.await.unwrap().unwrap().node, 5);
+    drop(second);
+
+    let (mut third, second_claim) = fake.claim(&resumable(), STATUS_OK).await;
+    assert_eq!(first_claim, a_ticket());
+    assert_eq!(
+        second_claim, first_claim,
+        "nothing rotates: one secret serves the session's whole life (design §7.6)"
+    );
+
+    let call = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { lookup_through(&session, b"after").await })
+    };
+    let req = third.recv().await;
+    third.reply_ok(req.id, &an_entry(6, 1)).await;
+    assert_eq!(call.await.unwrap().unwrap().node, 6);
+}
+
+/// The exit path must never park behind a redial. `Session::live` is the
+/// accessor the binary's exit sync uses: it answers now — the connection, if
+/// there is a usable one, or `None` while the session is reconnecting or over —
+/// where `current()` would park for the whole `--reconnect-timeout` on a mount
+/// that is already gone.
+#[tokio::test]
+async fn the_exit_path_gets_no_connection_while_reconnecting_rather_than_parking() {
+    let fake = Fake::bind().await;
+    // Redial an address nothing answers on, so the supervisor stays inside its
+    // loop; the deadline is far above the bound below, so an exit path that
+    // parked would fail loudly rather than sneak under it.
+    let nowhere = dead_address().await;
+    let (session, sess) = resuming_at(&fake, nowhere, Duration::from_secs(30)).await;
+    drop(sess);
+    noticed().await;
+
+    let started = Instant::now();
+    assert!(
+        session.live().is_none(),
+        "a reconnecting session has no live connection for the exit sync"
+    );
+    session.shutdown().await;
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(5),
+        "the exit path spent {waited:?} behind a reconnect it must not wait for"
+    );
+    assert_eq!(
+        lookup_through(&session, b"after").await.unwrap_err(),
+        Errno::EIO,
+        "shutdown ended the mount"
+    );
 }
 
 // ---------------------------------------------------------------------------
