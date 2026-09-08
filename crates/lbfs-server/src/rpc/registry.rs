@@ -7,7 +7,7 @@
 //! `Arc<dyn FileSystem>` and its settled `Limits`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lbfs_proto::types::SessionTicket;
@@ -213,6 +213,43 @@ impl<T: Clone, G: PartialEq> Registry<T, G> {
     }
 }
 
+/// A hold on a minted or claimed entry, released when dropped.
+///
+/// The session task owns one from the moment `mint` or `claim` succeeds until
+/// its own teardown, so every path out — the ordinary end of the request loop,
+/// an error return anywhere in the handshake after the entry went `Attached`,
+/// a panic — flips the entry back to `Idle` and starts its grace. Without it, a
+/// handshake that failed after the mint (an encode failure, a reply write onto
+/// a socket that died again — the session-resumption design's §7.6) would leave
+/// the entry `Attached` forever: [`Registry::reap_expired`] removes `Idle`
+/// entries only, so the payload and its cap slot would survive until the
+/// process exits, and every later claim would answer `Busy`.
+///
+/// Dropping carries the epoch, so a lease that outlived a successful claim by a
+/// newer socket is a no-op — the same stale-epoch rule [`Registry::release`]
+/// always had.
+pub struct Lease<T: Clone, G: PartialEq> {
+    registry: Arc<Registry<T, G>>,
+    id: u64,
+    epoch: u64,
+}
+
+impl<T: Clone, G: PartialEq> Lease<T, G> {
+    pub fn new(registry: Arc<Registry<T, G>>, id: u64, epoch: u64) -> Lease<T, G> {
+        Lease {
+            registry,
+            id,
+            epoch,
+        }
+    }
+}
+
+impl<T: Clone, G: PartialEq> Drop for Lease<T, G> {
+    fn drop(&mut self) {
+        self.registry.release(self.id, self.epoch);
+    }
+}
+
 /// 16 bytes from `getrandom(2)`, looped until every byte fills.
 ///
 /// The call reports how many bytes it wrote, and a short read taken as
@@ -394,6 +431,57 @@ mod tests {
         assert!(
             matches!(r.claim(&t, &5), Claim::Ok { .. }),
             "the matching guard straight afterwards succeeds"
+        );
+    }
+
+    /// The wedge [`Lease`] exists to prevent: a handshake that fails after its
+    /// mint or claim drops the lease, and the entry must be claimable again
+    /// rather than answering `Busy` until the process exits.
+    #[test]
+    fn a_dropped_lease_releases_the_entry_for_the_next_claim() {
+        let r = Arc::new(registry());
+        let (t, epoch) = r.mint(7, 0).unwrap();
+        drop(Lease::new(Arc::clone(&r), t.id, epoch));
+        assert!(
+            matches!(r.claim(&t, &0), Claim::Ok { .. }),
+            "an entry whose lease dropped must be claimable, not Busy"
+        );
+    }
+
+    /// The other half of the wedge: an entry stuck `Attached` eats a cap slot
+    /// forever, because `reap_expired` matches `Idle` only. A dropped lease
+    /// starts the grace, so the reaper returns the slot.
+    #[test]
+    fn a_dropped_lease_lets_the_reaper_return_the_cap_slot() {
+        let r: Arc<Registry<u32, u32>> = Arc::new(Registry::new(Duration::from_millis(20), 1));
+        let (t, epoch) = r.mint(7, 0).unwrap();
+        assert!(r.mint(8, 0).is_none(), "the cap is taken");
+        drop(Lease::new(Arc::clone(&r), t.id, epoch));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            r.reap_expired(),
+            vec![7],
+            "the released entry expires and is reaped"
+        );
+        assert!(r.mint(8, 0).is_some(), "the cap slot returns with it");
+    }
+
+    /// A lease carries the epoch rule: one that outlived a newer claim is a
+    /// no-op on drop, exactly like the late `release` it stands in for.
+    #[test]
+    fn a_stale_lease_does_not_re_idle_a_claimed_entry() {
+        let r = Arc::new(registry());
+        let (t, first) = r.mint(7, 0).unwrap();
+        let stale = Lease::new(Arc::clone(&r), t.id, first);
+        r.release(t.id, first);
+        assert!(
+            matches!(r.claim(&t, &0), Claim::Ok { .. }),
+            "the idle entry must be claimable"
+        );
+        drop(stale);
+        assert!(
+            matches!(r.claim(&t, &0), Claim::Busy),
+            "a stale lease must not hand a live session back to the reaper"
         );
     }
 

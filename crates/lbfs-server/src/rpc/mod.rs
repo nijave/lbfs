@@ -75,7 +75,7 @@ use crate::fs::local::uring::UringExecutor;
 use crate::fs::local::LocalFs;
 use crate::fs::FileSystem;
 use dispatch::{dispatch, DataPayload};
-use registry::{Claim, Registry};
+use registry::{Claim, Lease, Registry};
 
 /// Sessions that outlive their sockets (spec §7, design §8.1).
 ///
@@ -86,9 +86,16 @@ use registry::{Claim, Registry};
 /// handshake.
 type SessionRegistry = Registry<Arc<dyn FileSystem>, Limits>;
 
-/// The registry entry a session task answers for: `(id, epoch)`, handed back
-/// at teardown. `None` for a session that never minted a ticket.
-type Retained = Option<(u64, u64)>;
+/// The hold a session task keeps on its registry entry, released on drop —
+/// `None` for a session that never minted a ticket.
+///
+/// A [`Lease`] rather than a bare `(id, epoch)`: it is created the moment
+/// `mint` or `claim` succeeds, so a handshake that fails afterwards — an encode
+/// failure, a reply write onto a socket that died again (design §7.6's second
+/// break during a reconnect) — releases the entry on its way out instead of
+/// leaving it `Attached` forever, answering every claim `Busy` and holding the
+/// whole `LocalFs` until the process exits.
+type Retained = Option<Lease<Arc<dyn FileSystem>, Limits>>;
 
 /// The smallest I/O ceiling the server will settle on.
 ///
@@ -206,7 +213,18 @@ fn spawn_reaper(registry: &Arc<SessionRegistry>, grace: Duration) {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            for payload in registry.reap_expired() {
+            let expired = registry.reap_expired();
+            if !expired.is_empty() {
+                // With the count that remains, so the mint and claim lines and
+                // this one together track the registry's population — the only
+                // operational view of it there is.
+                tracing::info!(
+                    reaped = expired.len(),
+                    sessions = registry.len(),
+                    "dropped sessions whose grace ran out"
+                );
+            }
+            for payload in expired {
                 tokio::task::spawn_blocking(move || drop(payload));
             }
         }
@@ -601,7 +619,13 @@ async fn attach(
     let retain = limits.resume && !server.cfg.resume_grace.is_zero();
     let (ticket, retained) = if retain {
         match server.registry.mint(Arc::clone(&fs), limits) {
-            Some((ticket, epoch)) => (Some(ticket), Some((ticket.id, epoch))),
+            // The lease takes over from here: if the reply below never lands,
+            // its drop releases the entry, so the grace and the reaper decide
+            // instead of an `Attached` wedge nothing can ever claim.
+            Some((ticket, epoch)) => (
+                Some(ticket),
+                Some(Lease::new(Arc::clone(&server.registry), ticket.id, epoch)),
+            ),
             None => {
                 tracing::info!(
                     path = %requested.display(),
@@ -621,6 +645,7 @@ async fn attach(
         path = %requested.display(),
         writeback = limits.writeback,
         resumable = ticket.is_some(),
+        sessions = server.registry.len(),
         "attached"
     );
     Ok(Some((fs, retained)))
@@ -632,7 +657,10 @@ async fn attach(
 /// One registry call and one `getattr`. `claim` runs every check under its own
 /// lock — the id, the constant-time secret, idle-within-deadline, and the
 /// settled `Limits` against the ones stored at mint — and a refusal of any kind
-/// mutates nothing, so there is nothing here to release and nothing to undo.
+/// mutates nothing, so a refusal leaves nothing to undo. A *success* does: the
+/// entry is `Attached` from that moment, so the claim comes wrapped in a
+/// [`Lease`] at once, and any failure between here and the request loop
+/// releases it on the way out.
 async fn resume(
     sock: &mut TcpStream,
     server: &Server,
@@ -651,8 +679,11 @@ async fn resume(
     // the line an operator reads when a mount died, so it names the peer and
     // the reason; the successful claim is what the reconnect drill greps for,
     // so it names the session id.
-    let (fs, epoch) = match server.registry.claim(&req.ticket, &limits) {
-        Claim::Ok { payload, epoch } => (payload, epoch),
+    let (fs, lease) = match server.registry.claim(&req.ticket, &limits) {
+        Claim::Ok { payload, epoch } => (
+            payload,
+            Lease::new(Arc::clone(&server.registry), req.ticket.id, epoch),
+        ),
         Claim::NoSession => {
             tracing::info!(?peer, id = req.ticket.id, "RESUME refused: no such session");
             reply(sock, hdr.request_id, STATUS_NO_SESSION, &[]).await?;
@@ -678,16 +709,22 @@ async fn resume(
         Ok(attr) => attr,
         Err(e) => {
             reply(sock, hdr.request_id, e.0, &[]).await?;
-            // The claim already flipped the entry to `Attached` under this
-            // task's epoch, so teardown's `release` returns it to `Idle` for
-            // the next attempt — the same path a served session takes.
-            return Ok(Some((fs, Some((req.ticket.id, epoch)))));
+            // The same shape as `attach`'s failure arms: report, close, and
+            // let the lease's drop return the entry to `Idle` for the next
+            // attempt. The client treats any status but OK as a refusal, so
+            // serving on would be serving a socket it has already abandoned.
+            return Ok(None);
         }
     };
     let body = encode(&ResumeReply { root_attr })?;
     reply(sock, hdr.request_id, STATUS_OK, &body).await?;
-    tracing::info!(?peer, id = req.ticket.id, "resumed a retained session");
-    Ok(Some((fs, Some((req.ticket.id, epoch)))))
+    tracing::info!(
+        ?peer,
+        id = req.ticket.id,
+        sessions = server.registry.len(),
+        "resumed a retained session"
+    );
+    Ok(Some((fs, Some(lease))))
 }
 
 /// A frame the session writes itself, before the writer task exists.
@@ -760,9 +797,6 @@ async fn serve_requests(
     let (tx, rx) = mpsc::channel::<OutFrame>(limits.max_inflight as usize);
     let socket_dead = Arc::new(Notify::new());
     let mut writer = tokio::spawn(writer_task(writer_half, rx, Arc::clone(&socket_dead)));
-    // Held out here, before `server` moves into the session, so the entry can
-    // be released the instant the read loop returns — before the drain below.
-    let registry = Arc::clone(&server.registry);
     let session = Session {
         server,
         limits,
@@ -774,18 +808,16 @@ async fn serve_requests(
 
     let result = read_loop(&session, &mut reader, &socket_dead).await;
 
-    // Release the registry entry *before* the drain, not after (Trap 2 /
-    // design §8.1). The drain below waits up to `DRAIN_TIMEOUT` for replies
-    // already produced; a `RESUME` arriving one second into that wait must not
-    // queue behind it. Releasing flips the entry to `Idle` so a claim can
-    // proceed at once, while the handler tasks still holding their own
-    // `Arc<dyn FileSystem>` clones drain safely against the same tables (each
-    // behind its own mutex). The stale-epoch rule in `release` makes a
-    // superseded task's late release a no-op, so a socket the new one already
-    // claimed is never handed back to the reaper.
-    if let Some((id, epoch)) = retained {
-        registry.release(id, epoch);
-    }
+    // Release the registry entry — by dropping its lease — *before* the drain,
+    // not after (Trap 2 / design §8.1). The drain below waits up to
+    // `DRAIN_TIMEOUT` for replies already produced; a `RESUME` arriving one
+    // second into that wait must not queue behind it. The release flips the
+    // entry to `Idle` so a claim can proceed at once, while the handler tasks
+    // still holding their own `Arc<dyn FileSystem>` clones drain safely against
+    // the same tables (each behind its own mutex). The stale-epoch rule in
+    // `release` makes a superseded task's late release a no-op, so a socket the
+    // new one already claimed is never handed back to the reaper.
+    drop(retained);
 
     // Drop the session's own sender, then wait for the writer. Handler tasks
     // still hold clones, so this drains every reply that was produced before
@@ -1339,6 +1371,173 @@ mod tests {
         assert!(!writer.is_finished(), "the write should still be blocked");
 
         writer.abort();
+    }
+
+    /// A `Server` built by hand, so the test neither calls `init_process` —
+    /// umask and rlimits are process-wide, and other tests in this binary read
+    /// them — nor spawns the reaper it does not want running.
+    fn bare_server(export: &Path, resume_grace: Duration) -> Server {
+        use crate::config::FsyncPolicy;
+        let cfg = Arc::new(Config {
+            listen: "127.0.0.1:0".to_string(),
+            allowed_paths: vec![export.canonicalize().unwrap().to_str().unwrap().to_string()],
+            max_inflight: 128,
+            max_io_size: 1 << 20,
+            fsync: FsyncPolicy::Honor,
+            resume_grace,
+            max_resumable_sessions: 4,
+        });
+        let allow = Arc::new(Allowlist::new(&cfg.allowed_paths).unwrap());
+        let registry = Arc::new(SessionRegistry::new(
+            cfg.resume_grace,
+            cfg.max_resumable_sessions,
+        ));
+        Server {
+            cfg,
+            allow,
+            uring: UringExecutor::new(URING_THREADS, URING_ENTRIES).unwrap(),
+            pool: BufferPool::new(1 << 20, 2),
+            max_io_size: 1 << 20,
+            registry,
+        }
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, client) = tokio::join!(listener.accept(), TcpStream::connect(addr));
+        (accepted.unwrap().0, client.unwrap())
+    }
+
+    fn test_limits() -> Limits {
+        Limits {
+            max_inflight: 128,
+            max_io_size: 1 << 20,
+            writeback: false,
+            resume: true,
+        }
+    }
+
+    /// A `RESUME` that claims successfully and then cannot write its reply must
+    /// release the claim, or the session wedges: the entry stays `Attached`,
+    /// which `reap_expired` never removes, so it answers every later claim
+    /// `Busy` and holds the whole filesystem — node table, `O_PATH`
+    /// descriptors, open handles — until the process exits. Design §7.6 names
+    /// the scenario: the socket dies again mid-reconnect, after the claim and
+    /// before the reply.
+    ///
+    /// The write failure is forced without any timing: shutting down this
+    /// side's own write half makes the next `write(2)` fail whatever the peer
+    /// does.
+    #[tokio::test]
+    async fn a_resume_whose_reply_write_fails_releases_the_claimed_session() {
+        use crate::config::FsyncPolicy;
+        let export = tempfile::tempdir().unwrap();
+        let server = bare_server(export.path(), Duration::from_secs(60));
+        let limits = test_limits();
+        let fs: Arc<dyn FileSystem> = Arc::new(
+            LocalFs::new(
+                export.path(),
+                FsyncPolicy::Honor,
+                limits.writeback,
+                server.uring.clone(),
+                server.pool.clone(),
+            )
+            .unwrap(),
+        );
+        let (ticket, epoch) = server
+            .registry
+            .mint(Arc::clone(&fs), limits)
+            .expect("under the cap");
+        server.registry.release(ticket.id, epoch);
+
+        let (mut sock, mut client) = tcp_pair().await;
+        let body = postcard::to_allocvec(&ResumeRequest { ticket }).unwrap();
+        write_frame(
+            &mut client,
+            FrameHeader {
+                request_id: 9,
+                op_or_status: Opcode::Resume as u16,
+                flags: 0,
+                body_len: body.len() as u32,
+                data_len: 0,
+            },
+            &body,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let hdr = read_header(&mut sock).await.unwrap();
+        // From here no reply can leave. The claim below still succeeds; the
+        // question is what state the failed write leaves the entry in.
+        tokio::io::AsyncWriteExt::shutdown(&mut sock).await.unwrap();
+        let outcome = resume(&mut sock, &server, limits, hdr).await;
+        assert!(outcome.is_err(), "the reply write must fail");
+
+        assert!(
+            matches!(server.registry.claim(&ticket, &limits), Claim::Ok { .. }),
+            "the failed handshake left the session unclaimable; an Attached \
+             wedge answers Busy forever and only a process restart frees it"
+        );
+    }
+
+    /// The same wedge on the fresh-attach side: `ATTACH` mints, then its reply
+    /// write fails. The entry must go back to `Idle` so the grace and the
+    /// reaper decide — the client never learned the ticket, so nothing else
+    /// can free the slot it occupies.
+    #[tokio::test]
+    async fn an_attach_whose_reply_write_fails_releases_the_minted_session() {
+        let export = tempfile::tempdir().unwrap();
+        let grace = Duration::from_millis(30);
+        let server = bare_server(export.path(), grace);
+        let limits = test_limits();
+
+        let (mut sock, mut client) = tcp_pair().await;
+        let body = postcard::to_allocvec(&lbfs_proto::ops::AttachRequest {
+            path: export
+                .path()
+                .canonicalize()
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+        })
+        .unwrap();
+        write_frame(
+            &mut client,
+            FrameHeader {
+                request_id: 2,
+                op_or_status: Opcode::Attach as u16,
+                flags: 0,
+                body_len: body.len() as u32,
+                data_len: 0,
+            },
+            &body,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let hdr = read_header(&mut sock).await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut sock).await.unwrap();
+        let outcome = attach(&mut sock, &server, limits, hdr).await;
+        assert!(outcome.is_err(), "the reply write must fail");
+        assert_eq!(
+            server.registry.len(),
+            1,
+            "the mint happened before the failure"
+        );
+
+        // `Idle` is observable through the reaper: an `Attached` wedge is
+        // exactly the state `reap_expired` cannot touch.
+        tokio::time::sleep(grace + Duration::from_millis(30)).await;
+        assert_eq!(
+            server.registry.reap_expired().len(),
+            1,
+            "the entry must be reapable once its grace runs out; a wedged \
+             Attached entry holds its cap slot until the process exits"
+        );
     }
 
     #[tokio::test]

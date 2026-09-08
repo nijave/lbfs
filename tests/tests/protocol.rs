@@ -677,6 +677,41 @@ async fn the_ticket_serves_every_claim_the_session_makes() {
     assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
 }
 
+/// A second break during the reconnect itself (design §7.6): the socket dies
+/// between sending `RESUME` and reading its reply, so the server's claim may
+/// succeed on a connection the client has already abandoned. The next claim
+/// with the same ticket must still land — a claim whose handshake failed after
+/// the entry went `Attached` must release it, not wedge it `Busy` forever.
+///
+/// The reply-write failure cannot be forced deterministically over loopback
+/// TCP, so the deterministic pin of that exact path is the unit case
+/// `rpc::tests::a_resume_whose_reply_write_fails_releases_the_claimed_session`;
+/// this case covers the same scenario end to end, whichever side of the write
+/// the break lands on.
+#[tokio::test]
+async fn a_claim_abandoned_before_its_reply_leaves_the_session_claimable() {
+    let srv = TestServer::start().await;
+    std::fs::write(srv.join("f"), b"still here").unwrap();
+    let a = srv.attached_resumable().await;
+    let ticket = a.ticket().unwrap();
+    drop(a);
+
+    // Send the claim, then die without reading the answer.
+    let mut b = srv.connect().await;
+    let _: HelloReply = b
+        .hello(&hello_resuming(SERVER_WINDOW, SERVER_IO))
+        .await
+        .ok();
+    b.begin(Opcode::Resume, &ResumeRequest { ticket }).await;
+    drop(b);
+
+    // The retry loop inside `resume_ok` is the bound: a session wedged
+    // `Attached` answers `SESSION_BUSY` past any number of attempts.
+    let mut c = resume_ok(&srv, ticket).await;
+    let ent: Entry = c.lookup(ROOT_NODE, b"f").await.ok();
+    assert_eq!(ent.attr.size, 10, "the retained session still serves");
+}
+
 // ---------------------------------------------------------------------------
 // DETACH: dropping a retained session at a clean unmount
 // ---------------------------------------------------------------------------

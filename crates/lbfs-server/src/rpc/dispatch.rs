@@ -401,11 +401,12 @@ pub(crate) async fn dispatch(
         }
         // The session runs these itself: the handshake opcodes — `RESUME`
         // included, being `ATTACH`'s sibling — are refused after the
-        // handshake, and `FORGET` carries `NO_REPLY` and never reaches a
-        // reply-producing path. `EINVAL` rather than `unreachable!` so a future
-        // refactor that lets one slip through answers the client instead of
-        // panicking a request task and stranding it. `DETACH` sits here only
-        // until the session answers it in the read loop; nothing sends it yet.
+        // handshake, `DETACH` is answered inline in the read loop beside
+        // `FORGET` (the client sends it once, at a clean unmount), and `FORGET`
+        // carries `NO_REPLY` and never reaches a reply-producing path. `EINVAL`
+        // rather than `unreachable!` so a future refactor that lets one slip
+        // through answers the client instead of panicking a request task and
+        // stranding it.
         Opcode::Hello | Opcode::Attach | Opcode::Resume | Opcode::Detach | Opcode::Forget => {
             err(Errno::EINVAL)
         }
