@@ -1152,10 +1152,10 @@ git commit -m "feat(client): --reconnect-timeout, --no-reconnect, DETACH at unmo
 
 **Interfaces:**
 - Consumes: Tasks 10 and 11.
-- Produces: `Breaker`, a forwarding proxy the test can sever, plus four cases
-  through a real mount.
+- Produces: `Breaker`, a forwarding proxy the test can sever, plus the five
+  cases of Step 2 through a real mount.
 
-- [ ] **Step 1: Write the proxy**
+- [x] **Step 1: Write the proxy**
 
 The loopback harness starts its server in-process and the client connects
 straight to it, so no test can sever the socket without killing the server —
@@ -1171,7 +1171,7 @@ opted in detaches before the fd census reads.
 Keep it small, and say plainly what it stands for: a test double for a flaky
 network, not a proxy anybody ships.
 
-- [ ] **Step 2: Write the failing cases**
+- [x] **Step 2: Write the failing cases**
 
 1. **An open descriptor survives.** Open a file through the mount, write to it,
    `sever()`, wait for the mount to answer again, write more through the *same*
@@ -1199,19 +1199,19 @@ network, not a proxy anybody ships.
    the teardown's `Session::shutdown()` sent `DETACH` rather than leaving the
    session to the reaper.
 
-- [ ] **Step 3: Run the cases**
+- [x] **Step 3: Run the cases**
 
 Run: `cargo test -p lbfs-tests --test loopback sever -- --ignored --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 4: Run the whole loopback suite and `make check`**
+- [x] **Step 4: Run the whole loopback suite and `make check`**
 
 Expected: PASS, including
 `a_dead_server_leaves_an_eio_mount_that_still_unmounts` unchanged and on
 today's clock — its mount never asks to resume, so there is no ten-second park
 and no timing shift at all.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/tests/loopback.rs

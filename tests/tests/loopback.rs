@@ -57,7 +57,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use lbfs_client::conn::{Connection, Proposal};
@@ -99,6 +99,26 @@ const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 /// interval, never a substitute for a condition: nothing here sleeps for a
 /// fixed time and then asserts.
 const POLL: Duration = Duration::from_millis(10);
+
+/// How long a severed mount may spend re-attaching before it gives up.
+///
+/// Ten seconds, which is what `--reconnect-timeout` defaults to and what the
+/// drills are timed against. It sits under the three-quarters clamp
+/// `Session::new` applies to the server's 60-second grace, so the number the
+/// cases below reason about is this one.
+const RECONNECT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long to give the client to notice that its socket died, before issuing
+/// the call that has to park.
+///
+/// A closed socket is news that travels: the reader task has to wake, read the
+/// end of the stream and kill the connection before the session can know
+/// anything is wrong. A call issued inside that window rides a connection the
+/// client still believes in and fails `EIO` like anything else in flight at the
+/// break — which is correct, and not what the severed-connection cases are
+/// about. `crates/lbfs-client/tests/mux.rs` pauses for the same reason and for
+/// the same length; both are orders of magnitude longer than the wake-up takes.
+const NOTICED: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // Host requirements
@@ -229,16 +249,122 @@ struct Opts {
     /// Name lifetime. Defaults to `ttl`, which is what the shipped client does
     /// when `--entry-timeout` is absent.
     entry_ttl: Duration,
+    /// Put a [`Breaker`] between the client and the server, and point the
+    /// client at it. Every other mount in this file dials the server straight,
+    /// where the only way to take the socket away is to take the server with
+    /// it.
+    breaker: bool,
+    /// Ask the server to hold this mount's session across a disconnection, and
+    /// give the client [`RECONNECT_DEADLINE`] to re-attach inside.
+    ///
+    /// Off by default because the library is off by default (design §8.2).
+    /// Every case that does not name it keeps today's teardown semantics
+    /// exactly — no ticket in the `ATTACH` reply, nothing retained past a
+    /// socket, no parked call — which is what makes the fd-census cases and
+    /// `a_dead_server_leaves_an_eio_mount_that_still_unmounts` mean after this
+    /// feature what they meant before it.
+    resume: bool,
 }
 
 impl Default for Opts {
-    /// What the shipped client does by default (spec §7).
+    /// What the shipped client does by default (spec §7), except for
+    /// resumption: the *library* default is off, and only the cases that sever
+    /// a connection ask for it.
     fn default() -> Opts {
         Opts {
             writeback: true,
             fsync: FsyncPolicy::Honor,
             ttl: Duration::from_secs(1),
             entry_ttl: Duration::from_secs(1),
+            breaker: false,
+            resume: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A severable connection
+// ---------------------------------------------------------------------------
+
+/// A forwarding proxy between the client and the server, with a way to cut it.
+///
+/// The harness starts its server in this process and the client dials it
+/// straight, so nothing here could take the socket away without taking the
+/// server down with it — and a mount surviving a transport failure to a server
+/// that is *still running* is the whole of what session resumption promises.
+/// This listens on a port of its own, dials the real server for every
+/// connection it accepts, and copies both directions. One task owns both
+/// sockets of a link, so [`Breaker::sever`] drops the halves by aborting it:
+/// each peer sees its connection end, while the listener goes on accepting,
+/// which is what the client's redial needs.
+///
+/// **A test double for a flaky network, not a proxy anybody ships.** No
+/// backpressure story worth the name, no shutdown handling beyond what
+/// `copy_bidirectional` does for it, and no reason to exist outside this file:
+/// `ss -K` is the real tool and needs two machines, which is `vm/tests/`.
+struct Breaker {
+    /// Where the client dials. The server's own address never reaches it.
+    addr: SocketAddr,
+    /// One entry per link the proxy has built and not yet cut, each owning both
+    /// of that link's sockets.
+    links: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Breaker {
+    /// Start forwarding to `upstream`, on the runtime that serves it.
+    ///
+    /// The server's runtime rather than a third one: the proxy stands in for
+    /// the wire, and a case that takes the server away
+    /// ([`ServerSide::kill`]) means the wire to go with it.
+    fn start(rt: &Runtime, upstream: SocketAddr) -> Breaker {
+        let listener = rt
+            .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+            .expect("the proxy binds a loopback port of its own");
+        let addr = listener.local_addr().unwrap();
+        let links: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::clone(&links);
+        rt.spawn(async move {
+            loop {
+                let Ok((mut down, _peer)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut up) = tokio::net::TcpStream::connect(upstream).await else {
+                    // Nothing to forward to — the server is gone. Dropping the
+                    // accepted socket ends the client's dial the way a refused
+                    // one would, and its supervisor comes back.
+                    continue;
+                };
+                // What both real ends set on their own sockets. A proxy that
+                // let Nagle hold a reply would add latency this suite would
+                // then have to explain.
+                let _ = down.set_nodelay(true);
+                let _ = up.set_nodelay(true);
+                let link = tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+                });
+                accepted.lock().unwrap().push(link);
+            }
+        });
+        Breaker { addr, links }
+    }
+
+    /// Cut every link running through the proxy.
+    ///
+    /// Aborting a link drops the two sockets it owns, which is what a reset in
+    /// the middle looks like from either end: the client's connection dies and
+    /// the server's session task tears down and hands its session to the
+    /// registry. The listener is deliberately untouched — the supervisor
+    /// redials this same address, and the next accept builds a fresh link to
+    /// the same, still-running server.
+    fn sever(&self) {
+        let links = std::mem::take(&mut *self.links.lock().unwrap());
+        assert!(
+            !links.is_empty(),
+            "sever() with nothing to sever: no connection has come through the \
+             proxy, so this case is not testing what it means to test"
+        );
+        for link in links {
+            link.abort();
         }
     }
 }
@@ -278,6 +404,12 @@ impl ServerSide {
         ServerSide { rt: Some(rt), addr }
     }
 
+    /// The runtime the server is serving on, for anything that belongs to its
+    /// side of the wire.
+    fn rt(&self) -> &Runtime {
+        self.rt.as_ref().expect("the server is still running")
+    }
+
     /// Take the server away without touching the mount.
     ///
     /// Shutting the runtime down drops every task it owns, and with them both
@@ -302,7 +434,17 @@ impl ServerSide {
 /// export through it. See [`Loopback::drop`].
 struct Loopback {
     session: Option<fuser::BackgroundSession>,
+    /// The client's own session, the object the mount holds and the one whose
+    /// teardown sends `DETACH`. Dropped after the FUSE session and before the
+    /// connection below, because it holds the *current* connection — which is
+    /// a different one from `conn` on any mount that has been severed.
+    lbfs_session: Option<Arc<Session>>,
+    /// The connection this mount started on, and after a sever a dead one: the
+    /// session swapped a new one in underneath the bridge, and a `Connection`
+    /// that has died is never revived.
     conn: Option<Arc<Connection>>,
+    /// The proxy in the path, when the case asked for one.
+    breaker: Option<Breaker>,
     /// The bridge's callbacks spawn onto this runtime's handle, so it has to
     /// outlive the session and the connection whose reader and writer tasks
     /// live on it. A case that wants to drive the connection directly, rather
@@ -328,35 +470,60 @@ impl Loopback {
         let mnt = mnt.canonicalize().unwrap();
 
         let server = ServerSide::start(&export, &opts);
+        // The proxy stands where the wire would be, so the address the client
+        // dials is its own rather than the server's — and every redial goes
+        // back to the same place, which is what makes a sever survivable.
+        let breaker = opts
+            .breaker
+            .then(|| Breaker::start(server.rt(), server.addr));
+        let addr = breaker.as_ref().map_or(server.addr, |b| b.addr);
         let client_rt = runtime("lbfs-client");
         // The same proposal the binary builds, and named here for the same
         // reason: the session keeps it, so a redial asks for what this
         // handshake asked for.
         let proposal = Proposal {
             writeback: opts.writeback,
+            resume: opts.resume,
             ..Proposal::default()
         };
         let (conn, limits, _root_attr) = client_rt
             .block_on(Connection::connect_with(
-                server.addr,
+                addr,
                 export.as_os_str().as_bytes(),
                 proposal,
             ))
             .expect("the client attaches to the export this test just exported");
-        // The mount holds the session; this harness keeps its own clone of the
-        // connection, because the cases that reach past the mount — the fd
+        // Whatever the `ATTACH` reply carried: `Some` for a case that asked to
+        // resume against a server that retains, `None` everywhere else, and a
+        // session with no ticket never redials whatever deadline it is handed.
+        let ticket = conn.ticket;
+        let deadline = if opts.resume {
+            RECONNECT_DEADLINE
+        } else {
+            Duration::ZERO
+        };
+        // Built inside the runtime, exactly as `main.rs` builds it and for the
+        // reason its doc comment gives: a session that means to come back
+        // spawns the reconnect supervisor, which needs a runtime context its
+        // plain signature does not advertise.
+        //
+        // The mount holds this session; the harness keeps a clone, because its
+        // teardown is what sends `DETACH`. It keeps a clone of the first
+        // connection too, because the cases that reach past the mount — the fd
         // census, the forced-sync acknowledgement — speak to the socket.
-        let session = Session::new(
-            Arc::clone(&conn),
-            server.addr,
-            export.as_os_str().as_bytes().to_vec(),
-            proposal,
-            None,
-            Duration::ZERO,
-        );
+        let lbfs_session = client_rt.block_on(async {
+            Session::new(
+                Arc::clone(&conn),
+                addr,
+                export.as_os_str().as_bytes().to_vec(),
+                proposal,
+                ticket,
+                deadline,
+            )
+        });
 
         let fs = LbfsFuse::new(
-            Arc::clone(&session),
+            Arc::clone(&lbfs_session),
             client_rt.handle().clone(),
             opts.ttl,
             opts.entry_ttl,
@@ -374,7 +541,9 @@ impl Loopback {
 
         let mounted = Loopback {
             session: Some(session),
+            lbfs_session: Some(lbfs_session),
             conn: Some(conn),
+            breaker,
             client_rt,
             server,
             root: Some(root),
@@ -414,6 +583,13 @@ impl Loopback {
 
     fn conn(&self) -> &Arc<Connection> {
         self.conn.as_ref().expect("the connection is still held")
+    }
+
+    /// The proxy in the path, for a case that means to cut it.
+    fn breaker(&self) -> &Breaker {
+        self.breaker
+            .as_ref()
+            .expect("this case has to ask for `breaker: true` in its `Opts`")
     }
 
     /// Run one of the connection's own futures to completion.
@@ -477,7 +653,7 @@ impl Loopback {
                 std::panic::catch_unwind(AssertUnwindSafe(move || session.umount_and_join()));
             let _ = done.send(matches!(outcome, Ok(Ok(()))));
         });
-        match ended.recv_timeout(UNMOUNT_TIMEOUT) {
+        let unmounted = match ended.recv_timeout(UNMOUNT_TIMEOUT) {
             Ok(true) => true,
             Ok(false) => {
                 eprintln!("lbfs loopback: the FUSE session ended badly; forcing the unmount");
@@ -485,16 +661,32 @@ impl Loopback {
                 !is_fuse_mount(&self.mnt)
             }
             Err(_) => false,
+        };
+        // The call `main.rs` makes, where `main.rs` makes it: after the drain,
+        // because the drain flushes writeback and the `FORGET`s the kernel
+        // emits for every evicted inode, and both need the session. On a mount
+        // that asked to resume it sends `DETACH`, which is what hands the
+        // server's descriptors back now rather than at the end of the grace; on
+        // one that did not it marks the session dead and nothing else — no
+        // ticket, nothing to detach, and no supervisor to stop.
+        if let Some(lbfs) = &self.lbfs_session {
+            self.client_rt.block_on(lbfs.shutdown());
         }
+        unmounted
     }
 
-    /// Drop this side's reference to the connection, closing the socket.
+    /// Drop this side's references to the session and the connection, closing
+    /// the socket.
     ///
     /// Separate from [`Loopback::unmount`] because the interesting assertions
-    /// live between the two: after the unmount the session's `Arc` is gone but
-    /// the socket is still open, which is the only moment at which the server's
-    /// answer to "did every `FORGET` land?" is still observable.
+    /// live between the two: after the unmount the mount's own `Arc` is gone
+    /// but the socket is still open, which is the only moment at which the
+    /// server's answer to "did every `FORGET` land?" is still observable.
+    ///
+    /// Both references, because after a reconnect they are two different
+    /// connections and the live one is the session's.
     fn disconnect(&mut self) {
+        self.lbfs_session = None;
         self.conn = None;
     }
 
@@ -2062,6 +2254,316 @@ fn a_dead_server_leaves_an_eio_mount_that_still_unmounts() {
         "a mount whose server died could not be unmounted"
     );
     assert_eq!(std::fs::read_dir(&mnt).unwrap().count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A severed connection
+// ---------------------------------------------------------------------------
+//
+// What every case below is about, and what none of the cases above can reach:
+// the server stays up and the *wire* fails. The client re-attaches to the
+// session it already had, so node ids, open descriptors and directory cursors
+// go on meaning what they meant (design §2), while anything that was in flight
+// at the break still failed `EIO` (design §3.1).
+//
+// These are the only cases in the file that ask for resumption. Every other
+// mount here keeps the library default — off — so nothing else in the suite
+// changed clocks or teardown when this feature landed.
+
+/// The `Opts` every severed-connection case starts from.
+fn severable() -> Opts {
+    Opts {
+        breaker: true,
+        resume: true,
+        ..Opts::default()
+    }
+}
+
+/// Wait until the mount is serving again after a [`Breaker::sever`].
+///
+/// The probe is a `readdir` of the mount root, because `OPENDIR` is a request
+/// no cache can answer: an `Ok` here is a server on the other end of a working
+/// socket rather than the client's own memory of one. The first call parks
+/// inside the client for as long as the reconnect takes, which is the feature
+/// working rather than a wait; the bound around it is for the case where the
+/// mount never comes back at all.
+fn wait_for_the_mount_to_answer_again(mnt: &Path) {
+    wait_for(
+        "the mount to answer again after the sever",
+        SETTLE_TIMEOUT,
+        || std::fs::read_dir(mnt).is_ok(),
+    );
+}
+
+/// A descriptor open across a severed connection still addresses its file.
+///
+/// The `Fh` is an index into a table the server keeps, and the descriptor
+/// behind it is what pins the inode — so the second write below lands in the
+/// same file as the first because neither the table nor the descriptor ever
+/// went away. A client that re-opened by name would pass this case and fail
+/// `a_held_descriptor_keeps_its_file_across_a_sever`, which is why the two are
+/// separate.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn an_open_descriptor_survives_a_sever() {
+    let mut lb = Loopback::start(severable());
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+
+    let mut held = std::fs::File::create(mnt.join("held")).unwrap();
+    held.write_all(b"before the break").unwrap();
+    // On the server before the cut, so what the case proves afterwards is
+    // about the descriptor rather than about what the page cache happened to
+    // still be holding.
+    held.sync_all().unwrap();
+
+    lb.breaker().sever();
+    std::thread::sleep(NOTICED);
+    wait_for_the_mount_to_answer_again(&mnt);
+
+    // The same `File`, so the same `Fh`, so the same descriptor on the server.
+    held.write_all(b", and after it").unwrap();
+    held.sync_all().unwrap();
+    drop(held);
+
+    // Read from the export rather than back through the mount, which would
+    // only prove the mount agrees with itself.
+    assert_eq!(
+        std::fs::read_to_string(export.join("held")).unwrap(),
+        "before the break, and after it",
+        "the two writes had to land in order, in one file, through one \
+         descriptor that outlived the socket under it"
+    );
+    lb.unmount();
+}
+
+/// A directory walk in progress survives a severed connection.
+///
+/// `OPENDIR` snapshots the listing and the handle hands out cookies over that
+/// snapshot (spec §3.3), so a resumed session continues the same listing from
+/// the last cookie the *first* connection issued. Under any design that rebuilt
+/// the handle instead, that cookie belongs to a snapshot nobody has any more:
+/// `EINVAL`, or a listing quietly missing names — which is the failure
+/// `readdir(3)` must never have.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn a_directory_walk_survives_a_sever() {
+    // Enough names, at enough bytes each, that no single `getdents64` can hold
+    // the listing: glibc reads into a 32 KiB buffer and the kernel charges
+    // `align8(152 + namelen)` an entry, so this needs three of them and the
+    // last two happen after the break.
+    const NAMES: usize = 300;
+    // One server-side `O_PATH` per name the listing resolves, as in the other
+    // large-directory cases.
+    require_open_files(NAMES as u64 + 256);
+
+    let mut lb = Loopback::start(severable());
+    let mnt = lb.mnt().to_path_buf();
+
+    // Built on the export and never listed through the mount before it is
+    // complete, so no cached listing can flatter the result.
+    let dir = lb.export().join("walk");
+    std::fs::create_dir(&dir).unwrap();
+    let mut want = BTreeSet::new();
+    for i in 0..NAMES {
+        let name = format!("entry-{i:04}-with-a-name-long-enough-to-need-several-pages");
+        std::fs::write(dir.join(&name), "").unwrap();
+        want.insert(name);
+    }
+
+    let mut walk = std::fs::read_dir(mnt.join("walk")).unwrap();
+    let mut seen = Vec::new();
+    seen.push(
+        walk.next()
+            .expect("the listing has entries")
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap(),
+    );
+
+    lb.breaker().sever();
+    std::thread::sleep(NOTICED);
+
+    // The same iterator, so the same `Dh` and the same cursor. Every `next`
+    // from here parks until the session comes back and then reads on.
+    for entry in walk {
+        seen.push(entry.unwrap().file_name().into_string().unwrap());
+    }
+
+    let unique: BTreeSet<String> = seen.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "the listing repeated a name across the break, which is a cursor that \
+         went backwards"
+    );
+    assert_eq!(
+        unique, want,
+        "the two halves of the walk do not add up to the directory: a name is \
+         missing, or one arrived that is not there"
+    );
+    lb.unmount();
+}
+
+/// The mount comes down while the client is still trying to re-attach.
+///
+/// Spec §8's rule does not bend for this feature: a filesystem may fail, and
+/// may not hang. A supervisor with seconds left on its deadline must not be
+/// able to hold an unmount for even one of them, which is what
+/// `Session::shutdown` is for.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn a_mount_unmounts_while_a_sever_is_still_reconnecting() {
+    let mut lb = Loopback::start(severable());
+    let mnt = lb.mnt().to_path_buf();
+
+    // Written and closed, so the unmount below has no dirty page to flush and
+    // measures the supervisor rather than a parked writeback behind it.
+    std::fs::write(mnt.join("before"), "written while the wire was up").unwrap();
+
+    lb.breaker().sever();
+    // The redial cannot land: with the server gone every dial is refused, so
+    // the supervisor stays in its loop for the whole of RECONNECT_DEADLINE.
+    // The only way it leaves `Reconnecting` inside the next ten seconds is the
+    // unmount marking the session dead — which is the assertion.
+    lb.server.kill();
+    std::thread::sleep(NOTICED);
+
+    let started = Instant::now();
+    lb.unmount();
+    let waited = started.elapsed();
+    assert!(
+        waited < RECONNECT_DEADLINE,
+        "the unmount took {waited:?} against a {RECONNECT_DEADLINE:?} reconnect \
+         deadline, so it waited the supervisor out rather than cancelling it"
+    );
+    assert!(
+        !is_fuse_mount(&mnt),
+        "a mount whose connection was severed could not be unmounted"
+    );
+    assert_eq!(std::fs::read_dir(&mnt).unwrap().count(), 0);
+}
+
+/// A file replaced on the export during the gap does not change what a held
+/// descriptor reads.
+///
+/// **The case the whole design exists to get right.** Design §2.1: re-looking a
+/// name up across the gap would bind the client's remembered node id to a fresh
+/// inode, and every read afterwards would return bytes from a file the
+/// application never opened — data loss with no message attached. Retention
+/// makes it a non-event, because the server's `O_PATH` descriptor pins the
+/// original inode whatever happens to the name above it.
+///
+/// The protocol-level twin of this lives in `tests/tests/protocol.rs`; this one
+/// is the same claim with a real kernel, a real `open(2)` and a real page
+/// cache in the way.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn a_held_descriptor_keeps_its_file_across_a_sever() {
+    let mut lb = Loopback::start(Opts {
+        // Nothing cached. A held descriptor reading the original bytes out of
+        // the client's own page cache would prove nothing about the server,
+        // and a fresh lookup answered from the entry cache would never reach
+        // the new file at all.
+        ttl: Duration::ZERO,
+        entry_ttl: Duration::ZERO,
+        ..severable()
+    });
+    let mnt = lb.mnt().to_path_buf();
+    let export = lb.export().to_path_buf();
+
+    // Made on the export, so nothing this mount did put its bytes into the
+    // client's page cache on the way past.
+    std::fs::write(export.join("identity"), "the original bytes").unwrap();
+    let held = std::fs::File::open(mnt.join("identity")).unwrap();
+    let original = held.metadata().unwrap().ino();
+
+    lb.breaker().sever();
+    // Replaced rather than rewritten: a new inode under the old name, which is
+    // exactly what a rebuild by name cannot tell from the old file.
+    std::fs::write(export.join("scratch"), "entirely different bytes").unwrap();
+    std::fs::rename(export.join("scratch"), export.join("identity")).unwrap();
+
+    wait_for_the_mount_to_answer_again(&mnt);
+
+    let mut through_the_descriptor = String::new();
+    (&held)
+        .read_to_string(&mut through_the_descriptor)
+        .expect("the held descriptor still reads");
+    assert_eq!(
+        through_the_descriptor, "the original bytes",
+        "the descriptor followed the name to the new file, which is the one \
+         thing a reconnect may never do"
+    );
+
+    // And the name resolves to the new file, on a node id that is not the one
+    // the descriptor holds. `attr.ino` is the FUSE node id, so this is the
+    // client-visible half of "a different `NodeId` with a different
+    // generation".
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("identity")).unwrap(),
+        "entirely different bytes"
+    );
+    assert_ne!(
+        std::fs::metadata(mnt.join("identity")).unwrap().ino(),
+        original,
+        "a fresh lookup of the name has to yield a new node, or the old id \
+         quietly came to mean the new file"
+    );
+
+    drop(held);
+    lb.unmount();
+}
+
+/// The server's descriptors come back at the unmount, not at the end of the
+/// grace.
+///
+/// Retention is what makes a clean unmount worth a message: a socket closing
+/// cannot mean "drop this session", because a crashed client closes its socket
+/// the same way a polite one does — and the crashed client is the case
+/// retention exists for (design §7.5). So the client says it out loud, and this
+/// is the case that reads the consequence off the server.
+///
+/// The bound is the point. `SETTLE_TIMEOUT` is thirty seconds and the harness
+/// configures a sixty-second `resume_grace`, so a session left to the reaper
+/// cannot pass this wait — only a `DETACH` can.
+#[test]
+#[ignore = "mounts a real filesystem; run with `make test-loopback`"]
+fn descriptors_come_back_after_a_severed_mount_unmounts() {
+    let mut lb = Loopback::start(severable());
+    let mnt = lb.mnt().to_path_buf();
+
+    const DIRS: usize = 32;
+    for i in 0..DIRS {
+        std::fs::create_dir(mnt.join(format!("d{i}"))).unwrap();
+        std::fs::write(mnt.join(format!("d{i}/f")), "content").unwrap();
+    }
+    let held = lb.export_fds();
+    assert!(
+        held >= 2 * DIRS,
+        "the server should be holding a descriptor per registered node while \
+         the mount is live; {DIRS} directories and {DIRS} files came to {held}"
+    );
+
+    lb.breaker().sever();
+    std::thread::sleep(NOTICED);
+    wait_for_the_mount_to_answer_again(&mnt);
+    assert!(
+        lb.export_fds() >= 2 * DIRS,
+        "the session came back with fewer descriptors than it had, so \
+         something was rebuilt rather than retained"
+    );
+
+    // Unmount, which drains and then detaches, and drop both connections. What
+    // is left is the server, and it must be holding nothing.
+    lb.unmount();
+    lb.disconnect();
+    wait_for(
+        "the server to close every descriptor into the export",
+        SETTLE_TIMEOUT,
+        || lb.export_fds() == 0,
+    );
 }
 
 // ---------------------------------------------------------------------------
