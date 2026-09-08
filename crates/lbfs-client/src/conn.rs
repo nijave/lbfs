@@ -751,7 +751,10 @@ impl Connection {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // The connection is gone, and with it the whole node table:
-                // there is nothing left to decrement (spec §8).
+                // there is nothing left to decrement (spec §8). Still counted —
+                // `destroy` reports every forget the mount never delivered,
+                // whatever the reason it was dropped.
+                self.shared.dropped_forgets.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(node, nlookup, "connection is gone; dropping FORGET");
             }
         }
@@ -1623,6 +1626,7 @@ async fn flush_forgets(
     out: &mpsc::Sender<Outbound>,
     shared: &Shared,
 ) -> bool {
+    let count = items.len() as u64;
     let body = match postcard::to_allocvec(&ForgetRequest { items }) {
         Ok(body) => body,
         Err(e) => {
@@ -1645,6 +1649,12 @@ async fn flush_forgets(
             data: Vec::new(),
         })
         .await;
+    if queued.is_err() {
+        // The writer is gone, so this whole batch was dropped: into the same
+        // tally as the queue-full drops, so `destroy` reports every forget the
+        // mount never delivered.
+        shared.dropped_forgets.fetch_add(count, Ordering::Relaxed);
+    }
     queued.is_ok()
 }
 

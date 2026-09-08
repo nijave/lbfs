@@ -333,14 +333,16 @@ fn run() -> Result<(), StartupError> {
     // would lose, and this is the driver-initiated half of the forced-sync
     // control (spec §11).
     //
-    // Over the session's *current* connection rather than the one this function
+    // Over the session's *live* connection rather than the one this function
     // dialled: a reconnect swaps it, and syncing over the socket that died
-    // would report a failure for an export that is perfectly reachable. A
-    // redial still in flight parks this, bounded by the same deadline that
-    // bounds every other parked call.
-    match rt.block_on(lbfs_session.current()) {
-        Ok(conn) => force_sync_on_exit(&rt, &conn),
-        Err(_) => {
+    // would report a failure for an export that is perfectly reachable. `live`
+    // and never `current`, because the mount is already gone: a session still
+    // redialling — or dead — means the sync is skipped with the warning below,
+    // where `current` would park this exit for the whole reconnect deadline
+    // with nothing left to serve at the end of it.
+    match lbfs_session.live() {
+        Some(conn) => force_sync_on_exit(&rt, &conn),
+        None => {
             tracing::warn!("there is no connection left; the export was not synced on the way out")
         }
     }

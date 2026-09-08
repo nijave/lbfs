@@ -662,14 +662,24 @@ impl Loopback {
             }
             Err(_) => false,
         };
-        // The call `main.rs` makes, where `main.rs` makes it: after the drain,
-        // because the drain flushes writeback and the `FORGET`s the kernel
-        // emits for every evicted inode, and both need the session. On a mount
-        // that asked to resume it sends `DETACH`, which is what hands the
+        // The binary's exit sequence, in the binary's order: after the drain —
+        // which flushes writeback and the `FORGET`s the kernel emits for every
+        // evicted inode, both needing the session — first the exit sync, then
+        // `shutdown()`. The sync goes over `live()` exactly as `main.rs` sends
+        // it: a session still redialling, or dead, skips it rather than parking
+        // the teardown behind a reconnect deadline. `shutdown()` then sends
+        // `DETACH` on a mount that asked to resume, which is what hands the
         // server's descriptors back now rather than at the end of the grace; on
         // one that did not it marks the session dead and nothing else — no
         // ticket, nothing to detach, and no supervisor to stop.
         if let Some(lbfs) = &self.lbfs_session {
+            if let Some(conn) = lbfs.live() {
+                // Best effort, like the binary's: a failed sync is the export's
+                // problem to report, never the teardown's to hang on.
+                let _ = self.client_rt.block_on(async {
+                    tokio::time::timeout(UNMOUNT_TIMEOUT, conn.force_sync_export()).await
+                });
+            }
             self.client_rt.block_on(lbfs.shutdown());
         }
         unmounted

@@ -293,11 +293,14 @@ impl Session {
     /// The current connection if there is a usable one, without waiting for a
     /// redial.
     ///
-    /// [`Session::shutdown`] is not a caller that may park: it runs when the
-    /// mount is already gone, and a `DETACH` that waited out a reconnect first
-    /// would hold the process open for exactly as long as the deadline it is
-    /// there to cancel.
-    fn live(&self) -> Option<Arc<Connection>> {
+    /// This is the accessor for teardown paths, which must never park.
+    /// [`Session::shutdown`] runs when the mount is already gone, and a
+    /// `DETACH` that waited out a reconnect first would hold the process open
+    /// for exactly as long as the deadline it is there to cancel; the binary's
+    /// exit sync is in the same position, so it asks here too and skips the
+    /// sync — with a warning, never a park — when there is nothing live to
+    /// sync over.
+    pub fn live(&self) -> Option<Arc<Connection>> {
         match &*self.state.borrow() {
             State::Live(conn) if !conn.is_dead() => Some(Arc::clone(conn)),
             _ => None,

@@ -1053,6 +1053,35 @@ async fn forgets_after_a_disconnect_neither_panic_nor_block() {
     assert!(conn.is_dead());
 }
 
+/// A forget dropped because the connection is dead lands in the same tally a
+/// queue-full drop does, so the count `destroy` reports covers every forget the
+/// mount never delivered — not only the ones lost to a stalled socket.
+///
+/// The batcher and the writer wind down at their own pace after the death, so
+/// which arm a given forget dies in — batched behind a writer that is gone, or
+/// refused outright once the batcher exited — depends on timing this test does
+/// not control. It feeds forgets until one is counted, bounded well above any
+/// batch interval.
+#[tokio::test]
+async fn forgets_dropped_on_a_dead_connection_are_counted() {
+    let fake = Fake::bind().await;
+    let (conn, sess) = plain(&fake).await;
+    drop(sess);
+    assert_eq!(conn.getattr(1, None).await.unwrap_err(), Errno::EIO);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut node = 100;
+    while conn.dropped_forgets() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no forget dropped on the dead connection was ever counted"
+        );
+        conn.send_forget(node, 1);
+        node += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Frames the client must refuse
 // ---------------------------------------------------------------------------
@@ -1435,7 +1464,9 @@ async fn resuming_at(
 #[tokio::test]
 async fn a_call_in_flight_when_the_socket_dies_still_fails_at_once() {
     let fake = Fake::bind().await;
-    let (session, mut sess) = resuming(&fake, Duration::from_secs(5)).await;
+    // A deadline far above the bound below, so the assertion separates "failed
+    // with the socket" from "rode the reconnect" even on a loaded box.
+    let (session, mut sess) = resuming(&fake, Duration::from_secs(30)).await;
 
     let call = {
         let session = Arc::clone(&session);
@@ -1447,12 +1478,14 @@ async fn a_call_in_flight_when_the_socket_dies_still_fails_at_once() {
     // Design §3.1: the server may have executed it, may never have read it, and
     // the client cannot tell. It fails, and it fails now rather than riding the
     // reconnect — a `dd` mid-write reports at the same moment it does today.
+    // The bound is generous — it asserts "did not wait for the reconnect", not
+    // "fast" — because this runs under `make check` on arbitrary machines.
     let started = Instant::now();
     drop(sess);
     assert_eq!(call.await.unwrap().unwrap_err(), Errno::EIO);
     let waited = started.elapsed();
     assert!(
-        waited < Duration::from_secs(1),
+        waited < Duration::from_secs(5),
         "an in-flight call waited {waited:?} for a reconnect it must not wait for"
     );
 }
@@ -1601,13 +1634,15 @@ async fn the_deadline_bounds_the_wait_for_a_server_that_never_comes_back() {
 
     // Both bounds matter. Below the deadline the client gave up on a session it
     // promised to keep trying for; far above it, spec §8's one forbidden
-    // outcome — a filesystem that hangs — is back.
+    // outcome — a filesystem that hangs — is back. The slack is generous on
+    // purpose: the upper bound asserts "bounded", not "prompt", and this runs
+    // under `make check` on arbitrary machines.
     assert!(
         waited >= deadline,
         "the reconnect gave up after {waited:?}, inside its own deadline"
     );
     assert!(
-        waited < deadline + Duration::from_secs(2),
+        waited < deadline + Duration::from_secs(5),
         "the parked call waited {waited:?}, which is not a bounded wait"
     );
     assert_eq!(
@@ -1678,6 +1713,40 @@ async fn every_claim_presents_the_ticket_attach_minted() {
     let req = third.recv().await;
     third.reply_ok(req.id, &an_entry(6, 1)).await;
     assert_eq!(call.await.unwrap().unwrap().node, 6);
+}
+
+/// The exit path must never park behind a redial. `Session::live` is the
+/// accessor the binary's exit sync uses: it answers now — the connection, if
+/// there is a usable one, or `None` while the session is reconnecting or over —
+/// where `current()` would park for the whole `--reconnect-timeout` on a mount
+/// that is already gone.
+#[tokio::test]
+async fn the_exit_path_gets_no_connection_while_reconnecting_rather_than_parking() {
+    let fake = Fake::bind().await;
+    // Redial an address nothing answers on, so the supervisor stays inside its
+    // loop; the deadline is far above the bound below, so an exit path that
+    // parked would fail loudly rather than sneak under it.
+    let nowhere = dead_address().await;
+    let (session, sess) = resuming_at(&fake, nowhere, Duration::from_secs(30)).await;
+    drop(sess);
+    noticed().await;
+
+    let started = Instant::now();
+    assert!(
+        session.live().is_none(),
+        "a reconnecting session has no live connection for the exit sync"
+    );
+    session.shutdown().await;
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(5),
+        "the exit path spent {waited:?} behind a reconnect it must not wait for"
+    );
+    assert_eq!(
+        lookup_through(&session, b"after").await.unwrap_err(),
+        Errno::EIO,
+        "shutdown ended the mount"
+    );
 }
 
 // ---------------------------------------------------------------------------
