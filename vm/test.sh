@@ -63,7 +63,7 @@ reset_pair() {
     for _ in \$(seq 1 20); do pgrep -x lbfs-client >/dev/null || break; sleep 0.5; done
     pkill -KILL -x lbfs-client 2>/dev/null || true
     rm -f /tmp/lbfs-*.log /tmp/lbfs-*.job /tmp/lbfs-*.json /tmp/lbfs-*.err \
-      /tmp/lbfs-*.txt /tmp/lbfs-*.bin /tmp/lbfs-dd-rc \
+      /tmp/lbfs-*.txt /tmp/lbfs-*.bin /tmp/lbfs-dd-rc /tmp/lbfs-reconnect-* \
       /tmp/lbfs-e2e.sh /tmp/lbfs-build.sh /tmp/lbfs-fio.sh \
       ~/local-verify-rw-*.state /tmp/local-verify-rw-*.state
     exit 0" || true
@@ -382,6 +382,14 @@ pass
 
 step 'disconnect drill: kill the server mid-write'
 "$TESTS/disconnect.sh"
+pass
+
+# ---------------------------------------------------------------------------
+
+# After disconnect.sh on purpose: both drills want the server in a known state,
+# and disconnect.sh ends by restarting it and proving a fresh mount works.
+step 'reconnect drill: sever the TCP connection mid-write, server left running'
+"$TESTS/reconnect.sh"
 pass
 
 # ---------------------------------------------------------------------------

@@ -2,13 +2,34 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to execute this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Not started. Written 2026-08-28 alongside
+**Status:** Complete. Written 2026-08-28 alongside
 `docs/superpowers/specs/2026-08-28-session-resumption-design.md`, which holds
 the reasoning this plan executes. Read that document first; this one assumes
 its rulings and does not re-argue them. Revised 2026-09-07 after subagent
 review: no ticket rotation, shape checks inside the registry's `claim`,
 resumption opt-in with the shipped binary on by default, and the review's
-mechanical corrections folded in.
+mechanical corrections folded in. All thirteen tasks ran on 2026-09-07 —
+Tasks 1-12 on the host against `make check` and `make test-loopback`, Task 13
+on the guest pair — and the full `make vm-test` came back green: thirteen
+steps, `disconnect.sh` passing unchanged beside the new `reconnect.sh`.
+
+Two things the execution learned that the plan did not know:
+
+- **Task 13's `ss -K` filter named the wrong end of the connection.** Run on
+  the server, the lbfs connection's local port is 9423 and the client holds
+  the ephemeral end, so `dst $CLIENT_IP dport = :$SERVER_PORT` — the peer's
+  address *and* the peer's port — matches nothing, and `ss -K` exits zero
+  either way. The drill filters on `sport = :$SERVER_PORT` instead, checked
+  against a live connection before severing anything, and asserts the kill
+  printed the client's socket rather than trusting the exit code. `CONFIG_INET_DIAG_DESTROY` itself holds
+  on the guests, exactly as the plan expected — the risk that had a fallback
+  never fired; the spelling nobody doubted is what needed the fix.
+- **The drill's numbers, from the real pair.** A fresh write issued after the
+  sever landed 355 ms later standalone and 542 ms inside the suite, ssh round
+  trips included — one supervisor backoff, nowhere near the 10-second
+  deadline. The interrupted 4 GiB `dd` failed (exit 1) at its `conv=fsync`,
+  its in-flight writes dying with the socket as designed, and the descriptor
+  held open across the sever read and wrote in order afterwards.
 
 **Two coordination facts before Task 1.**
 
@@ -1234,7 +1255,7 @@ git commit -m "test(loopback): a mount survives a severed connection"
 **This is the first task that touches the VM pair. Confirm nobody else holds it
 before running anything here.**
 
-- [ ] **Step 1: Write the drill**
+- [x] **Step 1: Write the drill**
 
 Modelled on `vm/tests/disconnect.sh`, which it complements rather than
 replaces. Mount, start a large `dd` with `conv=fsync`, wait until the server's
@@ -1263,12 +1284,12 @@ Assert afterwards:
   session count.
 - The mount unmounts cleanly.
 
-- [ ] **Step 2: Wire it into `vm/test.sh`**
+- [x] **Step 2: Wire it into `vm/test.sh`**
 
 Beside `disconnect.sh`, after it — the two want the server in a known state and
 `disconnect.sh` restores one.
 
-- [ ] **Step 3: Deploy and run**
+- [x] **Step 3: Deploy and run**
 
 ```bash
 make vm-deploy
@@ -1277,7 +1298,7 @@ make vm-test
 
 Expected: PASS, including `disconnect.sh` unchanged.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add vm/tests/reconnect.sh vm/test.sh
