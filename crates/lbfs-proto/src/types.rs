@@ -113,7 +113,11 @@ pub struct XattrReply {
 /// roughly what a fresh `ATTACH` to the same export is worth, plus the open
 /// descriptors a fresh attach could not reach. The session-resumption design
 /// document prices it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Debug` and `PartialEq` are written by hand below — a derived `Debug` prints
+// the secret into whatever log line carries the ticket, and a derived `==` is
+// a short-circuiting secret compare one keystroke away wherever two tickets
+// meet.
+#[derive(Clone, Copy, Eq, Serialize, Deserialize)]
 pub struct SessionTicket {
     pub id: u64,
     pub secret: [u8; 16],
@@ -134,6 +138,27 @@ impl SessionTicket {
             diff |= a ^ b;
         }
         diff == 0
+    }
+}
+
+/// The secret rides through [`SessionTicket::secret_eq`]; the id and the grace
+/// are public and may short-circuit. Still a true equivalence — `secret_eq` is
+/// plain byte equality, read all at once — so the derived `Eq` above stands.
+impl PartialEq for SessionTicket {
+    fn eq(&self, other: &SessionTicket) -> bool {
+        self.id == other.id && self.grace_ms == other.grace_ms && self.secret_eq(&other.secret)
+    }
+}
+
+/// The id and the grace identify a session in a log line; the secret is the
+/// whole of the authentication and never reaches one.
+impl std::fmt::Debug for SessionTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionTicket")
+            .field("id", &self.id)
+            .field("secret", &"[redacted]")
+            .field("grace_ms", &self.grace_ms)
+            .finish()
     }
 }
 
@@ -158,5 +183,52 @@ mod tests {
         other[9] ^= 1;
         assert!(t.secret_eq(&t.secret));
         assert!(!t.secret_eq(&other));
+    }
+
+    /// The `Debug` form names the ticket without leaking it: the id and the
+    /// grace identify a session in a log line, and the secret — the whole of
+    /// the authentication — must never reach one.
+    #[test]
+    fn the_debug_form_redacts_the_secret() {
+        let t = SessionTicket {
+            id: 42,
+            secret: [0xAB; 16],
+            grace_ms: 60_000,
+        };
+        let s = format!("{t:?}");
+        assert!(s.contains("42"), "the id identifies the session: {s}");
+        assert!(s.contains("60000"), "the grace is not a secret: {s}");
+        assert!(
+            s.contains("redacted"),
+            "the redaction should say it happened: {s}"
+        );
+        assert!(
+            !s.contains("171") && !s.to_lowercase().contains("ab"),
+            "the secret leaked into the Debug form: {s}"
+        );
+    }
+
+    /// `==` on whole tickets goes through the constant-time helper for the
+    /// secret bytes, so the derived short-circuiting compare is never one
+    /// keystroke away from a timing oracle. The relation is still a true
+    /// equivalence — `secret_eq` is plain byte equality, read all at once —
+    /// which is what keeps `Eq` honest.
+    #[test]
+    fn ticket_equality_matches_field_equality() {
+        let t = SessionTicket {
+            id: 42,
+            secret: [7u8; 16],
+            grace_ms: 60_000,
+        };
+        assert_eq!(t, t);
+        let mut wrong_secret = t;
+        wrong_secret.secret[3] ^= 1;
+        assert_ne!(t, wrong_secret);
+        let mut wrong_id = t;
+        wrong_id.id += 1;
+        assert_ne!(t, wrong_id);
+        let mut wrong_grace = t;
+        wrong_grace.grace_ms += 1;
+        assert_ne!(t, wrong_grace);
     }
 }
