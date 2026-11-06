@@ -1708,8 +1708,10 @@ impl FileSystem for LocalFs {
         tokio::task::spawn_blocking(move || {
             if size == 0 {
                 // The same length probe `getxattr` honors, with the same rule:
-                // the reply is the count and nothing else.
-                let n = rustix::fs::flistxattr(&*fd, &mut [0u8; 0]).map_err(rustix_errno)?;
+                // the reply is the count and nothing else. Since rustix 1.1.6
+                // an empty buffer to `flistxattr` returns 0 instead of passing
+                // the kernel's size query through; `_query` is that query.
+                let n = rustix::fs::flistxattr_query(&*fd).map_err(rustix_errno)?;
                 return Ok((n as u32, Vec::new()));
             }
             let mut list = vec![0u8; (size as usize).min(MAX_XATTR_LIST)];

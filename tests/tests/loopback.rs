@@ -1840,9 +1840,10 @@ fn xattrs_are_set_read_listed_and_removed() {
     // FUSE reads an xattr in two steps, and the first one asks only for the
     // length. A client that answered it with the value — or with the wrong
     // length — breaks every caller that sizes its buffer this way.
-    let mut nothing: [u8; 0] = [];
+    // `getxattr_query` is the size-0 call; rustix's `getxattr` answers 0 for
+    // an empty buffer without reporting the kernel's length.
     assert_eq!(
-        rustix::fs::getxattr(&f, "user.one", &mut nothing[..]).unwrap(),
+        rustix::fs::getxattr_query(&f, "user.one").unwrap(),
         b"first".len()
     );
     // And the second step has to answer `ERANGE` when the buffer is too small
